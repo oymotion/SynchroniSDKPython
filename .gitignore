@@ -1,2 +1,4 @@
 /build/
 /.conda/
+/dist/
+/sensor_sdk.egg-info/

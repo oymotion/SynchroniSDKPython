@@ -2,27 +2,23 @@
 # 该枚举类定义了设备的各种状态，用于表示设备在不同操作阶段的状态信息
 from enum import Enum, IntEnum
 from queue import Queue
-import struct
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Optional
 
 import bleak
 from bleak import (
     BleakClient,
-    BleakGATTCharacteristic,
 )
 
-import sensor
+from sensor import utils
 from sensor.gforce import GForce
-from sensor.sensor_data import DataType, Sample, SensorData
+from sensor.sensor_data import SensorData
 import asyncio
-import threading
+
 
 from sensor.sensor_data_context import SensorProfileDataCtx
 from sensor.sensor_device import BLEDevice, DeviceInfo, DeviceStateEx
-from sensor.utils import start_loop, sync_timer, timer
-from contextlib import suppress
-from dataclasses import dataclass
+from sensor.utils import async_call, sync_call, async_exec
 
 SERVICE_GUID = "0000ffd0-0000-1000-8000-00805f9b34fb"
 OYM_CMD_NOTIFY_CHAR_UUID = "f000ffe1-0451-4000-b000-000000000000"
@@ -44,7 +40,7 @@ class SensorProfile:
         self,
         device: bleak.BLEDevice,
         adv: bleak.AdvertisementData,
-        gforce_event_loop: asyncio.AbstractEventLoop,
+        mac: str,
     ):
         """
         初始化 SensorProfile 类的实例。
@@ -52,7 +48,7 @@ class SensorProfile:
         :param            device (BLEDevice): 蓝牙设备对象，包含设备的名称、地址和信号强度等信息。
         """
         self._detail_device = device
-        self._device = BLEDevice(device.name, device.address, adv.rssi)
+        self._device = BLEDevice(device.name, mac, adv.rssi)
         self._device_state = DeviceStateEx.Disconnected
         self._on_state_changed: Callable[["SensorProfile", DeviceStateEx], None] = None
         self._on_error_callback: Callable[["SensorProfile", str], None] = None
@@ -64,9 +60,9 @@ class SensorProfile:
         self._data_ctx: SensorProfileDataCtx = None
         self._gforce: GForce = None
         self._data_event_loop: asyncio.AbstractEventLoop = None
-        self._gforce_event_loop: asyncio.AbstractEventLoop = gforce_event_loop
         self._event_loop: asyncio.AbstractEventLoop = None
-        self._event_thread = None
+        self._is_starting = False
+        self._is_setting_param = False
 
     def __del__(self) -> None:
         """
@@ -76,23 +72,20 @@ class SensorProfile:
         self._destroy()
 
     def _destroy(self):
-        if (
-            self._device_state == DeviceStateEx.Connected
-            or self._device_state == DeviceStateEx.Ready
-        ):
+        if self._device_state == DeviceStateEx.Connected or self._device_state == DeviceStateEx.Ready:
             self.disconnect()
         if self._data_event_loop != None:
             try:
                 self._data_event_loop.stop()
                 self._data_event_loop.close()
-                self._data_event_thread.join()
+                self._data_event_loop = None
             except Exception as e:
                 pass
         if self._event_loop != None:
             try:
                 self._event_loop.stop()
                 self._event_loop.close()
-                self._event_thread.join()
+                self._event_loop = None
             except Exception as e:
                 pass
 
@@ -108,11 +101,9 @@ class SensorProfile:
     def _set_device_state(self, newState: DeviceStateEx):
         if self._device_state != newState:
             self._device_state = newState
-            if self._on_state_changed != None:
+            if self._event_loop != None and self._on_state_changed != None:
                 try:
-                    self._event_loop.call_soon_threadsafe(
-                        self._on_state_changed, self, newState
-                    )
+                    asyncio.get_event_loop().run_in_executor(None, self._on_state_changed, self, newState)
                 except Exception as e:
                     print(e)
                     pass
@@ -158,9 +149,7 @@ class SensorProfile:
         return self._on_state_changed
 
     @onStateChanged.setter
-    def onStateChanged(
-        self, callback: Callable[["SensorProfile", DeviceStateEx], None]
-    ):
+    def onStateChanged(self, callback: Callable[["SensorProfile", DeviceStateEx], None]):
         """
         设置状态变化的回调函数。
 
@@ -223,51 +212,11 @@ class SensorProfile:
         self._on_power_changed = callback
 
     async def _connect(self) -> bool:
-        if (
-            self.deviceState == DeviceStateEx.Connected
-            or self.deviceState == DeviceStateEx.Ready
-        ):
-            return True
-        self._set_device_state(DeviceStateEx.Connecting)
+        if utils._terminated:
+            return False
 
-        def handle_disconnect(_: BleakClient):
-            self.stopDataNotification()
-            self._data_ctx.close()
-            time.sleep(1)
-            self._data_buffer.queue.clear()
-            self._data_ctx = None
-            self._gforce = None
-            self._set_device_state(DeviceStateEx.Disconnected)
-            pass
-
-        await self._gforce.connect(handle_disconnect, self._raw_data_buf)
-
-        if self._gforce.client.is_connected:
-            self._set_device_state(DeviceStateEx.Connected)
-            if self._gforce.client.mtu_size >= 80:
-                self._set_device_state(DeviceStateEx.Ready)
-            else:
-                self.disconnect()
-        else:
-            self._set_device_state(DeviceStateEx.Disconnected)
-
-        return True
-
-    def connect(self) -> bool:
-        """
-        连接传感器。
-
-        :return:            bool: 如果连接成功，返回 True；否则返回 False。
-
-        """
-        if self._event_thread == None:
+        if self._event_loop == None:
             self._event_loop = asyncio.new_event_loop()
-            self._event_thread = threading.Thread(
-                target=start_loop, args=(self._event_loop,)
-            )
-            self._event_thread.daemon = True
-            self._event_thread.name = self._device.Name + " event"
-            self._event_thread.start()
             self._data_buffer: Queue[SensorData] = Queue()
             self._raw_data_buf: Queue[bytes] = Queue()
 
@@ -282,50 +231,80 @@ class SensorProfile:
                 )
             elif self._adv.service_data.get(RFSTAR_SERVICE_GUID) != None:
                 # print("RFSTAR_SERVICE:" + self._detail_device.name)
-                self._gforce = GForce(
-                    self._detail_device, RFSTAR_CMD_UUID, RFSTAR_DATA_UUID, True
-                )
+                self._gforce = GForce(self._detail_device, RFSTAR_CMD_UUID, RFSTAR_DATA_UUID, True)
                 self._data_event_loop = asyncio.new_event_loop()
-                self._data_event_thread = threading.Thread(
-                    target=start_loop, args=(self._data_event_loop,)
-                )
-                self._data_event_thread.daemon = True
-                self._data_event_thread.name = self._detail_device.name + " data"
-                self._data_event_thread.start()
             else:
-                print(
-                    "Invalid device service uuid:"
-                    + self._detail_device.name
-                    + str(self._adv)
-                )
+                print("Invalid device service uuid:" + self._detail_device.name + str(self._adv))
                 return False
 
         if self._data_ctx == None and self._gforce != None:
-            self._data_ctx = SensorProfileDataCtx(
-                self._gforce, self._device.Address, self._raw_data_buf
-            )
-            if self._data_ctx.isUniversalStream:
-                timer(self._data_event_loop, 0, self._process_universal_data())
+            self._data_ctx = SensorProfileDataCtx(self._gforce, self._device.Address, self._raw_data_buf)
+        if self._data_ctx.isUniversalStream:
+            async_exec(self._process_universal_data())
+        else:
+            async_exec(self._process_data())
 
-        result = sync_timer(self._gforce_event_loop, 0, self._connect())
+        if self.deviceState == DeviceStateEx.Connected or self.deviceState == DeviceStateEx.Ready:
+            return True
+        self._set_device_state(DeviceStateEx.Connecting)
+
+        def handle_disconnect(_: BleakClient):
+            if self._data_ctx != None:
+                self._data_ctx.close()
+                time.sleep(1)
+                self._data_buffer.queue.clear()
+                self._data_ctx = None
+                self._gforce = None
+            self._set_device_state(DeviceStateEx.Disconnected)
+            pass
+
+        await self._gforce.connect(handle_disconnect, self._raw_data_buf)
+
+        if self._gforce != None and self._gforce.client.is_connected:
+            self._set_device_state(DeviceStateEx.Connected)
+            self._set_device_state(DeviceStateEx.Ready)
+            # if self._gforce.client.mtu_size >= 80:
+            #     self._set_device_state(DeviceStateEx.Ready)
+            # else:
+            #     self.disconnect()
+        else:
+            self._set_device_state(DeviceStateEx.Disconnected)
+
+        return True
+
+    def connect(self) -> bool:
+        """
+        连接传感器。
+
+        :return:            bool: 如果连接成功，返回 True；否则返回 False。
+
+        """
+        result = sync_call(self._connect())
         return result
 
+    async def asyncConnect(self) -> bool:
+        """
+        连接传感器。
+
+        :return:            bool: 如果连接成功，返回 True；否则返回 False。
+
+        """
+        return await async_call(self._connect())
+
     async def _waitForDisconnect(self) -> bool:
-        while self.deviceState != DeviceStateEx.Disconnected:
-            asyncio.sleep(1)
+        while not utils._terminated and self.deviceState != DeviceStateEx.Disconnected:
+            await asyncio.sleep(1)
         return True
 
     async def _disconnect(self) -> bool:
-        if (
-            self.deviceState != DeviceStateEx.Connected
-            and self.deviceState != DeviceStateEx.Ready
-        ):
+        if self.deviceState != DeviceStateEx.Connected and self.deviceState != DeviceStateEx.Ready:
             return True
         if self._data_ctx == None:
             return False
         self._set_device_state(DeviceStateEx.Disconnecting)
         await self._gforce.disconnect()
-        await asyncio.wait_for(self._waitForDisconnect(), 5)
+        await asyncio.wait_for(self._waitForDisconnect(), utils._TIMEOUT)
+
         return True
 
     def disconnect(self) -> bool:
@@ -335,46 +314,24 @@ class SensorProfile:
         :return:            bool: 如果断开连接成功，返回 True;否则返回 False。
 
         """
-        return sync_timer(self._gforce_event_loop, 0, self._disconnect())
+        return sync_call(self._disconnect())
+
+    async def asyncDisconnect(self) -> bool:
+        """
+        断开传感器连接。
+
+        :return:            bool: 如果断开连接成功，返回 True;否则返回 False。
+
+        """
+        return await async_call(self._disconnect())
 
     async def _process_data(self):
-        while self._data_ctx._is_running and self._data_ctx.isDataTransfering:
-            self._data_ctx.process_data(self._data_buffer)
-            while self._data_ctx._is_running and self._data_ctx.isDataTransfering:
-                sensorData: SensorData = None
-                try:
-                    sensorData = self._data_buffer.get_nowait()
-                except Exception as e:
-                    break
-                if sensorData != None and self._on_data_callback != None:
-                    try:
-                        self._event_loop.call_soon_threadsafe(
-                            self._on_data_callback, self, sensorData
-                        )
-                    except Exception as e:
-                        print(e)
-                self._data_buffer.task_done()
+        await self._data_ctx.process_data(self._data_buffer, self, self._on_data_callback)
 
     async def _process_universal_data(self):
-        self._data_ctx.processUniversalData(
-            self._data_buffer, self._event_loop, self, self._on_data_callback
-        )
+        await self._data_ctx.processUniversalData(self._data_buffer, self, self._on_data_callback)
 
     async def _startDataNotification(self) -> bool:
-        result = await self._data_ctx.start_streaming()
-        self._data_buffer.queue.clear()
-        self._data_ctx.clear()
-        if not self._data_ctx.isUniversalStream:
-            timer(self._data_event_loop, 0, self._process_data())
-        return result
-
-    def startDataNotification(self) -> bool:
-        """
-        开始数据通知。
-
-        :return:            bool: 如果开始数据通知成功，返回 True；否则返回 False。
-
-        """
         if self.deviceState != DeviceStateEx.Ready:
             return False
         if self._data_ctx == None:
@@ -387,26 +344,43 @@ class SensorProfile:
 
         if self._data_event_loop == None:
             self._data_event_loop = asyncio.new_event_loop()
-            self._data_event_thread = threading.Thread(
-                target=start_loop, args=(self._data_event_loop,)
-            )
-            self._data_event_thread.daemon = True
-            self._data_event_thread.name = self.BLEDevice.Name + " data"
-            self._data_event_thread.start()
 
-        return sync_timer(self._gforce_event_loop, 0, self._startDataNotification())
+        self._raw_data_buf.queue.clear()
+        self._data_buffer.queue.clear()
+
+        result = await self._data_ctx.start_streaming()
+        await asyncio.sleep(0.2)
+
+        self._is_starting = False
+        return result
+
+    def startDataNotification(self) -> bool:
+        """
+        开始数据通知。
+
+        :return:            bool: 如果开始数据通知成功，返回 True；否则返回 False。
+
+        """
+        if self._is_starting:
+            return False
+
+        self._is_starting = True
+        return sync_call(self._startDataNotification())
+
+    async def asyncStartDataNotification(self) -> bool:
+        """
+        开始数据通知。
+
+        :return:            bool: 如果开始数据通知成功，返回 True；否则返回 False。
+
+        """
+        if self._is_starting:
+            return False
+
+        self._is_starting = True
+        return await async_call(self._startDataNotification())
 
     async def _stopDataNotification(self) -> bool:
-
-        return not await self._data_ctx.stop_streaming()
-
-    def stopDataNotification(self) -> bool:
-        """
-        停止数据通知。
-
-        :return:            bool: 如果停止数据通知成功，返回 True；否则返回 False。
-
-        """
         if self.deviceState != DeviceStateEx.Ready:
             return False
         if self._data_ctx == None:
@@ -417,25 +391,47 @@ class SensorProfile:
         if not self._data_ctx.isDataTransfering:
             return True
 
-        return sync_timer(self._gforce_event_loop, 0, self._stopDataNotification())
+        result = await self._data_ctx.stop_streaming()
+        self._is_starting = False
+        return not result
+
+    def stopDataNotification(self) -> bool:
+        """
+        停止数据通知。
+
+        :return:            bool: 如果停止数据通知成功，返回 True；否则返回 False。
+
+        """
+        if self._is_starting:
+            return False
+
+        self._is_starting = True
+        return sync_call(self._stopDataNotification())
+
+    async def asyncStopDataNotification(self) -> bool:
+        """
+        停止数据通知。
+
+        :return:            bool: 如果停止数据通知成功，返回 True；否则返回 False。
+
+        """
+        if self._is_starting:
+            return False
+
+        self._is_starting = True
+        return await async_call(self._stopDataNotification())
 
     async def _refresh_power(self):
-        self._power = await self._gforce.get_battery_level()
+        while not utils._terminated and self.deviceState == DeviceStateEx.Ready:
+            await asyncio.sleep(self._power_interval / 1000)
 
-        if self._on_power_changed != None:
-            try:
-                self._event_loop.call_soon_threadsafe(
-                    self._on_power_changed, self, self._power
-                )
-            except Exception as e:
-                print(e)
+            self._power = await self._gforce.get_battery_level()
 
-        if self.deviceState == DeviceStateEx.Ready:
-            timer(
-                self._gforce_event_loop,
-                self._power_interval / 1000,
-                self._refresh_power(),
-            )
+            if self._event_loop != None and self._on_power_changed != None:
+                try:
+                    asyncio.get_event_loop().run_in_executor(None, self._on_power_changed, self, self._power)
+                except Exception as e:
+                    print(e)
 
     async def _init(self, packageSampleCount: int, powerRefreshInterval: int) -> bool:
         if self.deviceState != DeviceStateEx.Ready:
@@ -447,11 +443,7 @@ class SensorProfile:
 
         if await self._data_ctx.init(packageSampleCount):
             self._power_interval = powerRefreshInterval
-            timer(
-                self._gforce_event_loop,
-                self._power_interval / 1000,
-                self._refresh_power(),
-            )
+            utils.async_exec(self._refresh_power())
 
         return self._data_ctx.hasInit()
 
@@ -465,10 +457,24 @@ class SensorProfile:
         :return:            bool: 初始化结果。True 表示成功，False 表示失败。
 
         """
-        return sync_timer(
-            self._gforce_event_loop,
-            0,
+        return sync_call(
             self._init(packageSampleCount, powerRefreshInterval),
+            20,
+        )
+
+    async def asyncInit(self, packageSampleCount: int, powerRefreshInterval: int) -> bool:
+        """
+        初始化数据采集。
+
+        :param    packageSampleCount (int): 数据包中的样本数量。
+        :param    powerRefreshInterval (int): 电量刷新间隔。
+
+        :return:            bool: 初始化结果。True 表示成功，False 表示失败。
+
+        """
+        return await async_call(
+            self._init(packageSampleCount, powerRefreshInterval),
+            20,
         )
 
     def getBatteryLevel(self) -> int:
@@ -491,6 +497,37 @@ class SensorProfile:
             return self._data_ctx._device_info
         return None
 
+    async def _setParam(self, key: str, value: str) -> str:
+        result = "Error: Not supported"
+        if self.deviceState != DeviceStateEx.Ready:
+            result = "Error: Please connect first"
+
+        if key in ["NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH"]:
+            if value in ["ON", "OFF"]:
+                self._data_ctx.init_map[key] = value
+                result = "OK"
+
+        if key in ["FILTER_50Hz", "FILTER_60Hz", "FILTER_HPF", "FILTER_LPF"]:
+            if value in ["ON", "OFF"]:
+                needPauseTransfer = self.isDataTransfering
+                if needPauseTransfer:
+                    if self._is_starting:
+                        self._is_setting_param = False
+                        return "Error: Please pause data transfer first"
+
+                    self._is_starting = True
+                    await self._stopDataNotification()
+                result = await self._data_ctx.setFilter(key, value)
+                if needPauseTransfer:
+                    self._is_starting = True
+                    await self._startDataNotification()
+
+        if key == "DEBUG_BLE_DATA_PATH":
+            result = await self._data_ctx.setDebugCSV(value)
+
+        self._is_setting_param = False
+        return result
+
     def setParam(self, key: str, value: str) -> str:
         """
         设置传感器的参数。
@@ -501,4 +538,30 @@ class SensorProfile:
         :return:            str: 设置参数的结果。
 
         """
-        return ""
+        if self._is_setting_param:
+            return "Error: Please wait for the previous operation to complete"
+
+        self._is_setting_param = True
+        return sync_call(
+            self._setParam(key, value),
+            20,
+        )
+
+    async def asyncSetParam(self, key: str, value: str) -> str:
+        """
+        设置传感器的参数。
+
+        :param    key (str): 参数的键。
+        :param    value (str): 参数的值。
+
+        :return:            str: 设置参数的结果。
+
+        """
+        if self._is_setting_param:
+            return "Error: Please wait for the previous operation to complete"
+
+        self._is_setting_param = True
+        return await async_call(
+            self._setParam(key, value),
+            20,
+        )

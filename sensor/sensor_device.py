@@ -40,11 +40,17 @@ class DeviceInfo:
         self.HardwareVersion = ""
         self.FirmwareVersion = ""
         self.EmgChannelCount = 0
+        self.EmgSampleRate = 0
         self.EegChannelCount = 0
+        self.EegSampleRate = 0
         self.EcgChannelCount = 0
+        self.EcgSampleRate = 0
         self.AccChannelCount = 0
+        self.AccSampleRate = 0
         self.GyroChannelCount = 0
+        self.GyroSampleRate = 0
         self.BrthChannelCount = 0
+        self.BrthSampleRate = 0
         self.MTUSize = 0
 
 

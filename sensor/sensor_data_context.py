@@ -1,15 +1,19 @@
 import asyncio
 from collections import deque
+import os
+import platform
 from queue import Queue
+import struct
 from typing import Deque, List
-
+from concurrent.futures import ThreadPoolExecutor
+import csv
+from sensor import utils
 from sensor.gforce import DataSubscription, GForce
 from sensor.sensor_data import DataType, Sample, SensorData
 
 from enum import Enum, IntEnum
 
 from sensor.sensor_device import DeviceInfo
-from sensor.utils import timer
 
 
 class SensorDataType(IntEnum):
@@ -42,6 +46,7 @@ class SensorProfileDataCtx:
         self.deviceMac = deviceMac
         self._device_info: DeviceInfo = None
 
+        self._is_initing = False
         self._is_running = True
         self._is_data_transfering = False
         self.isUniversalStream: bool = gForce._is_universal_stream
@@ -53,9 +58,16 @@ class SensorProfileDataCtx:
             self.sensorDatas.append(SensorData())
         self.impedanceData: List[float] = list()
         self.saturationData: List[float] = list()
+        self.dataPool = ThreadPoolExecutor(1, "data")
+        self.init_map = {"NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON"}
+        self.filter_map = {"FILTER_50Hz": "ON", "FILTER_60Hz": "ON", "FILTER_HPF": "ON", "FILTER_LPF": "ON"}
+        self.debugCSVWriter = None
+        self.debugCSVPath = None
 
     def close(self):
         self._is_running = False
+        if self.debugCSVWriter != None:
+            self.debugCSVWriter = None
 
     def clear(self):
         for sensorData in self.sensorDatas:
@@ -79,7 +91,7 @@ class SensorProfileDataCtx:
         return self._is_data_transfering
 
     def hasInit(self):
-        return self.featureMap != 0 and self.notifyDataFlag != 0
+        return not self._is_initing and self.featureMap != 0 and self.notifyDataFlag != 0
 
     def hasEMG(self):
         return (self.featureMap & FeatureMaps.GFD_FEAT_EMG.value) != 0
@@ -198,44 +210,63 @@ class SensorProfileDataCtx:
 
     async def fetchDeviceInfo(self) -> DeviceInfo:
         info = DeviceInfo()
-        info.MTUSize = self.gForce.client.mtu_size
+        if platform.system() != "Linux":
+            info.MTUSize = self.gForce.client.mtu_size
+        else:
+            info.MTUSize = 0
+        # print("get_device_name")
         info.DeviceName = await self.gForce.get_device_name()
+        # print("get_model_number")
         info.ModelName = await self.gForce.get_model_number()
+        # print("get_hardware_revision")
         info.HardwareVersion = await self.gForce.get_hardware_revision()
+        # print("get_firmware_revision")
         info.FirmwareVersion = await self.gForce.get_firmware_revision()
         return info
 
     async def init(self, packageCount: int) -> bool:
+        if self._is_initing:
+            return False
         try:
+            self._is_initing = True
             info = await self.fetchDeviceInfo()
-
             await self.initDataTransfer(True)
-
             if self.hasImpedance():
                 self.notifyDataFlag |= DataSubscription.DNF_IMPEDANCE
 
-            if self.hasEEG():
+            if self.hasEEG() & (self.init_map["NTF_EEG"] == "ON"):
+                # print("initEEG")
                 info.EegChannelCount = await self.initEEG(packageCount)
+                info.EegSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].sampleRate
 
-            if self.hasECG():
+            if self.hasECG() & (self.init_map["NTF_ECG"] == "ON"):
+                # print("initECG")
                 info.EcgChannelCount = await self.initECG(packageCount)
+                info.EcgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ECG].sampleRate
 
-            if self.hasBrth():
+            if self.hasBrth() & (self.init_map["NTF_BRTH"] == "ON"):
+                # print("initBrth")
                 info.BrthChannelCount = await self.initBrth(packageCount)
+                info.BrthSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH].sampleRate
 
-            if self.hasIMU():
+            if self.hasIMU() & (self.init_map["NTF_IMU"] == "ON"):
+                # print("initIMU")
                 imuChannelCount = await self.initIMU(packageCount)
                 info.AccChannelCount = imuChannelCount
                 info.GyroChannelCount = imuChannelCount
+                info.AccSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ACC].sampleRate
+                info.GyroSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO].sampleRate
 
             self._device_info = info
 
             if not self.isUniversalStream:
                 await self.initDataTransfer(False)
 
+            self._is_initing = False
             return True
         except Exception as e:
             print(e)
+            self._is_initing = False
             return False
 
     async def start_streaming(self) -> bool:
@@ -243,12 +274,15 @@ class SensorProfileDataCtx:
             return True
         self._is_data_transfering = True
         self._rawDataBuffer.queue.clear()
+        self._concatDataBuffer.clear()
+        self.clear()
+
         if not self.isUniversalStream:
             await self.gForce.start_streaming(self._rawDataBuffer)
-            return True
         else:
             await self.gForce.set_subscription(self.notifyDataFlag)
-            return True
+
+        return True
 
     async def stop_streaming(self) -> bool:
         if not self._is_data_transfering:
@@ -256,23 +290,90 @@ class SensorProfileDataCtx:
 
         self._is_data_transfering = False
 
-        if not self.isUniversalStream:
-            await self.gForce.stop_streaming()
-            return True
-        else:
-            await self.gForce.set_subscription(0)
-            return True
-
-    def process_data(self, buf: Queue[SensorData]):
         try:
-            data: bytes = self._rawDataBuffer.get_nowait()
+
+            if not self.isUniversalStream:
+                await self.gForce.stop_streaming()
+            else:
+                await self.gForce.set_subscription(0)
+
+            while self._is_running and not self._rawDataBuffer.empty():
+                await asyncio.sleep(0.1)
+
         except Exception as e:
-            return
+            print(e)
+            return False
 
-        self._processDataPackage(data, buf)
-        self._rawDataBuffer.task_done()
+        return True
 
-    def _processDataPackage(self, data: bytes, buf: Queue[SensorData]):
+    async def setFilter(self, filter: str, value: str) -> str:
+        self.filter_map[filter] = value
+        switch = 0
+        for filter in self.filter_map.keys():
+            value = self.filter_map[filter]
+            if filter == "FILTER_50Hz":
+                if value == "ON":
+                    switch |= 1
+            elif filter == "FILTER_60Hz":
+                if value == "ON":
+                    switch |= 2
+            elif filter == "FILTER_HPF":
+                if value == "ON":
+                    switch |= 4
+            elif filter == "FILTER_LPF":
+                if value == "ON":
+                    switch |= 8
+        try:
+            await self.gForce.set_firmware_filter_switch(switch)
+            await asyncio.sleep(0.1)
+            return "OK"
+        except Exception as e:
+            return "ERROR: " + str(e)
+
+    async def setDebugCSV(self, debugFilePath) -> str:
+        if self.debugCSVWriter != None:
+            self.debugCSVWriter = None
+        if debugFilePath != None:
+            self.debugCSVPath = debugFilePath
+            try:
+                if self.debugCSVPath != "":
+                    CSVWriter = csv.writer(open(self.debugCSVPath, "w", newline=""), delimiter=",")
+                    CSVWriter = None
+            except Exception as e:
+                return "ERROR: " + str(e)
+        return "OK"
+
+    ####################################################################################
+
+    async def process_data(self, buf: Queue[SensorData], sensor, callback):
+        while self._is_running and self._rawDataBuffer.empty():
+            await asyncio.sleep(0.1)
+
+            while self._is_running and not self._rawDataBuffer.empty():
+                try:
+                    data: bytes = self._rawDataBuffer.get_nowait()
+                except Exception as e:
+                    continue
+
+                if self.isDataTransfering:
+                    self._processDataPackage(data, buf, sensor)
+                self._rawDataBuffer.task_done()
+
+            while self._is_running and self.isDataTransfering and not buf.empty():
+                sensorData: SensorData = None
+                try:
+                    sensorData = buf.get_nowait()
+                except Exception as e:
+                    break
+                if sensorData != None and callback != None:
+                    try:
+                        asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
+                    except Exception as e:
+                        print(e)
+
+                buf.task_done()
+
+    def _processDataPackage(self, data: bytes, buf: Queue[SensorData], sensor):
         v = data[0]
         if v == DataType.NTF_IMPEDANCE:
             offset = 1
@@ -283,15 +384,14 @@ class SensorProfileDataCtx:
             saturationData = []
 
             dataCount = (len(data) - 3) // 4 // 2
+
             for index in range(dataCount):
-                impedance_bytes = data[offset : offset + 4]
-                impedance = int.from_bytes(impedance_bytes, byteorder="little")
+                impedance = struct.unpack_from("<f", data, offset)[0]
                 offset += 4
                 impedanceData.append(impedance)
 
             for index in range(dataCount):
-                saturation_bytes = data[offset : offset + 4]
-                saturation = int.from_bytes(saturation_bytes, byteorder="little")
+                saturation = struct.unpack_from("<f", data, offset)[0]
                 offset += 4
                 saturationData.append(saturation / 10)  # firmware value range 0 - 1000
 
@@ -300,28 +400,26 @@ class SensorProfileDataCtx:
 
         elif v == DataType.NTF_EEG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
-            if self.checkReadSamples(data, sensor_data, 3, 0):
+            if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
                 self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_ECG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_ECG]
-            if self.checkReadSamples(data, sensor_data, 3, 0):
+            if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
                 self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_BRTH:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH]
-            if self.checkReadSamples(data, sensor_data, 3, 0):
+            if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
                 self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_IMU:
             sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
-            if self.checkReadSamples(data, sensor_data_acc, 3, 6):
+            if self.checkReadSamples(sensor, data, sensor_data_acc, 3, 6):
                 self.sendSensorData(sensor_data_acc, buf)
 
             sensor_data_gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
-            if self.checkReadSamples(data, sensor_data_gyro, 9, 6):
+            if self.checkReadSamples(sensor, data, sensor_data_gyro, 9, 6):
                 self.sendSensorData(sensor_data_gyro, buf)
 
-    def checkReadSamples(
-        self, data: bytes, sensorData: SensorData, dataOffset: int, dataGap: int
-    ):
+    def checkReadSamples(self, sensor, data: bytes, sensorData: SensorData, dataOffset: int, dataGap: int):
         offset = 1
         v = data[0]
         if not self._is_data_transfering:
@@ -340,12 +438,22 @@ class SensorProfileDataCtx:
 
             deltaPackageIndex = packageIndex - lastPackageIndex
             if deltaPackageIndex > 1:
-                lostSampleCount = sensorData.packageSampleCount * (
-                    deltaPackageIndex - 1
+                lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
+                lostLog = (
+                    "MSG|LOST SAMPLE|MAC|"
+                    + str(sensorData.deviceMac)
+                    + "|TYPE|"
+                    + str(sensorData.dataType)
+                    + "|COUNT|"
+                    + str(lostSampleCount)
                 )
-                print(
-                    f"lost dataType {sensorData.dataType} -> data {sensorData.deviceMac} {lostSampleCount}"
-                )
+                # print(lostLog)
+                if sensor._event_loop != None and sensor._on_error_callback != None:
+                    try:
+                        asyncio.get_event_loop().run_in_executor(None, sensor._on_error_callback, sensor, lostLog)
+                    except Exception as e:
+                        pass
+
                 self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
                 if newPackageIndex == 0:
                     sensorData.lastPackageIndex = 65535
@@ -356,7 +464,8 @@ class SensorProfileDataCtx:
             self.readSamples(data, sensorData, dataOffset, dataGap, 0)
             sensorData.lastPackageIndex = newPackageIndex
             sensorData.lastPackageCounter += 1
-        except Exception:
+        except Exception as e:
+            print(e)
             return False
         return True
 
@@ -385,19 +494,19 @@ class SensorProfileDataCtx:
                 channelSamples.append([])
 
         for sampleIndex in range(sampleCount):
-            for channelIndex, impedanceChannelIndex in enumerate(
-                range(sensorData.channelCount)
-            ):
+            for channelIndex, impedanceChannelIndex in enumerate(range(sensorData.channelCount)):
                 if (sensorData.channelMask & (1 << channelIndex)) != 0:
                     samples = channelSamples[channelIndex]
                     impedance = 0.0
                     saturation = 0.0
+
                     if sensorData.dataType == DataType.NTF_ECG:
-                        impedanceChannelIndex = self.sensorDatas[
-                            SensorDataType.DATA_TYPE_EEG
-                        ].channelCount
-                    impedance = _impedanceData[impedanceChannelIndex]
-                    saturation = _saturationData[impedanceChannelIndex]
+                        impedanceChannelIndex = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].channelCount
+
+                    if impedanceChannelIndex < len(_impedanceData):
+                        impedance = _impedanceData[impedanceChannelIndex]
+                        saturation = _saturationData[impedanceChannelIndex]
+
                     impedanceChannelIndex += 1
 
                     dataItem = Sample()
@@ -424,11 +533,7 @@ class SensorProfileDataCtx:
                             )
                             offset += 2
                         elif sensorData.resolutionBits == 24:
-                            rawData = (
-                                (data[offset] << 16)
-                                | (data[offset + 1] << 8)
-                                | data[offset + 2]
-                            )
+                            rawData = (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
                             rawData -= 8388608
                             offset += 3
 
@@ -481,6 +586,31 @@ class SensorProfileDataCtx:
             sensorDataResult.minPackageSampleCount = sensorData.minPackageSampleCount
             sensorDataList.append(sensorDataResult)
 
+            if self.debugCSVPath != None and self.debugCSVPath != "" and self.debugCSVWriter == None:
+                try:
+                    self.debugCSVWriter = csv.writer(open(self.debugCSVPath, "w", newline="", encoding="utf-8"))
+                    header_append_keys = ["dataType", "sampleRate"]
+                    channel_samples_header = list(vars(sensorDataResult.channelSamples[0][0]).keys())
+                    for key_item in header_append_keys:
+                        channel_samples_header.append(key_item)
+                    self.debugCSVWriter.writerow(channel_samples_header)
+                except Exception as e:
+                    print(e)
+
+            if self.debugCSVWriter != None:
+                try:
+                    for i, channel_sample_list in enumerate(sensorDataResult.channelSamples):
+                        for channel_sample in channel_sample_list:
+                            row_data = []
+
+                            for key in vars(channel_sample).keys():
+                                row_data.append(getattr(channel_sample, key))
+                            row_data.append(sensorDataResult.dataType)
+                            row_data.append(sensorDataResult.sampleRate)
+                            self.debugCSVWriter.writerow(row_data)
+                except Exception as e:
+                    print(e)
+
             startIndex += sensorData.minPackageSampleCount
 
         leftChannelSamples = []
@@ -497,279 +627,13 @@ class SensorProfileDataCtx:
         for sensorDataResult in sensorDataList:
             buf.put(sensorDataResult)
 
-    def calc_crc8(self, data):
-        crc8Table = [
-            0x00,
-            0x07,
-            0x0E,
-            0x09,
-            0x1C,
-            0x1B,
-            0x12,
-            0x15,
-            0x38,
-            0x3F,
-            0x36,
-            0x31,
-            0x24,
-            0x23,
-            0x2A,
-            0x2D,
-            0x70,
-            0x77,
-            0x7E,
-            0x79,
-            0x6C,
-            0x6B,
-            0x62,
-            0x65,
-            0x48,
-            0x4F,
-            0x46,
-            0x41,
-            0x54,
-            0x53,
-            0x5A,
-            0x5D,
-            0xE0,
-            0xE7,
-            0xEE,
-            0xE9,
-            0xFC,
-            0xFB,
-            0xF2,
-            0xF5,
-            0xD8,
-            0xDF,
-            0xD6,
-            0xD1,
-            0xC4,
-            0xC3,
-            0xCA,
-            0xCD,
-            0x90,
-            0x97,
-            0x9E,
-            0x99,
-            0x8C,
-            0x8B,
-            0x82,
-            0x85,
-            0xA8,
-            0xAF,
-            0xA6,
-            0xA1,
-            0xB4,
-            0xB3,
-            0xBA,
-            0xBD,
-            0xC7,
-            0xC0,
-            0xC9,
-            0xCE,
-            0xDB,
-            0xDC,
-            0xD5,
-            0xD2,
-            0xFF,
-            0xF8,
-            0xF1,
-            0xF6,
-            0xE3,
-            0xE4,
-            0xED,
-            0xEA,
-            0xB7,
-            0xB0,
-            0xB9,
-            0xBE,
-            0xAB,
-            0xAC,
-            0xA5,
-            0xA2,
-            0x8F,
-            0x88,
-            0x81,
-            0x86,
-            0x93,
-            0x94,
-            0x9D,
-            0x9A,
-            0x27,
-            0x20,
-            0x29,
-            0x2E,
-            0x3B,
-            0x3C,
-            0x35,
-            0x32,
-            0x1F,
-            0x18,
-            0x11,
-            0x16,
-            0x03,
-            0x04,
-            0x0D,
-            0x0A,
-            0x57,
-            0x50,
-            0x59,
-            0x5E,
-            0x4B,
-            0x4C,
-            0x45,
-            0x42,
-            0x6F,
-            0x68,
-            0x61,
-            0x66,
-            0x73,
-            0x74,
-            0x7D,
-            0x7A,
-            0x89,
-            0x8E,
-            0x87,
-            0x80,
-            0x95,
-            0x92,
-            0x9B,
-            0x9C,
-            0xB1,
-            0xB6,
-            0xBF,
-            0xB8,
-            0xAD,
-            0xAA,
-            0xA3,
-            0xA4,
-            0xF9,
-            0xFE,
-            0xF7,
-            0xF0,
-            0xE5,
-            0xE2,
-            0xEB,
-            0xEC,
-            0xC1,
-            0xC6,
-            0xCF,
-            0xC8,
-            0xDD,
-            0xDA,
-            0xD3,
-            0xD4,
-            0x69,
-            0x6E,
-            0x67,
-            0x60,
-            0x75,
-            0x72,
-            0x7B,
-            0x7C,
-            0x51,
-            0x56,
-            0x5F,
-            0x58,
-            0x4D,
-            0x4A,
-            0x43,
-            0x44,
-            0x19,
-            0x1E,
-            0x17,
-            0x10,
-            0x05,
-            0x02,
-            0x0B,
-            0x0C,
-            0x21,
-            0x26,
-            0x2F,
-            0x28,
-            0x3D,
-            0x3A,
-            0x33,
-            0x34,
-            0x4E,
-            0x49,
-            0x40,
-            0x47,
-            0x52,
-            0x55,
-            0x5C,
-            0x5B,
-            0x76,
-            0x71,
-            0x78,
-            0x7F,
-            0x6A,
-            0x6D,
-            0x64,
-            0x63,
-            0x3E,
-            0x39,
-            0x30,
-            0x37,
-            0x22,
-            0x25,
-            0x2C,
-            0x2B,
-            0x06,
-            0x01,
-            0x08,
-            0x0F,
-            0x1A,
-            0x1D,
-            0x14,
-            0x13,
-            0xAE,
-            0xA9,
-            0xA0,
-            0xA7,
-            0xB2,
-            0xB5,
-            0xBC,
-            0xBB,
-            0x96,
-            0x91,
-            0x98,
-            0x9F,
-            0x8A,
-            0x8D,
-            0x84,
-            0x83,
-            0xDE,
-            0xD9,
-            0xD0,
-            0xD7,
-            0xC2,
-            0xC5,
-            0xCC,
-            0xCB,
-            0xE6,
-            0xE1,
-            0xE8,
-            0xEF,
-            0xFA,
-            0xFD,
-            0xF4,
-            0xF3,
-        ]
-        crc8 = 0
-        len_data = len(data)
-
-        for i in range(len_data):
-            crc8 ^= data[i]
-            crc8 = crc8Table[crc8]
-
-        return crc8
-
-    def processUniversalData(
-        self, buf: Queue[SensorData], loop: asyncio.AbstractEventLoop, sensor, callback
-    ):
+    async def processUniversalData(self, buf: Queue[SensorData], sensor, callback):
 
         while self._is_running:
+            while self._is_running and self._rawDataBuffer.empty():
+                await asyncio.sleep(0.1)
+                continue
+
             try:
                 while self._is_running and not self._rawDataBuffer.empty():
                     data = self._rawDataBuffer.get_nowait()
@@ -795,18 +659,14 @@ class SensorProfileDataCtx:
                         index += 1
                         continue
                     crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = self.calc_crc8(
-                        self._concatDataBuffer[index + 2 : index + 2 + n]
-                    )
+                    calc_crc = utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
                     if crc != calc_crc:
                         index += 1
                         continue
                     if self._is_data_transfering:
-                        data_package = bytes(
-                            self._concatDataBuffer[index + 2 : index + 2 + n]
-                        )
-                        self._processDataPackage(data_package, buf)
-                        while self._is_running and self.isDataTransfering:
+                        data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
+                        self._processDataPackage(data_package, buf, sensor)
+                        while self._is_running and self.isDataTransfering and not buf.empty():
                             sensorData: SensorData = None
                             try:
                                 sensorData = buf.get_nowait()
@@ -814,15 +674,13 @@ class SensorProfileDataCtx:
                                 break
                             if sensorData != None and callback != None:
                                 try:
-                                    loop.call_soon_threadsafe(
-                                        callback, sensor, sensorData
-                                    )
+                                    asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
                                 except Exception as e:
                                     print(e)
 
                             buf.task_done()
-
                     last_cut = index = index + 2 + n
+
                 elif self._concatDataBuffer[index] == 0xAA:
                     if (index + 1) >= data_size:
                         index += 1
@@ -832,21 +690,18 @@ class SensorProfileDataCtx:
                         index += 1
                         continue
                     crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = self.calc_crc8(
-                        self._concatDataBuffer[index + 2 : index + 2 + n]
-                    )
+                    calc_crc = utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
                     if crc != calc_crc:
                         index += 1
                         continue
-                    data_package = bytes(
-                        self._concatDataBuffer[index + 2 : index + 2 + n]
-                    )
-                    loop.call_soon_threadsafe(
-                        self.gForce._on_cmd_response, None, data_package
-                    )
+                    data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
+                    asyncio.get_event_loop().run_in_executor(None, self.gForce._on_cmd_response, None, data_package)
                     last_cut = index = index + 2 + n
+
                 else:
                     index += 1
 
-            if last_cut > 0:
-                self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
+                if last_cut > 0:
+                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
+                    last_cut = -1
+                    index = 0

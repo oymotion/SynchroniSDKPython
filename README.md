@@ -57,6 +57,12 @@ success = SensorControllerInstance.startScan(6000)
 
 returns true if start scan success, periodInMS means onDeviceCallback will be called every periodInMS
 
+Use `def scan(period_in_ms: int) -> list[BLEDevice]` to scan once time
+
+```python
+bleDevices = SensorControllerInstance.scan(6000)
+```
+
 ### 3. Stop scan
 
 Use `def stopScan() -> None` to stop scan
@@ -111,7 +117,7 @@ sensorProfiles = SensorControllerInstance.getConnectedSensors()
 
 ### 9. Get Connected BLE Devices
 
-Use `def getConnectedDevices() -> list[SensorProfile]` to get connected BLE Devices.
+Use `def getConnectedDevices() -> list[BLEDevice]` to get connected BLE Devices.
 
 ```python
 bleDevices = SensorControllerInstance.getConnectedDevices()
@@ -329,3 +335,48 @@ batteryPower = sensorProfile.getBatteryLevel()
 ```
 
 Please check console.py in examples directory
+
+### Async methods
+
+all methods start with async is async methods, they has same params and return result as sync methods.
+
+Please check async_console.py in examples directory
+
+### setParam method
+
+Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor profile. Please call after device in 'Ready' state.
+
+Below is available key and value:
+
+```python
+result = sensorProfile.setParam("NTF_EMG", "ON")
+# set EMG data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("NTF_EEG", "ON")
+# set EEG data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("NTF_ECG", "ON")
+# set ECG data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("NTF_IMU", "ON")
+# set IMU data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("NTF_BRTH", "ON")
+# set BRTH data to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_50Hz", "ON")
+# set 50Hz notch filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_60Hz", "ON")
+# set 60Hz notch filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_HPF", "ON")
+# set 0.5Hz hpf filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("FILTER_LPF", "ON")
+# set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
+
+result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
+# set debug ble data path, result is "OK" if succeed
+# please give an absolute path and make sure it is valid and writeable by yourself
+```

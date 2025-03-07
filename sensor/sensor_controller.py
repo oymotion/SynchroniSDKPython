@@ -1,3 +1,4 @@
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Callable, Dict, List, Optional, Tuple
@@ -5,10 +6,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 import bleak
 
 from sensor import sensor_profile
+from sensor import utils
 from sensor.sensor_profile import DeviceStateEx, SensorProfile
-import asyncio
 
-from sensor.utils import start_loop, sync_timer, timer
+from sensor.utils import async_call, sync_call, async_exec
 from bleak import (
     BleakScanner,
     AdvertisementData,
@@ -26,6 +27,7 @@ class SensorController:
             with SensorController._instance_lock:
                 if not hasattr(SensorController, "_instance"):
                     SensorController._instance = object.__new__(cls)
+
         return SensorController._instance
 
     """
@@ -36,25 +38,8 @@ class SensorController:
         """
         初始化 SensorController 实例。
         """
-        self._event_loop = asyncio.new_event_loop()
-        self._event_thread = threading.Thread(
-            target=start_loop, args=(self._event_loop,)
-        )
-        self._event_thread.daemon = True
-        self._event_thread.name = "SensorController event"
-        self._event_thread.start()
-        self._gforce_event_loop = asyncio.new_event_loop()
-        self._gforce_event_thread = threading.Thread(
-            target=start_loop, args=(self._gforce_event_loop,)
-        )
-        self._gforce_event_thread.daemon = True
-        self._gforce_event_thread.name = "BLE operation"
-        self._gforce_event_thread.start()
-        self._scanner = BleakScanner(
-            detection_callback=self._match_device,
-            service_uuids=[SERVICE_GUID, RFSTAR_SERVICE_GUID],
-        )
         self._is_scanning = False
+        self._scanner: BleakScanner = None
         self._device_callback: Callable[[List[sensor_profile.BLEDevice]], None] = None
         self._device_callback_period = 0
         self._enable_callback: Callable[[bool], None] = None
@@ -65,16 +50,15 @@ class SensorController:
         反初始化 SensorController 类的实例。
 
         """
-        self._event_loop.close()
-        self._gforce_event_loop.close()
 
     def terminate(self):
+        utils._terminated = True
+
         for sensor in self._sensor_profiles.values():
-            if (
-                sensor.deviceState == DeviceStateEx.Connected
-                or sensor.deviceState == DeviceStateEx.Ready
-            ):
+            if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 sensor._destroy()
+
+        utils.Terminate()
 
     def _match_device(self, _device: bleak.BLEDevice, adv: AdvertisementData):
         if _device.name == None:
@@ -123,9 +107,7 @@ class SensorController:
         return self._device_callback != None
 
     @hasDeviceFoundCallback.setter
-    def onDeviceFoundCallback(
-        self, callback: Callable[[List[sensor_profile.BLEDevice]], None]
-    ):
+    def onDeviceFoundCallback(self, callback: Callable[[List[sensor_profile.BLEDevice]], None]):
         """
         设置扫描设备回调。
 
@@ -133,33 +115,86 @@ class SensorController:
         """
         self._device_callback = callback
 
-    async def _device_scan_callback(
+    def _process_ble_devices(
         self, found_devices: Dict[str, Tuple[bleak.BLEDevice, AdvertisementData]]
-    ):
+    ) -> List[sensor_profile.BLEDevice]:
+        devices: List[sensor_profile.BLEDevice] = list()
+        deviceMap: Dict[str, SensorProfile] = self._sensor_profiles.copy()
+        for uuid in found_devices:
+            device = found_devices[uuid][0]
+            if device.name == None:
+                continue
+            adv = found_devices[uuid][1]
+            if SERVICE_GUID in adv.service_uuids:
+                mac = None
+                if adv.service_data.get(SERVICE_GUID) != None:
+                    bytes_val = adv.service_data[SERVICE_GUID]
+                    mac = ":".join(f"{byte:02X}" for byte in bytes_val)
+                elif adv.service_data.get(RFSTAR_SERVICE_GUID) != None:
+                    bytes_val = adv.service_data[RFSTAR_SERVICE_GUID]
+                    mac = ":".join(f"{byte:02X}" for byte in reversed(bytes_val))
+
+                if mac == None:
+                    continue
+                if deviceMap.get(mac) != None:
+                    devices.append(self._sensor_profiles[mac].BLEDevice)
+                else:
+                    newSensor = SensorProfile(device, adv, mac)
+                    deviceMap[mac] = newSensor
+                    devices.append(newSensor.BLEDevice)
+
+        self._sensor_profiles = deviceMap
+        return devices
+
+    def _init_scan(self):
+        if self._scanner == None:
+            self._scanner = BleakScanner(
+                detection_callback=self._match_device,
+                service_uuids=[SERVICE_GUID, RFSTAR_SERVICE_GUID],
+            )
+
+    async def _async_scan(self, period):
+        self._is_scanning = True
+        self._init_scan()
+        found_devices = await self._scanner.discover(timeout=period / 1000, return_adv=True)
+        self._is_scanning = False
+        return self._process_ble_devices(found_devices)
+
+    def scan(self, period) -> List[sensor_profile.BLEDevice]:
+        """
+        扫描一段时间后返回BLEDevice列表。
+
+        :param            periodInMs (int): 扫描时长（毫秒）
+
+        :return:           List[sensor_profile.BLEDevice]： BLEDevice列表
+        """
+        return sync_call(self._async_scan(period))
+
+    async def asyncScan(self, period) -> List[sensor_profile.BLEDevice]:
+        """
+        扫描一段时间后返回BLEDevice列表。
+
+        :param            periodInMs (int): 扫描时长（毫秒）
+
+        :return:           List[sensor_profile.BLEDevice]： BLEDevice列表
+        """
+        return await async_call(self._async_scan(period))
+
+    async def _device_scan_callback(self, devices: List[sensor_profile.BLEDevice]):
         if self._device_callback:
-            devices: List[sensor_profile.BLEDevice] = list()
-            deviceMap: Dict[str, SensorProfile] = self._sensor_profiles.copy()
-            for mac in found_devices:
-                device = found_devices[mac][0]
-                adv = found_devices[mac][1]
-                if SERVICE_GUID in adv.service_uuids:
-                    if deviceMap.get(mac) != None:
-                        devices.append(self._sensor_profiles[mac].BLEDevice)
-                    else:
-                        newSensor = SensorProfile(device, adv, self._gforce_event_loop)
-                        deviceMap[mac] = newSensor
-                        devices.append(newSensor.BLEDevice)
-            self._sensor_profiles = deviceMap
-            self._device_callback(devices)
+            try:
+                asyncio.get_event_loop().run_in_executor(None, self._device_callback, devices)
+            except Exception as e:
+                print(e)
 
         if self._is_scanning:
-            timer(self._gforce_event_loop, 0, self._startScan())
+            async_exec(self._startScan())
 
     async def _startScan(self) -> bool:
-        devices = await self._scanner.discover(
-            timeout=self._device_callback_period / 1000, return_adv=True
-        )
-        timer(self._event_loop, 0, self._device_scan_callback(devices))
+        self._init_scan()
+        found_devices = await self._scanner.discover(timeout=self._device_callback_period / 1000, return_adv=True)
+        devices = self._process_ble_devices(found_devices)
+        async_exec(self._device_scan_callback(devices))
 
     def startScan(self, periodInMs: int) -> bool:
         """
@@ -175,7 +210,7 @@ class SensorController:
         self._is_scanning = True
         self._device_callback_period = periodInMs
 
-        timer(self._gforce_event_loop, 0, self._startScan())
+        async_exec(self._startScan())
         return True
 
     def stopScan(self) -> None:
@@ -187,9 +222,7 @@ class SensorController:
 
         self._is_scanning = False
 
-    def requireSensor(
-        self, device: sensor_profile.BLEDevice
-    ) -> Optional[SensorProfile]:
+    def requireSensor(self, device: sensor_profile.BLEDevice) -> Optional[SensorProfile]:
         """
         根据设备信息获取或创建SensorProfile。
 
@@ -221,10 +254,7 @@ class SensorController:
         """
         sensors: List[SensorProfile] = list()
         for sensor in self._sensor_profiles.values():
-            if (
-                sensor.deviceState == DeviceStateEx.Connected
-                or sensor.deviceState == DeviceStateEx.Ready
-            ):
+            if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 sensors.append(sensor)
 
         return sensors
@@ -237,10 +267,7 @@ class SensorController:
         """
         devices: List[sensor_profile.BLEDevice] = list()
         for sensor in self._sensor_profiles.values():
-            if (
-                sensor.deviceState == DeviceStateEx.Connected
-                or sensor.deviceState == DeviceStateEx.Ready
-            ):
+            if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 devices.append(sensor.BLEDevice)
 
         return devices

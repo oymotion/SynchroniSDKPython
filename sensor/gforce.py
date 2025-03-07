@@ -16,6 +16,8 @@ from bleak import (
     BleakGATTCharacteristic,
 )
 
+from sensor import utils
+
 
 @dataclass
 class Characteristic:
@@ -101,6 +103,8 @@ class Command(IntEnum):
     CMD_GET_BLE_MTU_INFO = (0xAE,)
     CMD_GET_BRT_CONFIG = (0xB3,)
 
+    CMD_SET_FRIMWARE_FILTER_SWITCH = (0xAA,)
+    CMD_GET_FRIMWARE_FILTER_SWITCH = (0xA9,)
     # Partial command packet, format: [CMD_PARTIAL_DATA, packet number in reverse order, packet content]
     MD_PARTIAL_DATA = 0xFF
 
@@ -146,15 +150,15 @@ class DataSubscription(IntEnum):
     LOG = (0x00000800,)
 
     DNF_EEG = (0x00010000,)
-    
+
     DNF_ECG = (0x00020000,)
-    
+
     DNF_IMPEDANCE = (0x00040000,)
-    
+
     DNF_IMU = (0x00080000,)
-    
+
     DNF_ADS = (0x00100000,)
-    
+
     DNF_BRTH = (0x00200000,)
 
     DNF_CONCAT_BLE = (0x80000000,)
@@ -181,8 +185,8 @@ class DataType(IntEnum):
 
 class SampleResolution(IntEnum):
     BITS_8 = (8,)
-    BITS_12 = 12,
-    BITS_16 = 16,
+    BITS_12 = (12,)
+    BITS_16 = (16,)
     BITS_24 = 24
 
 
@@ -215,6 +219,7 @@ class EmgRawDataConfig:
         )
         return cls(fs, channel_mask, batch_len, resolution)
 
+
 @dataclass
 class EegRawDataConfig:
     fs: SamplingRate = 0
@@ -240,6 +245,7 @@ class EegRawDataConfig:
         )
         return cls(fs, channel_mask, batch_len, resolution, K)
 
+
 @dataclass
 class EegRawDataCap:
     fs: SamplingRate = 0
@@ -262,7 +268,8 @@ class EegRawDataCap:
             data,
         )
         return cls(fs, channel_count, batch_len, resolution)
-    
+
+
 @dataclass
 class EcgRawDataConfig:
     fs: SamplingRate = SamplingRate.HZ_250
@@ -287,7 +294,8 @@ class EcgRawDataConfig:
             data,
         )
         return cls(fs, channel_mask, batch_len, resolution, K)
-    
+
+
 @dataclass
 class ImuRawDataConfig:
     channel_count: int = 0
@@ -295,6 +303,7 @@ class ImuRawDataConfig:
     batch_len: int = 0
     accK: float = 0
     gyroK: float = 0
+
     def to_bytes(self) -> bytes:
         body = b""
         body += struct.pack("<i", self.channel_count)
@@ -311,7 +320,8 @@ class ImuRawDataConfig:
             data,
         )
         return cls(channel_count, fs, batch_len, accK, gyroK)
-    
+
+
 @dataclass
 class BrthRawDataConfig:
     fs: SamplingRate = 0
@@ -336,7 +346,8 @@ class BrthRawDataConfig:
             data,
         )
         return cls(fs, channel_mask, batch_len, resolution, K)
-        
+
+
 @dataclass
 class Request:
     cmd: Command
@@ -371,24 +382,41 @@ class GForce:
         self._num_channels = 8
         self._device = device
         self._is_universal_stream = isUniversalStream
-        self._raw_data_buf:queue.Queue[bytes] = None
+        self._raw_data_buf: queue.Queue[bytes] = None
         self.packet_id = 0
         self.data_packet = []
 
     async def connect(self, disconnect_cb, buf: queue.Queue[bytes]):
         client = BleakClient(self._device, disconnected_callback=disconnect_cb)
-        await client.connect()
-
         self.client = client
         self.device_name = self._device.name
         self._raw_data_buf = buf
-        if (not self._is_universal_stream):
-            await client.start_notify(self.cmd_char,self._on_cmd_response)
-        else:
-            await client.start_notify(self.data_char,self._on_universal_response)
+
+        try:
+            await asyncio.wait_for(client.connect(), utils._TIMEOUT)
+        except Exception as e:
+            return
+
+        if not client.is_connected:
+            return
+
+        try:
+            if not self._is_universal_stream:
+                await asyncio.wait_for(
+                    client.start_notify(self.cmd_char, self._on_cmd_response),
+                    utils._TIMEOUT,
+                )
+            else:
+                await asyncio.wait_for(
+                    client.start_notify(self.data_char, self._on_universal_response),
+                    utils._TIMEOUT,
+                )
+        except Exception as e:
+            return
 
     def _on_data_response(self, q: Queue[bytes], bs: bytearray):
         bs = bytes(bs)
+
         full_packet = []
 
         is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
@@ -477,9 +505,7 @@ class GForce:
     def _convert_acceleration_to_g(data: bytes) -> np.ndarray[np.float32]:
         normalizing_factor = 65536.0
 
-        acceleration_data = (
-            np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        )
+        acceleration_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
         num_channels = 3
 
         return acceleration_data.reshape(-1, num_channels)
@@ -488,9 +514,7 @@ class GForce:
     def _convert_gyro_to_dps(data: bytes) -> np.ndarray[np.float32]:
         normalizing_factor = 65536.0
 
-        gyro_data = (
-            np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        )
+        gyro_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
         num_channels = 3
 
         return gyro_data.reshape(-1, num_channels)
@@ -499,9 +523,7 @@ class GForce:
     def _convert_magnetometer_to_ut(data: bytes) -> np.ndarray[np.float32]:
         normalizing_factor = 65536.0
 
-        magnetometer_data = (
-            np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
-        )
+        magnetometer_data = np.frombuffer(data, dtype=np.int32).astype(np.float32) / normalizing_factor
         num_channels = 3
 
         return magnetometer_data.reshape(-1, num_channels)
@@ -537,6 +559,7 @@ class GForce:
         num_channels = 6
 
         return emg_gesture_data.reshape(-1, num_channels)
+
     def _on_universal_response(self, _: BleakGATTCharacteristic, bs: bytearray):
         self._raw_data_buf.put_nowait(bytes(bs))
 
@@ -675,7 +698,6 @@ class GForce:
             )
         )
 
-
     async def system_reset(self):
         await self._send_request(
             Request(
@@ -684,11 +706,8 @@ class GForce:
             )
         )
 
-
     async def set_motor(self, switchStatus):
-        body = [
-            switchStatus == True
-        ]
+        body = [switchStatus == True]
         body = bytes(body)
         ret = await self._send_request(
             Request(
@@ -699,9 +718,7 @@ class GForce:
         )
 
     async def set_led(self, switchStatus):
-        body = [
-            switchStatus == True
-        ]
+        body = [switchStatus == True]
         body = bytes(body)
         ret = await self._send_request(
             Request(
@@ -712,9 +729,7 @@ class GForce:
         )
 
     async def set_log_level(self, logLevel):
-        body = [
-            0xFF & logLevel
-        ]
+        body = [0xFF & logLevel]
         body = bytes(body)
         ret = await self._send_request(
             Request(
@@ -724,6 +739,14 @@ class GForce:
             )
         )
 
+    async def set_firmware_filter_switch(self, switchStatus: int):
+        body = [0xFF & switchStatus]
+        body = bytes(body)
+        await self._send_request(Request(cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH, body=body, has_res=True))
+
+    async def get_firmware_filter_switch(self):
+        buf = await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
+        return buf[0]
 
     async def set_emg_raw_data_config(self, cfg=EmgRawDataConfig()):
         body = cfg.to_bytes()
@@ -757,7 +780,7 @@ class GForce:
             )
         )
         return EmgRawDataConfig.from_bytes(buf)
-    
+
     async def get_eeg_raw_data_config(self) -> EegRawDataConfig:
         buf = await self._send_request(
             Request(
@@ -766,7 +789,7 @@ class GForce:
             )
         )
         return EegRawDataConfig.from_bytes(buf)
-    
+
     async def get_eeg_raw_data_cap(self) -> EegRawDataCap:
         buf = await self._send_request(
             Request(
@@ -784,7 +807,7 @@ class GForce:
             )
         )
         return EcgRawDataConfig.from_bytes(buf)
-    
+
     async def get_imu_raw_data_config(self) -> ImuRawDataConfig:
         buf = await self._send_request(
             Request(
@@ -792,8 +815,8 @@ class GForce:
                 has_res=True,
             )
         )
-        return ImuRawDataConfig.from_bytes(buf)     
-    
+        return ImuRawDataConfig.from_bytes(buf)
+
     async def get_brth_raw_data_config(self) -> BrthRawDataConfig:
         buf = await self._send_request(
             Request(
@@ -801,8 +824,8 @@ class GForce:
                 has_res=True,
             )
         )
-        return BrthRawDataConfig.from_bytes(buf)   
-             
+        return BrthRawDataConfig.from_bytes(buf)
+
     async def set_subscription(self, subscription: DataSubscription):
         body = [
             0xFF & subscription,
@@ -819,20 +842,23 @@ class GForce:
             )
         )
 
-    async def start_streaming(self, q:queue.Queue):
-        await self.client.start_notify(
-            self.data_char,
-            lambda _, data: self._on_data_response(q, data),
+    async def start_streaming(self, q: queue.Queue):
+        await asyncio.wait_for(
+            self.client.start_notify(
+                self.data_char,
+                lambda _, data: self._on_data_response(q, data),
+            ),
+            utils._TIMEOUT,
         )
 
     async def stop_streaming(self):
         exceptions = []
+        # try:
+        #     await asyncio.wait_for(self.set_subscription(DataSubscription.OFF), utils._TIMEOUT)
+        # except Exception as e:
+        #     exceptions.append(e)
         try:
-            await self.set_subscription(DataSubscription.OFF)
-        except Exception as e:
-            exceptions.append(e)
-        try:
-            await self.client.stop_notify(self.data_char)
+            await asyncio.wait_for(self.client.stop_notify(self.data_char), utils._TIMEOUT)
         except Exception as e:
             exceptions.append(e)
 
@@ -841,7 +867,10 @@ class GForce:
 
     async def disconnect(self):
         with suppress(asyncio.CancelledError):
-            await self.client.disconnect()
+            try:
+                await asyncio.wait_for(self.client.disconnect(), utils._TIMEOUT)
+            except Exception as e:
+                pass
 
     def _get_response_channel(self, cmd: Command) -> Queue:
         q = Queue()
@@ -856,9 +885,12 @@ class GForce:
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
-        await self.client.write_gatt_char(self.cmd_char, bs)
+        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), utils._TIMEOUT)
 
         if not req.has_res:
             return None
 
-        return await asyncio.wait_for(q.get(), 3)
+        try:
+            return await asyncio.wait_for(q.get(), utils._TIMEOUT)
+        except Exception as e:
+            return None
