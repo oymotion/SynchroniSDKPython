@@ -16,7 +16,7 @@ from bleak import (
     BleakGATTCharacteristic,
 )
 
-from sensor import utils
+from sensor import sensor_utils
 
 
 @dataclass
@@ -393,7 +393,7 @@ class GForce:
         self._raw_data_buf = buf
 
         try:
-            await asyncio.wait_for(client.connect(), utils._TIMEOUT)
+            await asyncio.wait_for(client.connect(), sensor_utils._TIMEOUT)
         except Exception as e:
             return
 
@@ -404,12 +404,12 @@ class GForce:
             if not self._is_universal_stream:
                 await asyncio.wait_for(
                     client.start_notify(self.cmd_char, self._on_cmd_response),
-                    utils._TIMEOUT,
+                    sensor_utils._TIMEOUT,
                 )
             else:
                 await asyncio.wait_for(
                     client.start_notify(self.data_char, self._on_universal_response),
-                    utils._TIMEOUT,
+                    sensor_utils._TIMEOUT,
                 )
         except Exception as e:
             return
@@ -728,6 +728,17 @@ class GForce:
             )
         )
 
+    async def set_package_id(self, switchStatus):
+        body = [switchStatus == True]
+        body = bytes(body)
+        ret = await self._send_request(
+            Request(
+                cmd=Command.PACKAGE_ID_CONTROL,
+                body=body,
+                has_res=True,
+            )
+        )
+
     async def set_log_level(self, logLevel):
         body = [0xFF & logLevel]
         body = bytes(body)
@@ -848,17 +859,17 @@ class GForce:
                 self.data_char,
                 lambda _, data: self._on_data_response(q, data),
             ),
-            utils._TIMEOUT,
+            sensor_utils._TIMEOUT,
         )
 
     async def stop_streaming(self):
         exceptions = []
         # try:
-        #     await asyncio.wait_for(self.set_subscription(DataSubscription.OFF), utils._TIMEOUT)
+        #     await asyncio.wait_for(self.set_subscription(DataSubscription.OFF), sensor_utils._TIMEOUT)
         # except Exception as e:
         #     exceptions.append(e)
         try:
-            await asyncio.wait_for(self.client.stop_notify(self.data_char), utils._TIMEOUT)
+            await asyncio.wait_for(self.client.stop_notify(self.data_char), sensor_utils._TIMEOUT)
         except Exception as e:
             exceptions.append(e)
 
@@ -868,7 +879,7 @@ class GForce:
     async def disconnect(self):
         with suppress(asyncio.CancelledError):
             try:
-                await asyncio.wait_for(self.client.disconnect(), utils._TIMEOUT)
+                await asyncio.wait_for(self.client.disconnect(), sensor_utils._TIMEOUT)
             except Exception as e:
                 pass
 
@@ -885,12 +896,12 @@ class GForce:
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
-        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), utils._TIMEOUT)
+        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), sensor_utils._TIMEOUT)
 
         if not req.has_res:
             return None
 
         try:
-            return await asyncio.wait_for(q.get(), utils._TIMEOUT)
+            return await asyncio.wait_for(q.get(), sensor_utils._TIMEOUT)
         except Exception as e:
             return None

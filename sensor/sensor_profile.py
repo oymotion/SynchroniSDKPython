@@ -10,7 +10,7 @@ from bleak import (
     BleakClient,
 )
 
-from sensor import utils
+from sensor import sensor_utils
 from sensor.gforce import GForce
 from sensor.sensor_data import SensorData
 import asyncio
@@ -18,7 +18,7 @@ import asyncio
 
 from sensor.sensor_data_context import SensorProfileDataCtx
 from sensor.sensor_device import BLEDevice, DeviceInfo, DeviceStateEx
-from sensor.utils import async_call, sync_call, async_exec
+from sensor.sensor_utils import async_call, sync_call, async_exec
 
 SERVICE_GUID = "0000ffd0-0000-1000-8000-00805f9b34fb"
 OYM_CMD_NOTIFY_CHAR_UUID = "f000ffe1-0451-4000-b000-000000000000"
@@ -212,7 +212,7 @@ class SensorProfile:
         self._on_power_changed = callback
 
     async def _connect(self) -> bool:
-        if utils._terminated:
+        if sensor_utils._terminated:
             return False
 
         if self._event_loop == None:
@@ -292,7 +292,7 @@ class SensorProfile:
         return await async_call(self._connect())
 
     async def _waitForDisconnect(self) -> bool:
-        while not utils._terminated and self.deviceState != DeviceStateEx.Disconnected:
+        while not sensor_utils._terminated and self.deviceState != DeviceStateEx.Disconnected:
             await asyncio.sleep(1)
         return True
 
@@ -303,7 +303,7 @@ class SensorProfile:
             return False
         self._set_device_state(DeviceStateEx.Disconnecting)
         await self._gforce.disconnect()
-        await asyncio.wait_for(self._waitForDisconnect(), utils._TIMEOUT)
+        await asyncio.wait_for(self._waitForDisconnect(), sensor_utils._TIMEOUT)
 
         return True
 
@@ -393,7 +393,7 @@ class SensorProfile:
 
         result = await self._data_ctx.stop_streaming()
         self._is_starting = False
-        return not result
+        return result
 
     def stopDataNotification(self) -> bool:
         """
@@ -422,12 +422,12 @@ class SensorProfile:
         return await async_call(self._stopDataNotification())
 
     async def _refresh_power(self):
-        while not utils._terminated and self.deviceState == DeviceStateEx.Ready:
+        while not sensor_utils._terminated and self.deviceState == DeviceStateEx.Ready:
             await asyncio.sleep(self._power_interval / 1000)
 
             self._power = await self._gforce.get_battery_level()
 
-            if self._event_loop != None and self._on_power_changed != None:
+            if not sensor_utils._terminated and self._event_loop != None and self._on_power_changed != None:
                 try:
                     asyncio.get_event_loop().run_in_executor(None, self._on_power_changed, self, self._power)
                 except Exception as e:
@@ -443,7 +443,7 @@ class SensorProfile:
 
         if await self._data_ctx.init(packageSampleCount):
             self._power_interval = powerRefreshInterval
-            utils.async_exec(self._refresh_power())
+            sensor_utils.async_exec(self._refresh_power())
 
         return self._data_ctx.hasInit()
 

@@ -7,8 +7,8 @@ import struct
 from typing import Deque, List
 from concurrent.futures import ThreadPoolExecutor
 import csv
-from sensor import utils
-from sensor.gforce import DataSubscription, GForce
+from sensor import sensor_utils
+from sensor.gforce import DataSubscription, GForce, SamplingRate
 from sensor.sensor_data import DataType, Sample, SensorData
 
 from enum import Enum, IntEnum
@@ -22,7 +22,8 @@ class SensorDataType(IntEnum):
     DATA_TYPE_ACC = 2
     DATA_TYPE_GYRO = 3
     DATA_TYPE_BRTH = 4
-    DATA_TYPE_COUNT = 5
+    DATA_TYPE_EMG = 5
+    DATA_TYPE_COUNT = 6
 
 
 # 枚举 FeatureMaps 的 Python 实现
@@ -113,6 +114,31 @@ class SensorProfileDataCtx:
 
     def hasConcatBLE(self):
         return (self.featureMap & FeatureMaps.GFD_FEAT_CONCAT_BLE.value) != 0
+
+    async def initEMG(self, packageCount: int) -> int:
+        config = await self.gForce.get_emg_raw_data_config()
+        data = SensorData()
+        data.deviceMac = self.deviceMac
+        data.dataType = DataType.NTF_EMG
+        data.sampleRate = 500
+        data.resolutionBits = 0
+        data.channelCount = 8
+        data.channelMask = config.channel_mask
+        data.minPackageSampleCount = packageCount
+        data.packageSampleCount = 8
+        data.K = 4000000.0 / 8388607.0
+        data.clear()
+        self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
+        self.notifyDataFlag |= DataSubscription.EMG_RAW
+
+        config.fs = SamplingRate.HZ_500
+        config.channel_mask = 255
+        config.resolution = 8
+        config.batch_len = 128
+        await self.gForce.set_emg_raw_data_config(config)
+
+        await self.gForce.set_package_id(True)
+        return data.channelCount
 
     async def initEEG(self, packageCount: int) -> int:
         config = await self.gForce.get_eeg_raw_data_config()
@@ -234,23 +260,23 @@ class SensorProfileDataCtx:
             if self.hasImpedance():
                 self.notifyDataFlag |= DataSubscription.DNF_IMPEDANCE
 
-            if self.hasEEG() & (self.init_map["NTF_EEG"] == "ON"):
-                # print("initEEG")
+            if self.hasEMG() and (self.init_map["NTF_EMG"] == "ON"):
+                info.EmgChannelCount = await self.initEMG(packageCount)
+                info.EmgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EMG].sampleRate
+
+            if self.hasEEG() and (self.init_map["NTF_EEG"] == "ON"):
                 info.EegChannelCount = await self.initEEG(packageCount)
                 info.EegSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].sampleRate
 
-            if self.hasECG() & (self.init_map["NTF_ECG"] == "ON"):
-                # print("initECG")
+            if self.hasECG() and (self.init_map["NTF_ECG"] == "ON"):
                 info.EcgChannelCount = await self.initECG(packageCount)
                 info.EcgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ECG].sampleRate
 
-            if self.hasBrth() & (self.init_map["NTF_BRTH"] == "ON"):
-                # print("initBrth")
+            if self.hasBrth() and (self.init_map["NTF_BRTH"] == "ON"):
                 info.BrthChannelCount = await self.initBrth(packageCount)
                 info.BrthSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH].sampleRate
 
-            if self.hasIMU() & (self.init_map["NTF_IMU"] == "ON"):
-                # print("initIMU")
+            if self.hasIMU() and (self.init_map["NTF_IMU"] == "ON"):
                 imuChannelCount = await self.initIMU(packageCount)
                 info.AccChannelCount = imuChannelCount
                 info.GyroChannelCount = imuChannelCount
@@ -365,7 +391,7 @@ class SensorProfileDataCtx:
                     sensorData = buf.get_nowait()
                 except Exception as e:
                     break
-                if sensorData != None and callback != None:
+                if not sensor_utils._terminated and sensorData != None and callback != None:
                     try:
                         asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
                     except Exception as e:
@@ -374,7 +400,7 @@ class SensorProfileDataCtx:
                 buf.task_done()
 
     def _processDataPackage(self, data: bytes, buf: Queue[SensorData], sensor):
-        v = data[0]
+        v = data[0] & 0x7F
         if v == DataType.NTF_IMPEDANCE:
             offset = 1
             # packageIndex = ((data[offset + 1] & 0xff) << 8) | (data[offset] & 0xff)
@@ -397,7 +423,10 @@ class SensorProfileDataCtx:
 
             self.impedanceData = impedanceData
             self.saturationData = saturationData
-
+        elif v == DataType.NTF_EMG:
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
+            if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
+                self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_EEG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
             if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
@@ -421,7 +450,7 @@ class SensorProfileDataCtx:
 
     def checkReadSamples(self, sensor, data: bytes, sensorData: SensorData, dataOffset: int, dataGap: int):
         offset = 1
-        v = data[0]
+
         if not self._is_data_transfering:
             return False
         try:
@@ -430,6 +459,8 @@ class SensorProfileDataCtx:
             offset += 2
             newPackageIndex = packageIndex
             lastPackageIndex = sensorData.lastPackageIndex
+            if sensorData.lastPackageCounter == 0 and sensorData.lastPackageIndex == 0 and packageIndex > 1:
+                return False
 
             if packageIndex < lastPackageIndex:
                 packageIndex += 65536  # 包索引是 U16 类型
@@ -448,13 +479,14 @@ class SensorProfileDataCtx:
                     + str(lostSampleCount)
                 )
                 # print(lostLog)
-                if sensor._event_loop != None and sensor._on_error_callback != None:
+                if not sensor_utils._terminated and sensor._event_loop != None and sensor._on_error_callback != None:
                     try:
                         asyncio.get_event_loop().run_in_executor(None, sensor._on_error_callback, sensor, lostLog)
                     except Exception as e:
                         pass
+                if lostSampleCount < 100:
+                    self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
 
-                self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
                 if newPackageIndex == 0:
                     sensorData.lastPackageIndex = 65535
                 else:
@@ -468,6 +500,12 @@ class SensorProfileDataCtx:
             print(e)
             return False
         return True
+
+    def transTrainData(self, data: int):
+        xout = data >> 4
+        exp = data & 0x0000000F
+        xout = xout << exp
+        return xout
 
     def readSamples(
         self,
@@ -536,6 +574,10 @@ class SensorProfileDataCtx:
                             rawData = (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
                             rawData -= 8388608
                             offset += 3
+                        elif sensorData.resolutionBits == 0:
+                            rawData = struct.unpack_from("<h", data, offset)[0]
+                            offset += 2
+                            rawData = self.transTrainData(rawData)
 
                         converted = rawData * K
                         dataItem.rawData = rawData
@@ -659,7 +701,7 @@ class SensorProfileDataCtx:
                         index += 1
                         continue
                     crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
+                    calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
                     if crc != calc_crc:
                         index += 1
                         continue
@@ -672,7 +714,7 @@ class SensorProfileDataCtx:
                                 sensorData = buf.get_nowait()
                             except Exception as e:
                                 break
-                            if sensorData != None and callback != None:
+                            if not sensor_utils._terminated and sensorData != None and callback != None:
                                 try:
                                     asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
                                 except Exception as e:
@@ -690,12 +732,13 @@ class SensorProfileDataCtx:
                         index += 1
                         continue
                     crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
+                    calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
                     if crc != calc_crc:
                         index += 1
                         continue
                     data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
-                    asyncio.get_event_loop().run_in_executor(None, self.gForce._on_cmd_response, None, data_package)
+                    if not sensor_utils._terminated:
+                        asyncio.get_event_loop().run_in_executor(None, self.gForce._on_cmd_response, None, data_package)
                     last_cut = index = index + 2 + n
 
                 else:

@@ -81,10 +81,10 @@ isScanning = SensorControllerInstance.isScanning
 
 ### 5. Check if bluetooth is enabled
 
-Use `property isEnabled: bool` to check if bluetooth is enabled
+Use `property isEnable: bool` to check if bluetooth is enable
 
 ```python
-isEnabled = SensorControllerInstance.isEnabled
+isEnable = SensorControllerInstance.isEnable
 ```
 
 ### 6. Create SensorProfile

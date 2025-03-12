@@ -1,3 +1,4 @@
 sensor-sdk
 PyQt5
 matplotlib
+scipy

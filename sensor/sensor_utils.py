@@ -25,10 +25,18 @@ def checkRunLoop():
             _event_thread.daemon = True
             _event_thread.name = "SensorController event"
             _event_thread.start()
+            time.sleep(0.1)
 
 
 def Terminate():
-    global _runloop, _needCloseRunloop, _event_thread
+    global _runloop, _needCloseRunloop, _event_thread, _terminated
+    _terminated = True
+    try:
+        for task in asyncio.all_tasks():
+            task.cancel()
+    except Exception as e:
+        pass
+
     if _needCloseRunloop:
         try:
             _runloop.stop()
@@ -85,6 +93,7 @@ async def async_call(function, _timeout=_TIMEOUT) -> any:
 
 
 def start_loop(loop: asyncio.BaseEventLoop):
+    # asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.set_event_loop(loop)
     loop.run_forever()
 

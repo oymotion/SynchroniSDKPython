@@ -6,10 +6,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 import bleak
 
 from sensor import sensor_profile
-from sensor import utils
+from sensor import sensor_utils
 from sensor.sensor_profile import DeviceStateEx, SensorProfile
 
-from sensor.utils import async_call, sync_call, async_exec
+from sensor.sensor_utils import async_call, sync_call, async_exec
 from bleak import (
     BleakScanner,
     AdvertisementData,
@@ -52,13 +52,13 @@ class SensorController:
         """
 
     def terminate(self):
-        utils._terminated = True
+        sensor_utils._terminated = True
 
         for sensor in self._sensor_profiles.values():
             if sensor.deviceState == DeviceStateEx.Connected or sensor.deviceState == DeviceStateEx.Ready:
                 sensor._destroy()
 
-        utils.Terminate()
+        sensor_utils.Terminate()
 
     def _match_device(self, _device: bleak.BLEDevice, adv: AdvertisementData):
         if _device.name == None:
@@ -71,7 +71,7 @@ class SensorController:
         return False
 
     @property
-    def isScaning(self) -> bool:
+    def isScanning(self) -> bool:
         """
         检查是否正在扫描。
 
@@ -181,13 +181,13 @@ class SensorController:
         return await async_call(self._async_scan(period))
 
     async def _device_scan_callback(self, devices: List[sensor_profile.BLEDevice]):
-        if self._device_callback:
+        if not sensor_utils._terminated and self._device_callback:
             try:
                 asyncio.get_event_loop().run_in_executor(None, self._device_callback, devices)
             except Exception as e:
                 print(e)
 
-        if self._is_scanning:
+        if not sensor_utils._terminated and self._is_scanning:
             async_exec(self._startScan())
 
     async def _startScan(self) -> bool:

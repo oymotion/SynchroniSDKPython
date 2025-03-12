@@ -38,6 +38,7 @@ class Sample:
 class DataType(IntEnum):
     NTF_ACC = 0x1  # 加速度，用于标识加速度传感器采集的数据
     NTF_GYRO = 0x2  # 陀螺仪，用于标识陀螺仪传感器采集的数据
+    NTF_EMG = 0x8  # EMG，用于标识肌电传感器采集的数据
     NTF_EEG = 0x10  # EEG，用于标识脑电传感器采集的数据
     NTF_ECG = 0x11  # ECG，用于标识心电传感器采集的数据
     NTF_IMPEDANCE = (0x12,)  # 阻抗数据
