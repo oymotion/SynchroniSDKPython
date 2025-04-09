@@ -15,7 +15,7 @@ _needCloseRunloop = False
 
 def checkRunLoop():
     global _runloop, _needCloseRunloop, _event_thread
-    if _runloop == None:
+    if _runloop == None or not _runloop.is_running():
         try:
             _runloop = asyncio.get_running_loop()
         except Exception as e:
@@ -45,11 +45,13 @@ def Terminate():
             pass
 
 
-def async_exec(function):
+def async_exec(function, runloop=None):
     checkRunLoop()
+    if runloop == None:
+        runloop = _runloop
     task: asyncio.Future = None
     try:
-        task = asyncio.run_coroutine_threadsafe(function, _runloop)
+        task = asyncio.run_coroutine_threadsafe(function, runloop)
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:
@@ -57,11 +59,13 @@ def async_exec(function):
         pass
 
 
-def sync_call(function, _timeout=_TIMEOUT) -> any:
+def sync_call(function, _timeout=_TIMEOUT, runloop=None) -> any:
     checkRunLoop()
     task: asyncio.Future = None
+    if runloop == None:
+        runloop = _runloop
     try:
-        task = asyncio.run_coroutine_threadsafe(asyncio.wait_for(function, _timeout), _runloop)
+        task = asyncio.run_coroutine_threadsafe(asyncio.wait_for(function, _timeout), runloop)
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
         return task.result(timeout=_timeout)
@@ -70,11 +74,13 @@ def sync_call(function, _timeout=_TIMEOUT) -> any:
         pass
 
 
-async def async_call(function, _timeout=_TIMEOUT) -> any:
+async def async_call(function, _timeout=_TIMEOUT, runloop=None) -> any:
     checkRunLoop()
     task: asyncio.Future = None
+    if runloop == None:
+        runloop = _runloop
     try:
-        task = asyncio.run_coroutine_threadsafe(asyncio.wait_for(function, _timeout), _runloop)
+        task = asyncio.run_coroutine_threadsafe(asyncio.wait_for(function, _timeout), runloop)
         running_tasks.add(task)
         task.add_done_callback(lambda t: running_tasks.remove(t))
     except Exception as e:

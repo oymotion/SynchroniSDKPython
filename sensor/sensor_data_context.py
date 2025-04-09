@@ -351,7 +351,7 @@ class SensorProfileDataCtx:
                     switch |= 8
         try:
             await self.gForce.set_firmware_filter_switch(switch)
-            await asyncio.sleep(0.1)
+            # await asyncio.sleep(0.1)
             return "OK"
         except Exception as e:
             return "ERROR: " + str(e)
@@ -738,7 +738,7 @@ class SensorProfileDataCtx:
                         continue
                     data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
                     if not sensor_utils._terminated:
-                        asyncio.get_event_loop().run_in_executor(None, self.gForce._on_cmd_response, None, data_package)
+                        self.gForce._on_cmd_response(None, data_package)
                     last_cut = index = index + 2 + n
 
                 else:

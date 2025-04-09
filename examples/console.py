@@ -16,7 +16,7 @@ def SimpleTest():
     if not SensorControllerInstance.hasDeviceFoundCallback:
         SensorControllerInstance.onDeviceFoundCallback = deviceFoundCallback
 
-    if not SensorControllerInstance.isScaning:
+    if not SensorControllerInstance.isScanning:
         print("start scan")
         if not SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS):
             print("please try scan later")

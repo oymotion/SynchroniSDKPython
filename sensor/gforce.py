@@ -377,6 +377,7 @@ class GForce:
         self.client = None
         self.cmd_char = cmd_char
         self.data_char = data_char
+        self.current_request: Request = None
         self.responses: Dict[Command, Queue] = {}
         self.resolution = SampleResolution.BITS_8
         self._num_channels = 8
@@ -565,11 +566,14 @@ class GForce:
 
     def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray):
         try:
+            # print(bytes(bs))
             response = self._parse_response(bytes(bs))
-            if response.cmd in self.responses:
+            if self.responses.get(response.cmd) != None:
                 self.responses[response.cmd].put_nowait(
                     response.data,
                 )
+            else:
+                print("invalid response:" + bytes(bs))
         except Exception as e:
             raise Exception("Failed to parse response: %s" % e)
 
@@ -884,24 +888,44 @@ class GForce:
                 pass
 
     def _get_response_channel(self, cmd: Command) -> Queue:
+        if self.responses.get(cmd) != None:
+            return None
+
         q = Queue()
         self.responses[cmd] = q
         return q
 
     async def _send_request(self, req: Request) -> Optional[bytes]:
+
         q = None
         if req.has_res:
             q = self._get_response_channel(req.cmd)
+            if q == None:
+                # print("duplicate")
+                return None
 
+        while self.current_request != None:
+            # print("wait")
+            await asyncio.sleep(0.1)
+
+        self.current_request = req
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
-        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs), sensor_utils._TIMEOUT)
+
+        # print(str(req.cmd) + str(req.body))
+        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs, response=False), 0.1)
 
         if not req.has_res:
+            self.current_request = None
             return None
 
         try:
-            return await asyncio.wait_for(q.get(), sensor_utils._TIMEOUT)
+            ret = await asyncio.wait_for(q.get(), 0.5)
+            self.current_request = None
+            self.responses[req.cmd] = None
+            return ret
         except Exception as e:
+            self.current_request = None
+            self.responses[req.cmd] = None
             return None
