@@ -364,10 +364,10 @@ result = sensorProfile.setParam("NTF_IMU", "ON")
 result = sensorProfile.setParam("NTF_BRTH", "ON")
 # set BRTH data to ON or OFF, result is "OK" if succeed
 
-result = sensorProfile.setParam("FILTER_50Hz", "ON")
+result = sensorProfile.setParam("FILTER_50HZ", "ON")
 # set 50Hz notch filter to ON or OFF, result is "OK" if succeed
 
-result = sensorProfile.setParam("FILTER_60Hz", "ON")
+result = sensorProfile.setParam("FILTER_60HZ", "ON")
 # set 60Hz notch filter to ON or OFF, result is "OK" if succeed
 
 result = sensorProfile.setParam("FILTER_HPF", "ON")

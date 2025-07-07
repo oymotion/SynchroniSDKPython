@@ -49,8 +49,8 @@ async def main():
             await sensor.asyncSetParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
             await sensor.asyncSetParam("NTF_ECG", "OFF")
             await sensor.asyncSetParam("NTF_IMU", "OFF")
-            await sensor.asyncSetParam("FILTER_50Hz", "OFF")
-            await sensor.asyncSetParam("FILTER_60Hz", "OFF")
+            await sensor.asyncSetParam("FILTER_50HZ", "OFF")
+            await sensor.asyncSetParam("FILTER_60HZ", "OFF")
             await sensor.asyncSetParam("FILTER_HPF", "OFF")
             await sensor.asyncSetParam("FILTER_LPF", "OFF")
             if not await sensor.asyncInit(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):

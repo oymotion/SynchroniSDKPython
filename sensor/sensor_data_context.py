@@ -61,7 +61,7 @@ class SensorProfileDataCtx:
         self.saturationData: List[float] = list()
         self.dataPool = ThreadPoolExecutor(1, "data")
         self.init_map = {"NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON"}
-        self.filter_map = {"FILTER_50Hz": "ON", "FILTER_60Hz": "ON", "FILTER_HPF": "ON", "FILTER_LPF": "ON"}
+        self.filter_map = {"FILTER_50HZ": "ON", "FILTER_60HZ": "ON", "FILTER_HPF": "ON", "FILTER_LPF": "ON"}
         self.debugCSVWriter = None
         self.debugCSVPath = None
 
@@ -138,6 +138,9 @@ class SensorProfileDataCtx:
         await self.gForce.set_emg_raw_data_config(config)
 
         await self.gForce.set_package_id(True)
+
+        await self.gForce.set_function_switch(2)
+
         return data.channelCount
 
     async def initEEG(self, packageCount: int) -> int:
@@ -337,10 +340,10 @@ class SensorProfileDataCtx:
         switch = 0
         for filter in self.filter_map.keys():
             value = self.filter_map[filter]
-            if filter == "FILTER_50Hz":
+            if filter == "FILTER_50HZ":
                 if value == "ON":
                     switch |= 1
-            elif filter == "FILTER_60Hz":
+            elif filter == "FILTER_60HZ":
                 if value == "ON":
                     switch |= 2
             elif filter == "FILTER_HPF":
@@ -350,8 +353,9 @@ class SensorProfileDataCtx:
                 if value == "ON":
                     switch |= 8
         try:
-            await self.gForce.set_firmware_filter_switch(switch)
-            # await asyncio.sleep(0.1)
+            ret = await self.gForce.set_firmware_filter_switch(switch)
+            if ret == None:
+                return "ERROR: not success"
             return "OK"
         except Exception as e:
             return "ERROR: " + str(e)
@@ -372,10 +376,8 @@ class SensorProfileDataCtx:
     ####################################################################################
 
     async def process_data(self, buf: Queue[SensorData], sensor, callback):
-        while self._is_running and self._rawDataBuffer.empty():
-            await asyncio.sleep(0.1)
-
-            while self._is_running and not self._rawDataBuffer.empty():
+        while self._is_running:
+            while not self._rawDataBuffer.empty():
                 try:
                     data: bytes = self._rawDataBuffer.get_nowait()
                 except Exception as e:
@@ -385,7 +387,7 @@ class SensorProfileDataCtx:
                     self._processDataPackage(data, buf, sensor)
                 self._rawDataBuffer.task_done()
 
-            while self._is_running and self.isDataTransfering and not buf.empty():
+            if self.isDataTransfering and not buf.empty():
                 sensorData: SensorData = None
                 try:
                     sensorData = buf.get_nowait()
@@ -398,6 +400,8 @@ class SensorProfileDataCtx:
                         print(e)
 
                 buf.task_done()
+            else:
+                await asyncio.sleep(0.01)
 
     def _processDataPackage(self, data: bytes, buf: Queue[SensorData], sensor):
         v = data[0] & 0x7F
@@ -423,6 +427,29 @@ class SensorProfileDataCtx:
 
             self.impedanceData = impedanceData
             self.saturationData = saturationData
+        elif v == DataType.NTF_IMPEDANCE_EXT:
+            offset = 1
+            # packageIndex = ((data[offset + 1] & 0xff) << 8) | (data[offset] & 0xff)
+            offset += 2
+
+            impedanceData = []
+            saturationData = []
+
+            dataCount = self._device_info.EegChannelCount + self._device_info.EcgChannelCount
+
+            for index in range(dataCount):
+                impedance = struct.unpack_from("<f", data, offset)[0]
+                offset += 4
+                impedanceData.append(impedance)
+
+            for index in range(dataCount):
+                saturation = struct.unpack_from("<H", data, offset)[0]
+                offset += 2
+                saturationData.append(saturation / 10)  # firmware value range 0 - 1000
+
+            self.impedanceData = impedanceData
+            self.saturationData = saturationData
+
         elif v == DataType.NTF_EMG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
             if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
@@ -673,7 +700,21 @@ class SensorProfileDataCtx:
 
         while self._is_running:
             while self._is_running and self._rawDataBuffer.empty():
-                await asyncio.sleep(0.1)
+                if self._is_running and self.isDataTransfering and not buf.empty():
+                    sensorData: SensorData = None
+                    try:
+                        sensorData = buf.get_nowait()
+                    except Exception as e:
+                        break
+                    if not sensor_utils._terminated and sensorData != None and callback != None:
+                        try:
+                            asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
+                        except Exception as e:
+                            print(e)
+
+                    buf.task_done()
+                else:
+                    await asyncio.sleep(0.01)
                 continue
 
             try:
@@ -694,53 +735,39 @@ class SensorProfileDataCtx:
 
                 if self._concatDataBuffer[index] == 0x55:
                     if (index + 1) >= data_size:
-                        index += 1
+                        index = data_size
                         continue
                     n = self._concatDataBuffer[index + 1]
-                    if (index + 1 + n + 1) >= data_size:
-                        index += 1
+                    if (index + 1 + n + 2) >= data_size:
+                        index = data_size
                         continue
-                    crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
-                    if crc != calc_crc:
+                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
+                    if crc16 != calc_crc:
                         index += 1
                         continue
                     if self._is_data_transfering:
                         data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
                         self._processDataPackage(data_package, buf, sensor)
-                        while self._is_running and self.isDataTransfering and not buf.empty():
-                            sensorData: SensorData = None
-                            try:
-                                sensorData = buf.get_nowait()
-                            except Exception as e:
-                                break
-                            if not sensor_utils._terminated and sensorData != None and callback != None:
-                                try:
-                                    asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
-                                except Exception as e:
-                                    print(e)
-
-                            buf.task_done()
-                    last_cut = index = index + 2 + n
-
+                    last_cut = index = index + 2 + n + 1
                 elif self._concatDataBuffer[index] == 0xAA:
                     if (index + 1) >= data_size:
-                        index += 1
+                        index = data_size
                         continue
                     n = self._concatDataBuffer[index + 1]
-                    if (index + 1 + n + 1) >= data_size:
-                        index += 1
+                    if (index + 1 + n + 2) >= data_size:
+                        index = data_size
                         continue
-                    crc = self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
-                    if crc != calc_crc:
+                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
+                    if crc16 != calc_crc:
                         index += 1
                         continue
                     data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
-                    if not sensor_utils._terminated:
-                        self.gForce._on_cmd_response(None, data_package)
-                    last_cut = index = index + 2 + n
 
+                    if not sensor_utils._terminated:
+                        await sensor_utils.async_call(self.gForce.async_on_cmd_response(data_package), runloop=sensor._event_loop)
+                    last_cut = index = index + 2 + n + 1
                 else:
                     index += 1
 

@@ -62,6 +62,8 @@ class SensorProfile:
         self._gforce: GForce = None
         self._data_event_loop: asyncio.AbstractEventLoop = None
         self._data_event_thread: threading.Thread = None
+        self._gforce_event_loop: asyncio.AbstractEventLoop = None
+        self._gforce_event_thread: threading.Thread = None
         self._event_loop: asyncio.AbstractEventLoop = None
         self._event_thread: threading.Thread = None
         self._is_starting = False
@@ -91,6 +93,17 @@ class SensorProfile:
                 self._event_loop = None
             except Exception as e:
                 pass
+
+        if self._gforce_event_loop != None:
+            try:
+                self._gforce_event_loop.stop()
+                self._gforce_event_loop.close()
+                self._gforce_event_loop = None
+            except Exception as e:
+                pass
+
+        self._is_starting = False
+        self._is_setting_param = False
 
     @property
     def deviceState(self) -> DeviceStateEx:
@@ -215,6 +228,13 @@ class SensorProfile:
         self._on_power_changed = callback
 
     async def _initGforce(self):
+
+        self._gforce_event_loop = asyncio.new_event_loop()
+        self._gforce_event_thread = threading.Thread(target=sensor_utils.start_loop, args=(self._gforce_event_loop,))
+        self._gforce_event_thread.daemon = True
+        self._gforce_event_thread.name = self._detail_device.name + "data event"
+        self._gforce_event_thread.start()
+
         if self._gforce == None:
             if self._adv.service_data.get(SERVICE_GUID) != None:
                 # print("OYM_SERVICE:" + self._detail_device.name)
@@ -223,21 +243,31 @@ class SensorProfile:
                     OYM_CMD_NOTIFY_CHAR_UUID,
                     OYM_DATA_NOTIFY_CHAR_UUID,
                     False,
+                    self._event_loop,
+                    self._gforce_event_loop,
                 )
             elif self._adv.service_data.get(RFSTAR_SERVICE_GUID) != None:
                 # print("RFSTAR_SERVICE:" + self._detail_device.name)
-                self._gforce = GForce(self._detail_device, RFSTAR_CMD_UUID, RFSTAR_DATA_UUID, True)
-                self._data_event_loop = asyncio.new_event_loop()
+                self._gforce = GForce(
+                    self._detail_device, RFSTAR_CMD_UUID, RFSTAR_DATA_UUID, True, self._event_loop, self._gforce_event_loop
+                )
+
             else:
                 print("Invalid device service uuid:" + self._detail_device.name + str(self._adv))
                 return False
 
+        self._data_event_loop = asyncio.new_event_loop()
+        self._data_event_thread = threading.Thread(target=sensor_utils.start_loop, args=(self._data_event_loop,))
+        self._data_event_thread.daemon = True
+        self._data_event_thread.name = self._detail_device.name + "data event"
+        self._data_event_thread.start()
+
         if self._data_ctx == None and self._gforce != None:
             self._data_ctx = SensorProfileDataCtx(self._gforce, self._device.Address, self._raw_data_buf)
         if self._data_ctx.isUniversalStream:
-            async_exec(self._process_universal_data(), self._event_loop)
+            async_exec(self._process_universal_data(), self._data_event_loop)
         else:
-            async_exec(self._process_data(), self._event_loop)
+            async_exec(self._process_data(), self._data_event_loop)
 
     async def _connect(self) -> bool:
         if sensor_utils._terminated:
@@ -249,6 +279,7 @@ class SensorProfile:
             self._event_thread.daemon = True
             self._event_thread.name = self._detail_device.name + "event"
             self._event_thread.start()
+
             self._data_buffer: Queue[SensorData] = Queue()
             self._raw_data_buf: Queue[bytes] = Queue()
 
@@ -269,7 +300,7 @@ class SensorProfile:
             self._set_device_state(DeviceStateEx.Disconnected)
             pass
 
-        await async_call(self._gforce.connect(handle_disconnect, self._raw_data_buf), runloop=self._event_loop)
+        await self._gforce.connect(handle_disconnect, self._raw_data_buf)
 
         if self._gforce != None and self._gforce.client.is_connected:
             self._set_device_state(DeviceStateEx.Connected)
@@ -313,7 +344,7 @@ class SensorProfile:
         if self._data_ctx == None:
             return False
         self._set_device_state(DeviceStateEx.Disconnecting)
-        async_exec(self._gforce.disconnect(), self._event_loop)
+        await self._gforce.disconnect()
         await asyncio.wait_for(self._waitForDisconnect(), sensor_utils._TIMEOUT)
 
         return True
@@ -353,13 +384,10 @@ class SensorProfile:
         if self._data_ctx.isDataTransfering:
             return True
 
-        if self._data_event_loop == None:
-            self._data_event_loop = asyncio.new_event_loop()
-
         self._raw_data_buf.queue.clear()
         self._data_buffer.queue.clear()
 
-        result = await async_call(self._data_ctx.start_streaming(), runloop=self._event_loop)
+        result = await async_call(self._data_ctx.start_streaming(), runloop=None)
         await asyncio.sleep(0.2)
 
         return result
@@ -413,7 +441,7 @@ class SensorProfile:
         if not self._data_ctx.isDataTransfering:
             return True
 
-        result = await async_call(self._data_ctx.stop_streaming(), runloop=self._event_loop)
+        result = await async_call(self._data_ctx.stop_streaming(), runloop=None)
         return result
 
     def stopDataNotification(self) -> bool:
@@ -553,19 +581,18 @@ class SensorProfile:
         if self.deviceState != DeviceStateEx.Ready:
             result = "Error: Please connect first"
 
-        if key in ["NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH"]:
+        if key in ["NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH", "NTF_IMPEDANCE"]:
             if value in ["ON", "OFF"]:
                 self._data_ctx.init_map[key] = value
                 result = "OK"
 
-        if key in ["FILTER_50Hz", "FILTER_60Hz", "FILTER_HPF", "FILTER_LPF"]:
+        if key in ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"]:
             if value in ["ON", "OFF"]:
                 result = await self._data_ctx.setFilter(key, value)
 
         if key == "DEBUG_BLE_DATA_PATH":
             result = await self._data_ctx.setDebugCSV(value)
 
-        self._is_setting_param = False
         return result
 
     def setParam(self, key: str, value: str) -> str:
@@ -581,11 +608,17 @@ class SensorProfile:
         if self._is_setting_param:
             return "Error: Please wait for the previous operation to complete"
 
-        self._is_setting_param = True
-        return sync_call(
-            self._setParam(key, value),
-            20,
-        )
+        try:
+            self._is_setting_param = True
+            ret = sync_call(
+                self._setParam(key, value),
+                1,
+            )
+            self._is_setting_param = False
+            return ret
+        except Exception as e:
+            self._is_setting_param = False
+            print(e)
 
     async def asyncSetParam(self, key: str, value: str) -> str:
         """
@@ -600,8 +633,14 @@ class SensorProfile:
         if self._is_setting_param:
             return "Error: Please wait for the previous operation to complete"
 
-        self._is_setting_param = True
-        return await async_call(
-            self._setParam(key, value),
-            20,
-        )
+        try:
+            self._is_setting_param = True
+            ret = await async_call(
+                self._setParam(key, value),
+                1,
+            )
+            self._is_setting_param = False
+            return ret
+        except Exception as e:
+            self._is_setting_param = False
+            print(e)

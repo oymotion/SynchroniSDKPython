@@ -3,6 +3,7 @@ import queue
 import struct
 from asyncio import Queue
 from contextlib import suppress
+from datetime import datetime
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional, Dict, List
@@ -88,6 +89,7 @@ class Command(IntEnum):
     GET_EMG_RAWDATA_CONFIG = (0x46,)
 
     SET_DATA_NOTIF_SWITCH = (0x4F,)
+    SET_FUNCTION_SWITCH = (0x85,)
 
     CMD_GET_EEG_CONFIG = (0xA0,)
     CMD_SET_EEG_CONFIG = (0xA1,)
@@ -372,12 +374,21 @@ class Response:
 
 
 class GForce:
-    def __init__(self, device: BLEDevice, cmd_char: str, data_char: str, isUniversalStream: bool):
+    def __init__(
+        self,
+        device: BLEDevice,
+        cmd_char: str,
+        data_char: str,
+        isUniversalStream: bool,
+        event_loop: asyncio.AbstractEventLoop,
+        gforce_event_loop: asyncio.AbstractEventLoop,
+    ):
         self.device_name = ""
         self.client = None
+        self.event_loop = event_loop
+        self.gforce_event_loop = gforce_event_loop
         self.cmd_char = cmd_char
         self.data_char = data_char
-        self.current_request: Request = None
         self.responses: Dict[Command, Queue] = {}
         self.resolution = SampleResolution.BITS_8
         self._num_channels = 8
@@ -394,7 +405,7 @@ class GForce:
         self._raw_data_buf = buf
 
         try:
-            await asyncio.wait_for(client.connect(), sensor_utils._TIMEOUT)
+            await sensor_utils.async_call(client.connect(), sensor_utils._TIMEOUT, self.gforce_event_loop)
         except Exception as e:
             return
 
@@ -403,19 +414,22 @@ class GForce:
 
         try:
             if not self._is_universal_stream:
-                await asyncio.wait_for(
+                await sensor_utils.async_call(
                     client.start_notify(self.cmd_char, self._on_cmd_response),
                     sensor_utils._TIMEOUT,
+                    self.gforce_event_loop,
                 )
+
             else:
-                await asyncio.wait_for(
+                await sensor_utils.async_call(
                     client.start_notify(self.data_char, self._on_universal_response),
                     sensor_utils._TIMEOUT,
+                    self.gforce_event_loop,
                 )
         except Exception as e:
             return
 
-    def _on_data_response(self, q: Queue[bytes], bs: bytearray):
+    def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray):
         bs = bytes(bs)
 
         full_packet = []
@@ -444,63 +458,6 @@ class GForce:
             return
 
         q.put_nowait(bytes(full_packet))
-        # data = None
-        # data_type = DataType(full_packet[0])
-        # packet = full_packet[1:]
-        # match data_type:
-        #     case DataType.EMG_ADC:
-        #         data = self._convert_emg_to_raw(packet)
-
-        #     case DataType.ACC:
-        #         data = self._convert_acceleration_to_g(packet)
-
-        #     case DataType.GYO:
-        #         data = self._convert_gyro_to_dps(packet)
-
-        #     case DataType.MAG:
-        #         data = self._convert_magnetometer_to_ut(packet)
-
-        #     case DataType.EULER:
-        #         data = self._convert_euler(packet)
-
-        #     case DataType.QUAT:
-        #         data = self._convert_quaternion(packet)
-
-        #     case DataType.ROTA:
-        #         data = self._convert_rotation_matrix(packet)
-
-        #     case DataType.EMG_GEST:  # It is not supported by the device (?)
-        #         data = self._convert_emg_gesture(packet)
-
-        #     case DataType.HID_MOUSE:  # It is not supported by the device
-        #         pass
-
-        #     case DataType.HID_JOYSTICK:  # It is not supported by the device
-        #         pass
-
-        #     case DataType.PARTIAL:
-        #         pass
-        #     case _:
-        #         raise Exception(
-        #             f"Unknown data type {data_type}, full packet: {full_packet}"
-        #         )
-
-        # q.put_nowait(data)
-
-    # def _convert_emg_to_raw(self, data: bytes) -> np.ndarray[np.integer]:
-    #     match self.resolution:
-    #         case SampleResolution.BITS_8:
-    #             dtype = np.uint8
-
-    #         case SampleResolution.BITS_12:
-    #             dtype = np.uint16
-
-    #         case _:
-    #             raise Exception(f"Unsupported resolution {self.resolution}")
-
-    #     emg_data = np.frombuffer(data, dtype=dtype)
-
-    #     return emg_data.reshape(-1, self._num_channels)
 
     @staticmethod
     def _convert_acceleration_to_g(data: bytes) -> np.ndarray[np.float32]:
@@ -565,6 +522,9 @@ class GForce:
         self._raw_data_buf.put_nowait(bytes(bs))
 
     def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray):
+        sensor_utils.async_exec(self.async_on_cmd_response(bs), self.event_loop)
+
+    async def async_on_cmd_response(self, bs: bytearray):
         try:
             # print(bytes(bs))
             response = self._parse_response(bytes(bs))
@@ -754,6 +714,17 @@ class GForce:
             )
         )
 
+    async def set_function_switch(self, funcSwitch):
+        body = [0xFF & funcSwitch]
+        body = bytes(body)
+        ret = await self._send_request(
+            Request(
+                cmd=Command.SET_FUNCTION_SWITCH,
+                body=body,
+                has_res=True,
+            )
+        )
+
     async def set_firmware_filter_switch(self, switchStatus: int):
         body = [0xFF & switchStatus]
         body = bytes(body)
@@ -858,22 +829,20 @@ class GForce:
         )
 
     async def start_streaming(self, q: queue.Queue):
-        await asyncio.wait_for(
+        await sensor_utils.async_call(
             self.client.start_notify(
                 self.data_char,
                 lambda _, data: self._on_data_response(q, data),
             ),
             sensor_utils._TIMEOUT,
+            self.gforce_event_loop,
         )
 
     async def stop_streaming(self):
         exceptions = []
-        # try:
-        #     await asyncio.wait_for(self.set_subscription(DataSubscription.OFF), sensor_utils._TIMEOUT)
-        # except Exception as e:
-        #     exceptions.append(e)
+
         try:
-            await asyncio.wait_for(self.client.stop_notify(self.data_char), sensor_utils._TIMEOUT)
+            await sensor_utils.async_call(self.client.stop_notify(self.data_char), sensor_utils._TIMEOUT, self.gforce_event_loop)
         except Exception as e:
             exceptions.append(e)
 
@@ -883,49 +852,62 @@ class GForce:
     async def disconnect(self):
         with suppress(asyncio.CancelledError):
             try:
-                await asyncio.wait_for(self.client.disconnect(), sensor_utils._TIMEOUT)
+                await sensor_utils.async_call(self.client.disconnect(), sensor_utils._TIMEOUT, self.gforce_event_loop)
             except Exception as e:
                 pass
 
     def _get_response_channel(self, cmd: Command) -> Queue:
         if self.responses.get(cmd) != None:
-            return None
-
-        q = Queue()
-        self.responses[cmd] = q
-        return q
+            return self.responses[cmd]
+        else:
+            q = Queue()
+            self.responses[cmd] = q
+            return q
 
     async def _send_request(self, req: Request) -> Optional[bytes]:
+        return await sensor_utils.async_call(self._send_request_internal(req=req), runloop=self.event_loop)
 
+    async def _send_request_internal(self, req: Request) -> Optional[bytes]:
         q = None
         if req.has_res:
             q = self._get_response_channel(req.cmd)
-            if q == None:
-                # print("duplicate")
-                return None
 
-        while self.current_request != None:
-            # print("wait")
-            await asyncio.sleep(0.1)
+        timeStamp_old = -1
+        while not q.empty():
+            timeStamp_old = q.get_nowait()
 
-        self.current_request = req
+        now = datetime.now()
+        timestamp_now = now.timestamp()
+        if (timeStamp_old > -1) and ((timestamp_now - timeStamp_old) < 3):
+            print("send request too fast")
+            q.put_nowait(timeStamp_old)
+            return None
+
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
 
         # print(str(req.cmd) + str(req.body))
-        await asyncio.wait_for(self.client.write_gatt_char(self.cmd_char, bs, response=False), 0.1)
+        try:
+            await sensor_utils.async_call(
+                self.client.write_gatt_char(self.cmd_char, bs),
+                1,
+                runloop=self.gforce_event_loop,
+            )
+        except Exception as e:
+            self.responses[req.cmd] = None
+            return None
 
         if not req.has_res:
-            self.current_request = None
+            self.responses[req.cmd] = None
             return None
 
         try:
-            ret = await asyncio.wait_for(q.get(), 0.5)
-            self.current_request = None
-            self.responses[req.cmd] = None
+            ret = await asyncio.wait_for(q.get(), 2)
+            now = datetime.now()
+            timestamp_now = now.timestamp()
+            q.put_nowait(timestamp_now)
             return ret
         except Exception as e:
-            self.current_request = None
             self.responses[req.cmd] = None
             return None

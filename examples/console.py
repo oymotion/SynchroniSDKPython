@@ -59,8 +59,8 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
             # sensor.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
             sensor.setParam("NTF_ECG", "OFF")
             sensor.setParam("NTF_IMU", "OFF")
-            sensor.setParam("FILTER_50Hz", "OFF")
-            sensor.setParam("FILTER_60Hz", "OFF")
+            sensor.setParam("FILTER_50HZ", "OFF")
+            sensor.setParam("FILTER_60HZ", "OFF")
             sensor.setParam("FILTER_HPF", "OFF")
             sensor.setParam("FILTER_LPF", "OFF")
             if not sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):

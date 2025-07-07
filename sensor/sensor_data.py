@@ -41,10 +41,12 @@ class DataType(IntEnum):
     NTF_EMG = 0x8  # EMG，用于标识肌电传感器采集的数据
     NTF_EEG = 0x10  # EEG，用于标识脑电传感器采集的数据
     NTF_ECG = 0x11  # ECG，用于标识心电传感器采集的数据
-    NTF_IMPEDANCE = (0x12,)  # 阻抗数据
-    NTF_IMU = (0x13,)  # 包含ACC和GYRO数据
-    NTF_ADS = (0x14,)  # 无单位ads数据
+    NTF_IMPEDANCE = 0x12  # 阻抗数据
+    NTF_IMU = 0x13  # 包含ACC和GYRO数据
+    NTF_ADS = 0x14  # 无单位ads数据
     NTF_BRTH = 0x15  # 呼吸，用于标识呼吸传感器采集的数据
+    NTF_IMPEDANCE_EXT = 0x16  # 阻抗数据扩展
+    NTF_DATA_TYPE_MAX = 0x17
 
 
 # 一次采样的数据，包含多个通道的数据，channal_samples 为一个二维数组, 第一个维度为通道索引，第二个维度为采样索引
