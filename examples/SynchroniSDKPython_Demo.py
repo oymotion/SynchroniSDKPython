@@ -105,20 +105,20 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_title("EEG Waveform (Real-time)")
 
         # 添加阻抗值显示标签
-        self.impedance_label = QtWidgets.QLabel("阻抗值: 0 Ω")
+        self.impedance_label = QtWidgets.QLabel("Impedance: 0 Ω")
         left_layout.addWidget(self.impedance_label, stretch=1)
 
         right_layout = QtWidgets.QVBoxLayout()
-        self.scan_button = QtWidgets.QPushButton("开始扫描蓝牙设备")
+        self.scan_button = QtWidgets.QPushButton("Scan device")
         self.scan_button.clicked.connect(self.start_scan)
         right_layout.addWidget(self.scan_button)
 
-        self.stop_scan_button = QtWidgets.QPushButton("停止扫描蓝牙设备")
+        self.stop_scan_button = QtWidgets.QPushButton("Stop scan")
         self.stop_scan_button.clicked.connect(self.stop_scan)
         self.stop_scan_button.setEnabled(False)
         right_layout.addWidget(self.stop_scan_button)
 
-        self.disconnect_button = QtWidgets.QPushButton("断开连接")
+        self.disconnect_button = QtWidgets.QPushButton("Disconnect")
         self.disconnect_button.clicked.connect(self.disconnect_device)
         self.disconnect_button.setEnabled(False)
         right_layout.addWidget(self.disconnect_button)
@@ -133,13 +133,13 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
             self.period_combobox.addItem(option)
         self.period_combobox.setCurrentText("1s")  # 默认选择 1s
         self.period_combobox.currentTextChanged.connect(self.change_period)
-        right_layout.addWidget(QtWidgets.QLabel("选择周期:"))
+        right_layout.addWidget(QtWidgets.QLabel("Choose period:"))
         right_layout.addWidget(self.period_combobox)
 
         # 添加通道选择下拉框
         self.channel_combobox = QtWidgets.QComboBox()
         self.channel_combobox.currentIndexChanged.connect(self.change_channel)
-        right_layout.addWidget(QtWidgets.QLabel("选择通道:"))
+        right_layout.addWidget(QtWidgets.QLabel("Choose channel:"))
         right_layout.addWidget(self.channel_combobox)
 
         # 添加滤波开关
@@ -149,8 +149,8 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         filter_layout1.addWidget(self.hpf_checkbox)
         filter_layout1.addWidget(self.lpf_checkbox)
 
-        self.notch_filter_50_checkbox = QtWidgets.QCheckBox("50hz陷波器")
-        self.notch_filter_60_checkbox = QtWidgets.QCheckBox("60hz陷波器")
+        self.notch_filter_50_checkbox = QtWidgets.QCheckBox("50hz notch")
+        self.notch_filter_60_checkbox = QtWidgets.QCheckBox("60hz notch")
         filter_layout2 = QtWidgets.QHBoxLayout()
         filter_layout2.addWidget(self.notch_filter_50_checkbox)
         filter_layout2.addWidget(self.notch_filter_60_checkbox)
@@ -176,46 +176,46 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def toggle_hpf(self, state):
         if self.current_sensor is None:
-            print("当前未连接设备")
+            print("Not connected")
             return
         if state == QtCore.Qt.Checked:
-            print("高通滤波器（HPF）已开启")
+            print("（HPF）open")
             self.current_sensor.setParam("FILTER_HPF", "ON")
         else:
-            print("高通滤波器（HPF）已关闭")
+            print("（HPF）close")
             self.current_sensor.setParam("FILTER_HPF", "OFF")
 
     def toggle_lpf(self, state):
         if self.current_sensor is None:
-            print("当前未连接设备")
+            print("no device connected")
             return
         if state == QtCore.Qt.Checked:
-            print("低通滤波器（LPF）已开启")
+            print("（LPF）open")
             self.current_sensor.setParam("FILTER_LPF", "ON")
         else:
-            print("低通滤波器（LPF）已关闭")
+            print("（LPF）close")
             self.current_sensor.setParam("FILTER_LPF", "OFF")
 
     def toggle_notch_50(self, state):
         if self.current_sensor is None:
-            print("当前未连接设备")
+            print("no device connected")
             return
         if state == QtCore.Qt.Checked:
-            print("50Hz陷波器已开启")
+            print("50Hz notch open")
             self.current_sensor.setParam("FILTER_50HZ", "ON")
         else:
-            print("50Hz陷波器已关闭")
+            print("50Hz notch close")
             self.current_sensor.setParam("FILTER_50HZ", "OFF")
 
     def toggle_notch_60(self, state):
         if self.current_sensor is None:
-            print("当前未连接设备")
+            print("no device connected")
             return
         if state == QtCore.Qt.Checked:
-            print("60Hz陷波器已开启")
+            print("60Hz notch open")
             self.current_sensor.setParam("FILTER_60HZ", "ON")
         else:
-            print("60Hz陷波器已关闭")
+            print("60Hz notch close")
             self.current_sensor.setParam("FILTER_60HZ", "OFF")
 
     def start_scan(self):
@@ -229,7 +229,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                 self.scan_button.setEnabled(False)
                 self.stop_scan_button.setEnabled(True)
         except Exception as e:
-            print(f"扫描出错: {e}")
+            print(f"scan error: {e}")
 
     def stop_scan(self):
         try:
@@ -237,7 +237,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
             self.scan_button.setEnabled(True)
             self.stop_scan_button.setEnabled(False)
         except Exception as e:
-            print(f"停止扫描出错: {e}")
+            print(f"stop scan error: {e}")
 
     def connect_device(self, item):
         item_text = item.text()
@@ -278,7 +278,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                     self.channel_combobox.clear()
                     # 根据读取到的通道数目添加通道选项
                     for i in range(self.EegChannelCount):
-                        self.channel_combobox.addItem(f"通道 {i + 1}")
+                        self.channel_combobox.addItem(f"Channel {i + 1}")
                     self.channel_combobox.setCurrentIndex(0)
 
                 if not self.current_sensor.startDataNotification():
@@ -292,7 +292,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                 self.init_blitting()
 
             except Exception as e:
-                print(f"连接设备出错: {e}")
+                print(f"connect device error: {e}")
 
     def add_device_to_list(self, item_text):
         self.device_list.addItem(item_text)
@@ -322,7 +322,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                     self.device_list.clear()
                     self.discovered_devices.clear()
                 except Exception as e:
-                    print(f"断开设备连接时出现异常: {e}")
+                    print(f"Disconnet error: {e}")
             else:
                 print("No sensor profile found for the connected device.")
         else:
@@ -334,14 +334,14 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
             self.scan_button.setEnabled(True)
             self.stop_scan_button.setEnabled(False)
 
-            filteredDevice = filter(lambda x: x.Name.startswith("OB") or x.Name.startswith("Sync"), deviceList)
+            filteredDevice = filter(lambda x: x.Name.startswith("OB") or x.Name.startswith("Sync") or x.Name.startswith("Orion"), deviceList)
             for device in filteredDevice:
                 if device.Address not in [d.Address for d in self.discovered_devices]:
                     item_text = f"Name: {device.Name}, Address: {device.Address}, RSSI: {device.RSSI}"
                     self.add_device_signal.emit(item_text)
                     self.discovered_devices.append(device)
         except Exception as e:
-            print(f"设备发现回调中出现异常: {e}")
+            print(f"fetch device error: {e}")
 
     def onDataCallback(self, sensor: SensorProfile, data: SensorData):
         if data and data.channelSamples and data.dataType in [DataType.NTF_EEG]:
@@ -354,7 +354,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                 sensor.disconnect()
                 self.SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
             except Exception as e:
-                print(f"电源变化时断开连接并重新扫描出现异常: {e}")
+                print(f"on power changed error: {e}")
 
     def onStateChanged(self, sensor: SensorProfile, newstate: DeviceStateEx):
         print("device: " + sensor.BLEDevice.Name + str(newstate))
@@ -513,12 +513,12 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
                 self.update_plot_signal.emit()
         except Exception as e:
-            print(f"add_data_to_buffer 方法中出现异常: {e}")
+            print(f"add_data_to_buffer exception: {e}")
 
     def init_blitting(self):
         self.canvas.draw()
         self.background = self.canvas.copy_from_bbox(self.ax.bbox)
-        (self.line,) = self.ax.plot([], [], label="通道 1")
+        (self.line,) = self.ax.plot([], [], label="Channel 1")
         self.ax.legend(handles=[self.line], loc="upper right")
 
     def start_data_processing(self, data):
@@ -531,7 +531,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude (uV)")
         self.ax.set_title("EEG Waveform (Real-time)")
-        (self.line,) = self.ax.plot([], [], label=f"通道 {self.current_channel + 1}")
+        (self.line,) = self.ax.plot([], [], label=f"Channel {self.current_channel + 1}")
         self.ax.legend(handles=[self.line], loc="upper right")
         self.canvas.draw()
         self.background = self.canvas.copy_from_bbox(self.ax.bbox)
@@ -591,7 +591,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                 self.line.set_data(time_axis, y_data)
 
                 if not np.issubdtype(y_data.dtype, np.number):
-                    print(f"警告：通道 {self.current_channel + 1} 的数据类型不是数值类型，可能影响绘图。")
+                    print(f"Warning: Channel {self.current_channel + 1} data type error。")
                     return
 
                 min_val = np.min(y_data)
@@ -629,7 +629,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
             if self.impedance and self.current_channel < len(self.impedance):
                 current_impedance = np.mean(self.impedance[self.current_channel]) / 1000
-                impedance_text = f"阻抗值: {current_impedance:.2f} KΩ"
+                impedance_text = f"Impedance: {current_impedance:.2f} KΩ"
                 if current_impedance <= 500:
                     color = "green"
                 elif 500 < current_impedance <= 999:
@@ -640,7 +640,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                 self.impedance_label.setStyleSheet(f"color: {color}")
 
         except Exception as e:
-            print(f"update_plot 方法中出现异常: {e}")
+            print(f"update_plot exception: {e}")
             print(traceback.format_exc())  # 打印详细的异常堆栈信息
             self.canvas.draw()  # 异常时强制全量绘制
 
@@ -681,4 +681,4 @@ if __name__ == "__main__":
         signal.signal(signal.SIGINT, sigint_handler)
         sys.exit(app.exec_())
     except Exception as e:
-        print(f"应用程序出现未捕获的异常: {e}")
+        print(f"app exception: {e}")

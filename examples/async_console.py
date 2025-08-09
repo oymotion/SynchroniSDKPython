@@ -23,7 +23,7 @@ async def main():
     deviceList = await SensorControllerInstance.asyncScan(3000)
 
     filteredDevice = filter(
-        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Sync")),
+        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Orion") or x.Name.startswith("Sync")),
         deviceList,
     )
     for device in filteredDevice:

@@ -33,7 +33,7 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
     SensorControllerInstance.stopScan()
 
     filteredDevice = filter(
-        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Sync")),
+        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Sync") or x.Name.startswith("Orion")),
         deviceList,
     )
     for device in filteredDevice:
