@@ -714,7 +714,7 @@ class GForce:
             )
         )
 
-    async def set_function_switch(self, funcSwitch):
+    async def set_function_switch(self, funcSwitch)-> bool:
         body = [0xFF & funcSwitch]
         body = bytes(body)
         ret = await self._send_request(
@@ -724,6 +724,9 @@ class GForce:
                 has_res=True,
             )
         )
+        if (len(ret) > 0 and ret[0] == 0):
+            return True
+        return False
 
     async def set_firmware_filter_switch(self, switchStatus: int):
         body = [0xFF & switchStatus]
@@ -736,7 +739,7 @@ class GForce:
 
     async def set_emg_raw_data_config(self, cfg=EmgRawDataConfig()):
         body = cfg.to_bytes()
-        await self._send_request(
+        ret = await self._send_request(
             Request(
                 cmd=Command.SET_EMG_RAWDATA_CONFIG,
                 body=body,
@@ -744,7 +747,7 @@ class GForce:
             )
         )
 
-        # print('_send_request returned:', ret)
+        # print('set_emg_raw_data_config returned:', ret)
 
         self.resolution = cfg.resolution
 

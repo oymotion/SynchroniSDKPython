@@ -18,7 +18,7 @@ from sensor import *
 SCAN_DEVICE_PERIOD_IN_MS = 3000
 PACKAGE_COUNT = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
-PLOT_UPDATE_INTERVAL = 100  # 更新图像的时间间隔
+PLOT_UPDATE_INTERVAL = 50  # 更新图像的时间间隔
 
 # 定义周期选项
 PERIOD_OPTIONS = {"500ms": 0.5, "1s": 1, "5s": 5, "10s": 10, "30s": 30, "60s": 60}
@@ -57,7 +57,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.background = None
         self.thread_pool = QThreadPool.globalInstance()  # 获取全局线程池
         self.current_channel = 0  # 默认显示通道 1 的数据
-        self.EegChannelCount = 0  # 通道数目初始化为 0
+        self.EmgChannelCount = 0  # 通道数目初始化为 0
         self.impedance = []  # 阻抗值
         self.initUI()
         self.timer = QtCore.QTimer(self)
@@ -88,7 +88,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_ylim(-1000, 1000)
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude (uV)")
-        self.ax.set_title("EEG Waveform (Real-time)")
+        self.ax.set_title("EMG Waveform (Real-time)")
 
         # 添加阻抗值显示标签
         self.impedance_label = QtWidgets.QLabel("阻抗值: 0 Ω")
@@ -257,12 +257,12 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
                         return
                     deviceInfo = self.current_sensor.getDeviceInfo()
                     self.sampling_rate = deviceInfo.EmgSampleRate
-                    self.EegChannelCount = deviceInfo.EmgChannelCount
+                    self.EmgChannelCount = deviceInfo.EmgChannelCount
                     self.update_buffer_size()
                     # 清空原有的通道选项
                     self.channel_combobox.clear()
                     # 根据读取到的通道数目添加通道选项
-                    for i in range(self.EegChannelCount):
+                    for i in range(self.EmgChannelCount):
                         self.channel_combobox.addItem(f"通道 {i + 1}")
                     self.channel_combobox.setCurrentIndex(0)
 
@@ -305,7 +305,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
             self.scan_button.setEnabled(True)
             self.stop_scan_button.setEnabled(False)
 
-            filteredDevice = filter(lambda x: x.Name.startswith("OY") or x.Name.startswith("Sync"), deviceList)
+            filteredDevice = filter(lambda x: x.Name.startswith("OY") or x.Name.startswith("Sync") or x.Name.startswith("gForce"), deviceList)
             for device in filteredDevice:
                 if device.Address not in [d.Address for d in self.discovered_devices]:
                     item_text = f"Name: {device.Name}, Address: {device.Address}, RSSI: {device.RSSI}"
@@ -336,7 +336,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def update_buffer_size(self):
         buffer_size = int(self.period * self.sampling_rate)
-        self.data_buffer = np.zeros((self.EegChannelCount, buffer_size))
+        self.data_buffer = np.zeros((self.EmgChannelCount, buffer_size))
         self.buffer_index = 0
 
     def add_data_to_buffer(self, data: SensorData):
@@ -463,7 +463,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_ylim(-1000, 1000)  # 这里可以先设置一个默认范围，后续根据数据更新
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude (uV)")
-        self.ax.set_title("EEG Waveform (Real-time)")
+        self.ax.set_title("EMG Waveform (Real-time)")
 
         (self.line,) = self.ax.plot([], [], label=f"通道 {self.current_channel + 1}")
         self.ax.legend(handles=[self.line], loc="upper right")
@@ -481,7 +481,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_ylim(-1000, 1000)  # 先设置默认范围
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude (uV)")
-        self.ax.set_title("EEG Waveform (Real-time)")
+        self.ax.set_title("EMG Waveform (Real-time)")
 
         (self.line,) = self.ax.plot([], [], label=f"通道 {self.current_channel + 1}")
         self.ax.legend(handles=[self.line], loc="upper right")
@@ -499,7 +499,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.ax.set_ylim(-1000, 1000)  # 设置默认范围
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude (uV)")
-        self.ax.set_title("EEG Waveform (Real-time)")
+        self.ax.set_title("EMG Waveform (Real-time)")
 
         (self.line,) = self.ax.plot([], [], label=f"通道 {self.current_channel + 1}")
         self.ax.legend(handles=[self.line], loc="upper right")

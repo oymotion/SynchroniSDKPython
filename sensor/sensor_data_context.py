@@ -126,21 +126,41 @@ class SensorProfileDataCtx:
         data.channelMask = config.channel_mask
         data.minPackageSampleCount = packageCount
         data.packageSampleCount = 8
-        data.K = 4000000.0 / 8388607.0
-        data.clear()
-        self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
-        self.notifyDataFlag |= DataSubscription.EMG_RAW
 
-        config.fs = SamplingRate.HZ_500
-        config.channel_mask = 255
-        config.resolution = 8
-        config.batch_len = 128
-        await self.gForce.set_emg_raw_data_config(config)
+        data.clear()
 
         await self.gForce.set_package_id(True)
 
-        await self.gForce.set_function_switch(2)
+        isNewEMG = await self.gForce.set_function_switch(2)
 
+        if (isNewEMG):
+            #new emg
+            data.packageIndexLength = 2
+            data.packageSampleCount = 8
+            data.resolutionBits = 0
+            data.K = 4000000.0 / 8388607.0
+            config.resolution = 8
+        else:
+            #old emg
+            data.packageIndexLength = 1
+            data.packageSampleCount = 8
+            data.resolutionBits = 8
+            gain = 1200
+            min_voltage = -1.25 * 1000000 
+            max_voltage = 1.25 * 100000 
+            div = 127.0
+            conversion_factor = (max_voltage - min_voltage) / gain / div
+            data.K = conversion_factor
+            config.resolution = 8
+
+        config.fs = SamplingRate.HZ_500
+        config.channel_mask = 255
+        config.batch_len = 128
+        await self.gForce.set_emg_raw_data_config(config)
+
+        self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
+        self.notifyDataFlag |= DataSubscription.EMG_RAW
+        
         return data.channelCount
 
     async def initEEG(self, packageCount: int) -> int:
@@ -452,7 +472,7 @@ class SensorProfileDataCtx:
 
         elif v == DataType.NTF_EMG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
-            if self.checkReadSamples(sensor, data, sensor_data, 3, 0):
+            if self.checkReadSamples(sensor, data, sensor_data, sensor_data.packageIndexLength + 1, 0):
                 self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_EEG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
@@ -481,16 +501,23 @@ class SensorProfileDataCtx:
         if not self._is_data_transfering:
             return False
         try:
+            packageIndex = 0
+            maxPackageIndex = 0
+            if (sensorData.packageIndexLength == 2):
+                packageIndex = ((data[offset + 1] & 0xFF) << 8) | (data[offset] & 0xFF)
+                maxPackageIndex = 65535
+            else:
+                packageIndex = (data[offset] & 0xFF)
+                maxPackageIndex = 255
 
-            packageIndex = ((data[offset + 1] & 0xFF) << 8) | (data[offset] & 0xFF)
-            offset += 2
+            offset += sensorData.packageIndexLength
             newPackageIndex = packageIndex
             lastPackageIndex = sensorData.lastPackageIndex
             if sensorData.lastPackageCounter == 0 and sensorData.lastPackageIndex == 0 and packageIndex > 1:
                 return False
 
             if packageIndex < lastPackageIndex:
-                packageIndex += 65536  # 包索引是 U16 类型
+                packageIndex += (maxPackageIndex + 1)
             elif packageIndex == lastPackageIndex:
                 return False
 
@@ -515,12 +542,14 @@ class SensorProfileDataCtx:
                     self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
 
                 if newPackageIndex == 0:
-                    sensorData.lastPackageIndex = 65535
+                    sensorData.lastPackageIndex = maxPackageIndex
                 else:
                     sensorData.lastPackageIndex = newPackageIndex - 1
                 sensorData.lastPackageCounter += deltaPackageIndex - 1
 
-            self.readSamples(data, sensorData, dataOffset, dataGap, 0)
+            if (dataGap >= 0):
+                self.readSamples(data, sensorData, dataOffset, dataGap, 0)
+
             sensorData.lastPackageIndex = newPackageIndex
             sensorData.lastPackageCounter += 1
         except Exception as e:
@@ -588,8 +617,15 @@ class SensorProfileDataCtx:
                         rawData = 0
                         if sensorData.resolutionBits == 8:
                             rawData = data[offset]
-                            rawData -= 128
+                            rawData -= 119
                             offset += 1
+                        elif sensorData.resolutionBits == 12:
+                            rawData = int.from_bytes(
+                                data[offset : offset + 2],
+                                byteorder="little",
+                                signed=True,
+                            )
+                            offset += 2
                         elif sensorData.resolutionBits == 16:
                             rawData = int.from_bytes(
                                 data[offset : offset + 2],

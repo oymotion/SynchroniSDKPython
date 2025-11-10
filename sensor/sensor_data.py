@@ -83,6 +83,7 @@ class SensorData:
         self.sampleRate = 0
         self.channelCount = 0
         self.packageSampleCount = 0
+        self.packageIndexLength = 2
         self.channelSamples: List[List[Sample]] = list()
         self.lastPackageCounter = 0
         self.lastPackageIndex = 0
