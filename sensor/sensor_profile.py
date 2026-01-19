@@ -232,7 +232,7 @@ class SensorProfile:
         self._gforce_event_loop = asyncio.new_event_loop()
         self._gforce_event_thread = threading.Thread(target=sensor_utils.start_loop, args=(self._gforce_event_loop,))
         self._gforce_event_thread.daemon = True
-        self._gforce_event_thread.name = self._detail_device.name + "data event"
+        self._gforce_event_thread.name = self._detail_device.name + "raw event"
         self._gforce_event_thread.start()
 
         if self._gforce == None:
@@ -576,6 +576,34 @@ class SensorProfile:
             return self._data_ctx._device_info
         return None
 
+    async def _asyncSet_neucir_app_control(self, open:bool, close:bool, stop:bool) -> str:
+        if self.deviceState != DeviceStateEx.Ready:
+            return False
+        if self._data_ctx == None:
+            return False
+        if not self._data_ctx.hasInit():
+            return False
+
+        ret = await self._gforce.set_neucir_app_control(open, close, stop)
+        if ret:
+            return "OK"
+        else:
+            return "Error: Unknow error"
+    
+    async def _asyncSet_neucir_mode(self, mode:int) -> str:
+        if self.deviceState != DeviceStateEx.Ready:
+            return False
+        if self._data_ctx == None:
+            return False
+        if not self._data_ctx.hasInit():
+            return False
+
+        ret = await self._gforce.set_neucir_mode(mode)
+        if ret:
+            return "OK"
+        else:
+            return "Error: Unknow error"
+        
     async def _setParam(self, key: str, value: str) -> str:
         result = "Error: Not supported"
         if self.deviceState != DeviceStateEx.Ready:
@@ -592,6 +620,20 @@ class SensorProfile:
 
         if key == "DEBUG_BLE_DATA_PATH":
             result = await self._data_ctx.setDebugCSV(value)
+
+        if key == "NEUCIR_SET_MODE":
+            if value in ["APP_REMOTE"]:
+                if value == "APP_REMOTE":
+                    result = await self._asyncSet_neucir_mode(1)
+
+        if key == "NEUCIR_APP_CONTROL":
+            if value in ["OPEN", "CLOSE", "STOP"]:
+                if value == "OPEN":
+                    result = await self._asyncSet_neucir_app_control(True,False,False)
+                elif value == "CLOSE":
+                    result = await self._asyncSet_neucir_app_control(False,True,False)
+                elif value == "STOP":
+                    result = await self._asyncSet_neucir_app_control(False,False,True)
 
         return result
 

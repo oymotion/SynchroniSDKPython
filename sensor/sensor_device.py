@@ -51,6 +51,8 @@ class DeviceInfo:
         self.GyroSampleRate = 0
         self.BrthChannelCount = 0
         self.BrthSampleRate = 0
+        self.MagAngleChannelCount = 0
+        self.MagAngleSampleRate = 0
         self.MTUSize = 0
 
 

@@ -90,6 +90,8 @@ class Command(IntEnum):
 
     SET_DATA_NOTIF_SWITCH = (0x4F,)
     SET_FUNCTION_SWITCH = (0x85,)
+    CMD_SET_NEUCIR_STATUS = (0x87,)
+    CMD_SET_APP_REMOTE_CMD = (0x89,)
 
     CMD_GET_EEG_CONFIG = (0xA0,)
     CMD_SET_EEG_CONFIG = (0xA1,)
@@ -151,6 +153,8 @@ class DataSubscription(IntEnum):
     # Device Log On
     LOG = (0x00000800,)
 
+    DNF_MAG_ANGLE_EXT = (0x00002000,)
+    
     DNF_EEG = (0x00010000,)
 
     DNF_ECG = (0x00020000,)
@@ -430,30 +434,31 @@ class GForce:
             return
 
     def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray):
-        bs = bytes(bs)
+        # bs = bytes(bs)
 
-        full_packet = []
+        # full_packet = []
 
-        is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
-        if is_partial_data:
-            packet_id = bs[1]
-            if self.packet_id != 0 and self.packet_id != packet_id + 1:
-                raise Exception(
-                    "Unexpected packet id: expected {} got {}".format(
-                        self.packet_id + 1,
-                        packet_id,
-                    )
-                )
-            elif self.packet_id == 0 or self.packet_id > packet_id:
-                self.packet_id = packet_id
-                self.data_packet += bs[2:]
+        # is_partial_data = bs[0] == ResponseCode.PARTIAL_PACKET
+        # if is_partial_data:
+        #     packet_id = bs[1]
+        #     if self.packet_id != 0 and self.packet_id != packet_id + 1:
+        #         raise Exception(
+        #             "Unexpected packet id: expected {} got {}".format(
+        #                 self.packet_id + 1,
+        #                 packet_id,
+        #             )
+        #         )
+        #     elif self.packet_id == 0 or self.packet_id > packet_id:
+        #         self.packet_id = packet_id
+        #         self.data_packet += bs[2:]
 
-                if self.packet_id == 0:
-                    full_packet = self.data_packet
-                    self.data_packet = []
-        else:
-            full_packet = bs
+        #         if self.packet_id == 0:
+        #             full_packet = self.data_packet
+        #             self.data_packet = []
+        # else:
+        #     full_packet = bs
 
+        full_packet = bs
         if len(full_packet) == 0:
             return
 
@@ -728,6 +733,41 @@ class GForce:
             return True
         return False
 
+    async def set_neucir_app_control(self, open, close, stop)-> bool:
+        if stop:
+            body = [4]
+        elif open:
+            body = [6]
+        elif close:
+            body = [5]
+
+        body = bytes(body)
+        ret = await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_APP_REMOTE_CMD,
+                body=body,
+                has_res=True,
+            )
+        )
+        if (len(ret) > 0 and ret[0] == 0):
+            return True
+        return False
+
+    async def set_neucir_mode(self, mode)-> bool:
+        body = [0x90]
+
+        body = bytes(body)
+        ret = await self._send_request(
+            Request(
+                cmd=Command.CMD_SET_NEUCIR_STATUS,
+                body=body,
+                has_res=True,
+            )
+        )
+        if (len(ret) > 0 and ret[0] == 0):
+            return True
+        return False
+    
     async def set_firmware_filter_switch(self, switchStatus: int):
         body = [0xFF & switchStatus]
         body = bytes(body)

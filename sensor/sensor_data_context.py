@@ -23,12 +23,14 @@ class SensorDataType(IntEnum):
     DATA_TYPE_GYRO = 3
     DATA_TYPE_BRTH = 4
     DATA_TYPE_EMG = 5
-    DATA_TYPE_COUNT = 6
+    DATA_TYPE_MAG_ANGLE = 6
+    DATA_TYPE_COUNT = 7
 
 
 # 枚举 FeatureMaps 的 Python 实现
 class FeatureMaps(Enum):
     GFD_FEAT_EMG = 0x000002000
+    GFD_FEAT_MAGANG = 0x00080000
     GFD_FEAT_EEG = 0x000400000
     GFD_FEAT_ECG = 0x000800000
     GFD_FEAT_IMPEDANCE = 0x001000000
@@ -60,7 +62,7 @@ class SensorProfileDataCtx:
         self.impedanceData: List[float] = list()
         self.saturationData: List[float] = list()
         self.dataPool = ThreadPoolExecutor(1, "data")
-        self.init_map = {"NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON"}
+        self.init_map = {"NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON", "NTF_MAG_ANGLE": "ON", "NTF_IMPEDANCE": "ON"}
         self.filter_map = {"FILTER_50HZ": "ON", "FILTER_60HZ": "ON", "FILTER_HPF": "ON", "FILTER_LPF": "ON"}
         self.debugCSVWriter = None
         self.debugCSVPath = None
@@ -112,6 +114,9 @@ class SensorProfileDataCtx:
     def hasBrth(self):
         return (self.featureMap & FeatureMaps.GFD_FEAT_BRTH.value) != 0
 
+    def hasMagAngle(self):
+        return (self.featureMap & FeatureMaps.GFD_FEAT_MAGANG.value) != 0
+    
     def hasConcatBLE(self):
         return (self.featureMap & FeatureMaps.GFD_FEAT_CONCAT_BLE.value) != 0
 
@@ -128,23 +133,26 @@ class SensorProfileDataCtx:
         data.packageSampleCount = 8
 
         data.clear()
-
-        await self.gForce.set_package_id(True)
-
-        isNewEMG = await self.gForce.set_function_switch(2)
+        isNewEMG = True
+        try:
+            if self._device_info.DeviceName.startswith("gForce") or self._device_info.DeviceName.startswith("OHand") or self._device_info.DeviceName.startswith("ORE-") or self._device_info.DeviceName.startswith("OYEM-") or self._device_info.DeviceName.startswith("ORehab"):
+                isNewEMG = False
+        except Exception as e:
+            pass
 
         if (isNewEMG):
             #new emg
             data.packageIndexLength = 2
             data.packageSampleCount = 8
             data.resolutionBits = 0
-            data.K = 4000000.0 / 8388607.0
+            gain = 6
+            data.K = 4000000.0 / 8388607.0 / gain
             config.resolution = 8
         else:
             #old emg
             data.packageIndexLength = 1
             data.packageSampleCount = 8
-            data.resolutionBits = 8
+            data.resolutionBits = 7
             gain = 1200
             min_voltage = -1.25 * 1000000 
             max_voltage = 1.25 * 100000 
@@ -156,7 +164,12 @@ class SensorProfileDataCtx:
         config.fs = SamplingRate.HZ_500
         config.channel_mask = 255
         config.batch_len = 128
+
+        if isNewEMG:
+            await self.gForce.set_function_switch(2)
+
         await self.gForce.set_emg_raw_data_config(config)
+        await self.gForce.set_package_id(True)
 
         self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
         self.notifyDataFlag |= DataSubscription.EMG_RAW
@@ -207,7 +220,7 @@ class SensorProfileDataCtx:
         data.resolutionBits = 16
         data.channelCount = config.channel_count
         data.channelMask = 255
-        data.minPackageSampleCount = packageCount
+        data.minPackageSampleCount = 1
         data.packageSampleCount = config.batch_len
         data.K = config.accK
         data.clear()
@@ -220,7 +233,7 @@ class SensorProfileDataCtx:
         data.resolutionBits = 16
         data.channelCount = config.channel_count
         data.channelMask = 255
-        data.minPackageSampleCount = packageCount
+        data.minPackageSampleCount = 1
         data.packageSampleCount = config.batch_len
         data.K = config.gyroK
         data.clear()
@@ -247,6 +260,25 @@ class SensorProfileDataCtx:
         self.notifyDataFlag |= DataSubscription.DNF_ECG
         return data.channelCount
 
+    async def initMagAngle(self, packageCount: int) -> int:
+        await self.gForce.set_package_id(True)
+
+        data = SensorData()
+        data.deviceMac = self.deviceMac
+        data.dataType = DataType.NTF_MAG_ANGLE_DATA
+        data.sampleRate = 40
+        data.resolutionBits = 8
+        data.channelCount = 1
+        data.channelMask = 1
+        data.minPackageSampleCount = 1
+        data.packageSampleCount = 1
+        data.K = 1
+        data.packageIndexLength = 2
+        data.clear()
+        self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE] = data
+        self.notifyDataFlag |= DataSubscription.DNF_MAG_ANGLE_EXT
+        return data.channelCount
+    
     async def initDataTransfer(self, isGetFeature: bool) -> int:
         if isGetFeature:
             self.featureMap = await self.gForce.get_feature_map()
@@ -279,8 +311,13 @@ class SensorProfileDataCtx:
         try:
             self._is_initing = True
             info = await self.fetchDeviceInfo()
+            self._device_info = info
             await self.initDataTransfer(True)
-            if self.hasImpedance():
+            
+            if self.hasConcatBLE():
+                self.notifyDataFlag |= DataSubscription.DNF_CONCAT_BLE
+
+            if self.hasImpedance() and (self.init_map["NTF_IMPEDANCE"] == "ON"):
                 self.notifyDataFlag |= DataSubscription.DNF_IMPEDANCE
 
             if self.hasEMG() and (self.init_map["NTF_EMG"] == "ON"):
@@ -305,6 +342,11 @@ class SensorProfileDataCtx:
                 info.GyroChannelCount = imuChannelCount
                 info.AccSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ACC].sampleRate
                 info.GyroSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO].sampleRate
+
+            if self.hasMagAngle() and (self.init_map["NTF_MAG_ANGLE"] == "ON"):
+                magAngleChannelCount = await self.initMagAngle(packageCount)
+                info.MagAngleChannelCount = magAngleChannelCount
+                info.MagAngleSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE].sampleRate
 
             self._device_info = info
 
@@ -397,31 +439,73 @@ class SensorProfileDataCtx:
 
     async def process_data(self, buf: Queue[SensorData], sensor, callback):
         while self._is_running:
-            while not self._rawDataBuffer.empty():
-                try:
-                    data: bytes = self._rawDataBuffer.get_nowait()
-                except Exception as e:
-                    continue
-
-                if self.isDataTransfering:
-                    self._processDataPackage(data, buf, sensor)
-                self._rawDataBuffer.task_done()
-
-            if self.isDataTransfering and not buf.empty():
-                sensorData: SensorData = None
-                try:
-                    sensorData = buf.get_nowait()
-                except Exception as e:
-                    break
-                if not sensor_utils._terminated and sensorData != None and callback != None:
+            while self._is_running and self._rawDataBuffer.empty():
+                if self._is_running and self.isDataTransfering and not buf.empty():
+                    sensorData: SensorData = None
                     try:
-                        asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
+                        sensorData = buf.get_nowait()
                     except Exception as e:
-                        print(e)
+                        break
+                    if not sensor_utils._terminated and sensorData != None and callback != None:
+                        try:
+                            asyncio.get_event_loop().run_in_executor(self.dataPool, callback, sensor, sensorData)
+                        except Exception as e:
+                            print(e)
 
-                buf.task_done()
-            else:
-                await asyncio.sleep(0.01)
+                    buf.task_done()
+                else:
+                    await asyncio.sleep(0.01)
+                continue
+
+            try:
+                while self._is_running and not self._rawDataBuffer.empty():
+                    data = self._rawDataBuffer.get_nowait()
+
+                    if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
+                        self._concatDataBuffer.extend(data)
+                    else:
+                        self._processDataPackage(data, buf, sensor)
+
+                    self._rawDataBuffer.task_done()
+            except Exception as e:
+                pass
+
+            if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
+                index = 0
+                last_cut = -1
+                data_size = len(self._concatDataBuffer)
+
+                while self._is_running:
+                    if index >= data_size:
+                        break
+
+                    if self._concatDataBuffer[index] == 0x55:
+                        if (index + 1) >= data_size:
+                            index = data_size
+                            continue
+                        n = self._concatDataBuffer[index + 1]
+                        if n < 2 or (index + 1 + n + 1) >= data_size:
+                            index += 1
+                            continue
+                        crc8 = (self._concatDataBuffer[index + 1 + n + 1])
+                        calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2 : index + 2 + n])
+                        if crc8 != calc_crc:
+                            index += 1
+                            continue
+                        if self._is_data_transfering:
+                            data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
+                            self._processDataPackage(data_package, buf, sensor)
+                        last_cut = index = index + 2 + n
+                        index += 1
+                    else:
+                        index += 1
+
+                if last_cut > 0:
+                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
+                    last_cut = -1
+                    index = 0
+
+
 
     def _processDataPackage(self, data: bytes, buf: Queue[SensorData], sensor):
         v = data[0] & 0x7F
@@ -469,7 +553,10 @@ class SensorProfileDataCtx:
 
             self.impedanceData = impedanceData
             self.saturationData = saturationData
-
+        elif v == DataType.NTF_MAG_ANGLE_DATA:
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE]
+            if self.checkReadSamples(sensor, data, sensor_data, 4, 0):
+                self.sendSensorData(sensor_data, buf)
         elif v == DataType.NTF_EMG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
             if self.checkReadSamples(sensor, data, sensor_data, sensor_data.packageIndexLength + 1, 0):
@@ -506,51 +593,60 @@ class SensorProfileDataCtx:
             if (sensorData.packageIndexLength == 2):
                 packageIndex = ((data[offset + 1] & 0xFF) << 8) | (data[offset] & 0xFF)
                 maxPackageIndex = 65535
-            else:
+            elif (sensorData.packageIndexLength == 1):
                 packageIndex = (data[offset] & 0xFF)
                 maxPackageIndex = 255
 
-            offset += sensorData.packageIndexLength
-            newPackageIndex = packageIndex
-            lastPackageIndex = sensorData.lastPackageIndex
-            if sensorData.lastPackageCounter == 0 and sensorData.lastPackageIndex == 0 and packageIndex > 1:
-                return False
+            if sensorData.packageIndexLength <= 0:
+                if sensorData.lastPackageCounter < 0:
+                    sensorData.lastPackageIndex = 0
+                    sensorData.lastPackageCounter = 0
+            else:
+                offset += sensorData.packageIndexLength
+                newPackageIndex = packageIndex
+                lastPackageIndex = sensorData.lastPackageIndex
+                if sensorData.lastPackageCounter < 0 and newPackageIndex > 0:
+                    sensorData.lastPackageIndex = lastPackageIndex = newPackageIndex - 1
+                    sensorData.lastPackageCounter = 0
 
-            if packageIndex < lastPackageIndex:
-                packageIndex += (maxPackageIndex + 1)
-            elif packageIndex == lastPackageIndex:
-                return False
+                if packageIndex < lastPackageIndex:
+                    packageIndex += (maxPackageIndex + 1)
+                elif packageIndex == lastPackageIndex:
+                    return False
 
-            deltaPackageIndex = packageIndex - lastPackageIndex
-            if deltaPackageIndex > 1:
-                lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
-                lostLog = (
-                    "MSG|LOST SAMPLE|MAC|"
-                    + str(sensorData.deviceMac)
-                    + "|TYPE|"
-                    + str(sensorData.dataType)
-                    + "|COUNT|"
-                    + str(lostSampleCount)
-                )
-                # print(lostLog)
-                if not sensor_utils._terminated and sensor._event_loop != None and sensor._on_error_callback != None:
-                    try:
-                        asyncio.get_event_loop().run_in_executor(None, sensor._on_error_callback, sensor, lostLog)
-                    except Exception as e:
-                        pass
-                if lostSampleCount < 100:
-                    self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
+                deltaPackageIndex = packageIndex - lastPackageIndex
+                if deltaPackageIndex > 1:
+                    lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
 
-                if newPackageIndex == 0:
-                    sensorData.lastPackageIndex = maxPackageIndex
-                else:
-                    sensorData.lastPackageIndex = newPackageIndex - 1
-                sensorData.lastPackageCounter += deltaPackageIndex - 1
+                    if lostSampleCount < 100:
+                        self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
+
+                    if newPackageIndex == 0:
+                        sensorData.lastPackageIndex = maxPackageIndex
+                    else:
+                        sensorData.lastPackageIndex = newPackageIndex - 1
+                    sensorData.lastPackageCounter += deltaPackageIndex - 1
+                    
+                    lostLog = (
+                        "MSG|LOST SAMPLE|MAC|"
+                        + str(sensorData.deviceMac)
+                        + "|TYPE|"
+                        + str(sensorData.dataType)
+                        + "|COUNT|"
+                        + str(lostSampleCount)
+                    )
+                    # print(lostLog)
+                    if not sensor_utils._terminated and sensor._event_loop != None and sensor._on_error_callback != None:
+                        try:
+                            asyncio.get_event_loop().run_in_executor(None, sensor._on_error_callback, sensor, lostLog)
+                        except Exception as e:
+                            pass
+
+                sensorData.lastPackageIndex = newPackageIndex
 
             if (dataGap >= 0):
                 self.readSamples(data, sensorData, dataOffset, dataGap, 0)
 
-            sensorData.lastPackageIndex = newPackageIndex
             sensorData.lastPackageCounter += 1
         except Exception as e:
             print(e)
@@ -615,9 +711,12 @@ class SensorProfileDataCtx:
                         dataItem.isLost = True
                     else:
                         rawData = 0
-                        if sensorData.resolutionBits == 8:
+                        if sensorData.resolutionBits == 7:
                             rawData = data[offset]
                             rawData -= 119
+                            offset += 1
+                        elif sensorData.resolutionBits == 8:
+                            rawData = data[offset] & 0xFF
                             offset += 1
                         elif sensorData.resolutionBits == 12:
                             rawData = int.from_bytes(
@@ -763,9 +862,9 @@ class SensorProfileDataCtx:
 
             index = 0
             last_cut = -1
+            data_size = len(self._concatDataBuffer)
 
             while self._is_running:
-                data_size = len(self._concatDataBuffer)
                 if index >= data_size:
                     break
 
@@ -774,8 +873,8 @@ class SensorProfileDataCtx:
                         index = data_size
                         continue
                     n = self._concatDataBuffer[index + 1]
-                    if (index + 1 + n + 2) >= data_size:
-                        index = data_size
+                    if n < 2 or (index + 1 + n + 2) >= data_size:
+                        index += 1
                         continue
                     crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
                     calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
@@ -786,13 +885,14 @@ class SensorProfileDataCtx:
                         data_package = bytes(self._concatDataBuffer[index + 2 : index + 2 + n])
                         self._processDataPackage(data_package, buf, sensor)
                     last_cut = index = index + 2 + n + 1
+                    index += 1
                 elif self._concatDataBuffer[index] == 0xAA:
                     if (index + 1) >= data_size:
                         index = data_size
                         continue
                     n = self._concatDataBuffer[index + 1]
-                    if (index + 1 + n + 2) >= data_size:
-                        index = data_size
+                    if n < 2 or (index + 1 + n + 2) >= data_size:
+                        index += 1
                         continue
                     crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
                     calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2 : index + 2 + n], n)
@@ -804,10 +904,11 @@ class SensorProfileDataCtx:
                     if not sensor_utils._terminated:
                         await sensor_utils.async_call(self.gForce.async_on_cmd_response(data_package), runloop=sensor._event_loop)
                     last_cut = index = index + 2 + n + 1
+                    index += 1
                 else:
                     index += 1
 
-                if last_cut > 0:
-                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
-                    last_cut = -1
-                    index = 0
+            if last_cut > 0:
+                self._concatDataBuffer = self._concatDataBuffer[last_cut + 1 :]
+                last_cut = -1
+                index = 0

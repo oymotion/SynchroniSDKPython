@@ -39,6 +39,7 @@ class DataType(IntEnum):
     NTF_ACC = 0x1  # 加速度，用于标识加速度传感器采集的数据
     NTF_GYRO = 0x2  # 陀螺仪，用于标识陀螺仪传感器采集的数据
     NTF_EMG = 0x8  # EMG，用于标识肌电传感器采集的数据
+    NTF_MAG_ANGLE_DATA = 0x0D #NeuCir设备的角度值百分比0%-100%
     NTF_EEG = 0x10  # EEG，用于标识脑电传感器采集的数据
     NTF_ECG = 0x11  # ECG，用于标识心电传感器采集的数据
     NTF_IMPEDANCE = 0x12  # 阻抗数据
@@ -47,6 +48,7 @@ class DataType(IntEnum):
     NTF_BRTH = 0x15  # 呼吸，用于标识呼吸传感器采集的数据
     NTF_IMPEDANCE_EXT = 0x16  # 阻抗数据扩展
     NTF_DATA_TYPE_MAX = 0x17
+
 
 
 # 一次采样的数据，包含多个通道的数据，channal_samples 为一个二维数组, 第一个维度为通道索引，第二个维度为采样索引
@@ -94,5 +96,5 @@ class SensorData:
 
     def clear(self):
         self.channelSamples.clear()
-        self.lastPackageCounter = 0
+        self.lastPackageCounter = -1
         self.lastPackageIndex = 0
