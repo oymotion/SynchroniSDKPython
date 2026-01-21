@@ -403,34 +403,53 @@ class GForce:
         self.data_packet = []
 
     async def connect(self, disconnect_cb, buf: queue.Queue[bytes]):
+        loop = asyncio.get_running_loop()
+        asyncio.set_event_loop(loop)
+        
         client = BleakClient(self._device, disconnected_callback=disconnect_cb)
         self.client = client
         self.device_name = self._device.name
         self._raw_data_buf = buf
 
-        try:
-            await sensor_utils.async_call(client.connect(), sensor_utils._TIMEOUT, self.gforce_event_loop)
-        except Exception as e:
-            return
+        import platform
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await asyncio.wait_for(client.connect(), timeout=sensor_utils._TIMEOUT)
+                await asyncio.sleep(0.5)
+                
+                if client.is_connected:
+                    break
+            except Exception as e:
+                print(f"[ERROR] Connection attempt {attempt + 1} failed: {e}", flush=True)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0)
+                else:
+                    print("[ERROR] All connection attempts failed", flush=True)
+                    return
 
         if not client.is_connected:
             return
 
         try:
-            if not self._is_universal_stream:
-                await sensor_utils.async_call(
-                    client.start_notify(self.cmd_char, self._on_cmd_response),
-                    sensor_utils._TIMEOUT,
-                    self.gforce_event_loop,
-                )
+            if platform.system() == "Darwin":
+                 services = await client.get_services()
 
-            else:
-                await sensor_utils.async_call(
-                    client.start_notify(self.data_char, self._on_universal_response),
-                    sensor_utils._TIMEOUT,
-                    self.gforce_event_loop,
+            if not self._is_universal_stream:
+                await asyncio.wait_for(
+                    client.start_notify(self.cmd_char, self._on_cmd_response),
+                    timeout=sensor_utils._TIMEOUT
                 )
+            else:
+                await asyncio.wait_for(
+                    client.start_notify(self.data_char, self._on_universal_response),
+                    timeout=sensor_utils._TIMEOUT
+                )
+            
+            
         except Exception as e:
+            print(f"[ERROR] Failed to start notifications: {e}", flush=True)
+            await client.disconnect()
             return
 
     def _on_data_response(self, q: queue.Queue[bytes], bs: bytearray):
@@ -872,32 +891,27 @@ class GForce:
         )
 
     async def start_streaming(self, q: queue.Queue):
-        await sensor_utils.async_call(
+        await asyncio.wait_for(
             self.client.start_notify(
                 self.data_char,
                 lambda _, data: self._on_data_response(q, data),
             ),
-            sensor_utils._TIMEOUT,
-            self.gforce_event_loop,
+            timeout=sensor_utils._TIMEOUT
         )
 
     async def stop_streaming(self):
-        exceptions = []
-
         try:
-            await sensor_utils.async_call(self.client.stop_notify(self.data_char), sensor_utils._TIMEOUT, self.gforce_event_loop)
+            await asyncio.wait_for(self.client.stop_notify(self.data_char), timeout=sensor_utils._TIMEOUT)
         except Exception as e:
-            exceptions.append(e)
-
-        if len(exceptions) > 0:
-            raise Exception("Failed to stop streaming: %s" % exceptions)
+            print(f"Failed to stop streaming: {e}")
 
     async def disconnect(self):
         with suppress(asyncio.CancelledError):
             try:
-                await sensor_utils.async_call(self.client.disconnect(), sensor_utils._TIMEOUT, self.gforce_event_loop)
+                if self.client:
+                    await asyncio.wait_for(self.client.disconnect(), timeout=sensor_utils._TIMEOUT)
             except Exception as e:
-                pass
+                print(f"Disconnect error: {e}")
 
     def _get_response_channel(self, cmd: Command) -> Queue:
         if self.responses.get(cmd) != None:
@@ -908,7 +922,7 @@ class GForce:
             return q
 
     async def _send_request(self, req: Request) -> Optional[bytes]:
-        return await sensor_utils.async_call(self._send_request_internal(req=req), runloop=self.event_loop)
+        return await self._send_request_internal(req=req)
 
     async def _send_request_internal(self, req: Request) -> Optional[bytes]:
         q = None
@@ -932,10 +946,9 @@ class GForce:
 
         # print(str(req.cmd) + str(req.body))
         try:
-            await sensor_utils.async_call(
+            await asyncio.wait_for(
                 self.client.write_gatt_char(self.cmd_char, bs),
-                1,
-                runloop=self.gforce_event_loop,
+                timeout=1
             )
         except Exception as e:
             self.responses[req.cmd] = None
