@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import struct
+import platform
 from asyncio import Queue
 from contextlib import suppress
 from datetime import datetime
@@ -403,15 +404,15 @@ class GForce:
         self.data_packet = []
 
     async def connect(self, disconnect_cb, buf: queue.Queue[bytes]):
-        loop = asyncio.get_running_loop()
-        asyncio.set_event_loop(loop)
+        if platform.system() == "Darwin":
+            loop = asyncio.get_running_loop()
+            asyncio.set_event_loop(loop)
         
         client = BleakClient(self._device, disconnected_callback=disconnect_cb)
         self.client = client
         self.device_name = self._device.name
         self._raw_data_buf = buf
-
-        import platform
+        
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -432,8 +433,7 @@ class GForce:
             return
 
         try:
-            if platform.system() == "Darwin":
-                 services = await client.get_services()
+
 
             if not self._is_universal_stream:
                 await asyncio.wait_for(
@@ -922,6 +922,7 @@ class GForce:
             return q
 
     async def _send_request(self, req: Request) -> Optional[bytes]:
+        # 直接调用内部方法，不再跨 loop
         return await self._send_request_internal(req=req)
 
     async def _send_request_internal(self, req: Request) -> Optional[bytes]:
@@ -946,11 +947,13 @@ class GForce:
 
         # print(str(req.cmd) + str(req.body))
         try:
+            # 直接 write，不再跨 loop
             await asyncio.wait_for(
                 self.client.write_gatt_char(self.cmd_char, bs),
                 timeout=1
             )
         except Exception as e:
+            # print(f"Write char failed: {e}")
             self.responses[req.cmd] = None
             return None
 
