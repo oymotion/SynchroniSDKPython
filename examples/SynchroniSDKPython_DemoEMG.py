@@ -321,12 +321,12 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onPowerChanged(self, sensor: SensorProfile, power: int):
         print("connected sensor: " + sensor.BLEDevice.Name + " power: " + str(power))
-        if not sensor.isDataTransfering:
-            try:
-                sensor.disconnect()
-                self.SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
-            except Exception as e:
-                print(f"电源变化时断开连接并重新扫描出现异常: {e}")
+        # if not sensor.isDataTransfering:
+        #     try:
+        #         sensor.disconnect()
+        #         self.SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
+        #     except Exception as e:
+        #         print(f"电源变化时断开连接并重新扫描出现异常: {e}")
 
     def onStateChanged(self, sensor: SensorProfile, newstate: DeviceStateEx):
         print("device: " + sensor.BLEDevice.Name + str(newstate))

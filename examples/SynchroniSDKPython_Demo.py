@@ -266,7 +266,15 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
                 if not self.current_sensor.hasInited:
                     # result = self.current_sensor.setParam('DEBUG_BLE_DATA_PATH', '/temp/test.csv')
-                    if not self.current_sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
+                    init_ok = False
+                    for attempt in range(3): 
+                        if self.current_sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
+                            init_ok = True
+                            break
+                        print(f"init device: {self.current_sensor.BLEDevice.Name} failed (attempt {attempt + 1}/3), retrying...")
+                        import time
+                        time.sleep(1)
+                    if not init_ok:
                         print("init device: " + self.current_sensor.BLEDevice.Name + " failed")
                         return
                     print("init device: " + self.current_sensor.BLEDevice.Name + " ok")
@@ -349,12 +357,12 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onPowerChanged(self, sensor: SensorProfile, power: int):
         print("connected sensor: " + sensor.BLEDevice.Name + " power: " + str(power))
-        if not sensor.isDataTransfering:
-            try:
-                sensor.disconnect()
-                self.SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
-            except Exception as e:
-                print(f"on power changed error: {e}")
+        # if not sensor.isDataTransfering:
+        #     try:
+        #         sensor.disconnect()
+        #         self.SensorControllerInstance.startScan(SCAN_DEVICE_PERIOD_IN_MS)
+        #     except Exception as e:
+        #         print(f"电源变化时断开连接并重新扫描出现异常: {e}")
 
     def onStateChanged(self, sensor: SensorProfile, newstate: DeviceStateEx):
         print("device: " + sensor.BLEDevice.Name + str(newstate))
