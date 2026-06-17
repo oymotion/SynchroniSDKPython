@@ -326,8 +326,12 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onDataCallback(self, sensor: SensorProfile, data: SensorData):
         if data and data.channelSamples and data.dataType in [DataType.NTF_EMG]:
+            lost_count = self.lost_packet_counts.get(data.dataType, 0)
+            if data.lostPackageCount > lost_count:
+                lost_count = data.lostPackageCount
+                self.update_lost_packet_display(str(data.dataType), lost_count)
             self.data_received.emit(data)
-            print(data.channelSamples[0][0].sampleIndex)
+            # print(data.channelSamples[0][0].sampleIndex)
 
     def onPowerChanged(self, sensor: SensorProfile, power: int):
         print("connected sensor: " + sensor.BLEDevice.Name + " power: " + str(power))
@@ -343,20 +347,6 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onErrorCallback(self, sensor: SensorProfile, reason: str):
         print("device: " + sensor.BLEDevice.Name + reason)
-        try:
-            parts = reason.split("|")
-            if "LOST SAMPLE" in parts:
-                lost_type = None
-                lost_count = None
-                for i, part in enumerate(parts):
-                    if part == "TYPE" and i + 1 < len(parts):
-                        lost_type = parts[i + 1]
-                    elif part == "COUNT" and i + 1 < len(parts):
-                        lost_count = int(parts[i + 1])
-                if lost_type is not None and lost_count is not None:
-                    self.lost_packet_signal.emit(lost_type, lost_count)
-        except Exception as e:
-            print(f"解析丢包信息出错: {e}")
 
     def _lost_type_name(self, type_str: str) -> str:
         try:
@@ -366,7 +356,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def update_lost_packet_display(self, lost_type: str, count: int):
         type_name = self._lost_type_name(lost_type)
-        self.lost_packet_counts[type_name] = self.lost_packet_counts.get(type_name, 0) + count
+        self.lost_packet_counts[type_name] = count
         lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
         self.lost_packet_label.setText("丢包统计:\n" + "\n".join(lines))
 
