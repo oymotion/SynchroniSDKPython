@@ -363,10 +363,10 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onDataCallback(self, sensor: SensorProfile, data: SensorData):
         if data and data.channelSamples and data.dataType in [DataType.NTF_EEG]:
-            # lost_count = self.lost_packet_counts.get(data.dataType, 0)
-            # if data.lostPackageCount > lost_count:
-            #     lost_count = data.lostPackageCount
-            #     self.update_lost_packet_display(str(data.dataType), lost_count)
+            lost_count = self.lost_packet_counts.get(data.dataType, 0)
+            if data.lostPackageCount > lost_count:
+                lost_count = data.lostPackageCount
+                self.update_lost_packet_display(str(data.dataType), lost_count)
             self.data_received.emit(data)
 
     def onPowerChanged(self, sensor: SensorProfile, power: int):
