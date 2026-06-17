@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 
-plt.rcParams["font.family"] = "SimHei"  # 使用黑体字体
-plt.rcParams["axes.unicode_minus"] = False  # 解决负号显示问题
+# plt.rcParams["font.family"] = "SimHei"
+# plt.rcParams["axes.unicode_minus"] = False
 
 import sys
 import signal
@@ -41,6 +41,7 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
     data_received = QtCore.pyqtSignal(object)
     add_device_signal = QtCore.pyqtSignal(str)
     update_plot_signal = QtCore.pyqtSignal()
+    lost_packet_signal = QtCore.pyqtSignal(str, int)
 
     def __init__(self):
         super().__init__()
@@ -67,6 +68,9 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         self.add_device_signal.connect(self.add_device_to_list)
         self.update_plot_signal.connect(self.update_plot)
         self.data_received.connect(self.start_data_processing)
+        self.lost_packet_signal.connect(self.update_lost_packet_display)
+
+        self.lost_packet_counts = {}
 
         if not self.SensorControllerInstance.hasDeviceFoundCallback:
             self.SensorControllerInstance.onDeviceFoundCallback = self.deviceFoundCallback
@@ -93,6 +97,10 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
         # 添加阻抗值显示标签
         self.impedance_label = QtWidgets.QLabel("阻抗值: 0 Ω")
         left_layout.addWidget(self.impedance_label, stretch=1)
+
+        self.lost_packet_label = QtWidgets.QLabel("丢包统计: 无")
+        self.lost_packet_label.setWordWrap(True)
+        left_layout.addWidget(self.lost_packet_label, stretch=1)
 
         right_layout = QtWidgets.QVBoxLayout()
         self.scan_button = QtWidgets.QPushButton("开始扫描蓝牙设备")
@@ -206,6 +214,8 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def start_scan(self):
         try:
+            self.device_list.clear()
+            self.discovered_devices.clear()
             if not self.SensorControllerInstance.isEnable:
                 print("please open bluetooth")
                 return
@@ -333,6 +343,32 @@ class BluetoothDeviceScanner(QtWidgets.QWidget):
 
     def onErrorCallback(self, sensor: SensorProfile, reason: str):
         print("device: " + sensor.BLEDevice.Name + reason)
+        try:
+            parts = reason.split("|")
+            if "LOST SAMPLE" in parts:
+                lost_type = None
+                lost_count = None
+                for i, part in enumerate(parts):
+                    if part == "TYPE" and i + 1 < len(parts):
+                        lost_type = parts[i + 1]
+                    elif part == "COUNT" and i + 1 < len(parts):
+                        lost_count = int(parts[i + 1])
+                if lost_type is not None and lost_count is not None:
+                    self.lost_packet_signal.emit(lost_type, lost_count)
+        except Exception as e:
+            print(f"解析丢包信息出错: {e}")
+
+    def _lost_type_name(self, type_str: str) -> str:
+        try:
+            return DataType(int(type_str, 0)).name
+        except (ValueError, KeyError):
+            return f"TYPE {type_str}"
+
+    def update_lost_packet_display(self, lost_type: str, count: int):
+        type_name = self._lost_type_name(lost_type)
+        self.lost_packet_counts[type_name] = self.lost_packet_counts.get(type_name, 0) + count
+        lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
+        self.lost_packet_label.setText("丢包统计:\n" + "\n".join(lines))
 
     def update_buffer_size(self):
         buffer_size = int(self.period * self.sampling_rate)
