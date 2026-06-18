@@ -1,0 +1,279 @@
+import asyncio
+import multiprocessing
+import queue
+import threading
+import uuid
+
+from sensor.bleak_process import BleakProcess
+from sensor import sensor_utils
+
+
+class BleakHost:
+
+
+    def __init__(self):
+        self._cmd_queue = multiprocessing.Queue(maxsize=50)
+        self._result_queue = multiprocessing.Queue(maxsize=sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE)
+        self._bleak_process = BleakProcess(self._cmd_queue, self._result_queue)
+        self._started = False
+
+
+        self._result_loop = None
+        self._result_thread = None
+
+
+        self._cmd_loop = None
+        self._cmd_thread = None
+
+        # Pending commands: cmd_id -> (waiter_type, waiter, container, loop)
+        self._pending_lock = threading.Lock()
+        self._pending = {}
+
+
+        self.on_scan_once_result = None  # callable(msg)
+        self.on_scan_result = None       # callable(msg)
+        self.on_device_message = None    # callable(device_mac, msg)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def start(self):
+        if self._started:
+            return
+        self._bleak_process.start()
+        self._started = True
+        self._start_result_loop()
+        self._start_cmd_loop()
+
+    def stop(self):
+        if not self._started:
+            return
+        try:
+            self._cmd_queue.put({"type": "terminate"})
+        except Exception:
+            pass
+
+        if self._bleak_process.is_alive():
+            self._bleak_process.join(timeout=5)
+        if self._bleak_process.is_alive():
+            self._bleak_process.terminate()
+
+        self._stop_result_loop()
+        self._stop_cmd_loop()
+        self._started = False
+
+    # ------------------------------------------------------------------
+    # Result loop
+    # ------------------------------------------------------------------
+    def _start_result_loop(self):
+        from sensor import sensor_utils
+        result_loop = asyncio.new_event_loop()
+        result_thread = threading.Thread(target=sensor_utils.start_loop, args=(result_loop,))
+        result_thread.daemon = True
+        result_thread.name = "BleakHost result"
+        result_thread.start()
+        self._result_loop = result_loop
+        self._result_thread = result_thread
+        asyncio.run_coroutine_threadsafe(self._consume_results(), result_loop)
+
+    def _stop_result_loop(self):
+        loop = getattr(self, '_result_loop', None)
+        thread = getattr(self, '_result_thread', None)
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass
+        self._result_loop = None
+        self._result_thread = None
+
+    async def _consume_results(self):
+
+        while True:
+            try:
+                msg = await asyncio.get_event_loop().run_in_executor(
+                    None, self._result_queue.get, True, 0.5
+                )
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            msg_type = msg.get("type")
+            if msg_type == "scan_once_result":
+                if self.on_scan_once_result is not None:
+                    try:
+                        self.on_scan_once_result(msg)
+                    except Exception:
+                        pass
+            elif msg_type == "devices":
+                if self.on_scan_result is not None:
+                    try:
+                        self.on_scan_result(msg)
+                    except Exception:
+                        pass
+            elif msg_type == "command_result":
+                self._handle_command_result(msg)
+            elif msg_type in ("state_changed", "power_changed", "sensor_data", "error"):
+                if self.on_device_message is not None:
+                    device_mac = msg.get("device_mac")
+                    try:
+                        self.on_device_message(device_mac, msg)
+                    except Exception:
+                        pass
+
+    def _handle_command_result(self, msg):
+
+        cmd_id = msg.get("cmd_id")
+        with self._pending_lock:
+            pending = self._pending.pop(cmd_id, None)
+        if pending is None:
+            return
+        waiter_type, waiter, container, loop = pending
+        if waiter_type == "async_event":
+            container["result"] = msg
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(waiter.set)
+        elif waiter_type == "future":
+            if loop is not None and not loop.is_closed() and not waiter.done():
+                loop.call_soon_threadsafe(waiter.set_result, msg)
+
+    # ------------------------------------------------------------------
+    # Command loop
+    # ------------------------------------------------------------------
+    def _start_cmd_loop(self):
+        from sensor import sensor_utils
+        cmd_loop = asyncio.new_event_loop()
+        cmd_thread = threading.Thread(target=sensor_utils.start_loop, args=(cmd_loop,))
+        cmd_thread.daemon = True
+        cmd_thread.name = "BleakHost cmd"
+        cmd_thread.start()
+        self._cmd_loop = cmd_loop
+        self._cmd_thread = cmd_thread
+
+    def _stop_cmd_loop(self):
+        loop = getattr(self, '_cmd_loop', None)
+        thread = getattr(self, '_cmd_thread', None)
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive():
+            try:
+                thread.join(timeout=2)
+            except Exception:
+                pass
+        self._cmd_loop = None
+        self._cmd_thread = None
+
+    def _ensure_cmd_loop(self):
+        if self._cmd_loop is None or self._cmd_loop.is_closed():
+            self._start_cmd_loop()
+
+    # ------------------------------------------------------------------
+    # Public APIs
+    # ------------------------------------------------------------------
+    def scan_once(self, period):
+
+        try:
+            self._cmd_queue.put_nowait({"type": "scan_once", "period": period})
+        except queue.Full:
+            pass
+
+    def start_scan(self, period):
+
+        try:
+            self._cmd_queue.put_nowait({"type": "start_scan", "period": period})
+        except queue.Full:
+            pass
+
+    def stop_scan(self):
+
+        try:
+            self._cmd_queue.put_nowait({"type": "stop_scan"})
+        except queue.Full:
+            pass
+
+    def send_command(self, cmd: dict):
+
+        try:
+            self._cmd_queue.put_nowait(cmd)
+        except queue.Full:
+            pass
+
+    def send_command_sync(self, cmd: dict, timeout: float = 10.0) -> dict:
+
+        if not self._started:
+            return {}
+        self._ensure_cmd_loop()
+
+        async def _do_send():
+            cmd_id = str(uuid.uuid4())
+            cmd["cmd_id"] = cmd_id
+            event = asyncio.Event()
+            container = {}
+            with self._pending_lock:
+                self._pending[cmd_id] = ("async_event", event, container, asyncio.get_event_loop())
+            try:
+                self._cmd_queue.put(cmd, timeout=1.0)
+            except queue.Full:
+                with self._pending_lock:
+                    self._pending.pop(cmd_id, None)
+                return {}
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                with self._pending_lock:
+                    self._pending.pop(cmd_id, None)
+                return {}
+            with self._pending_lock:
+                self._pending.pop(cmd_id, None)
+            return container.get("result", {})
+
+        future = asyncio.run_coroutine_threadsafe(_do_send(), self._cmd_loop)
+        try:
+            return future.result(timeout=timeout)
+        except Exception:
+            return {}
+
+    async def send_command_async(self, cmd: dict, timeout: float = 10.0) -> dict:
+
+        if not self._started:
+            return {}
+        self._ensure_cmd_loop()
+
+        async def _do_send():
+            cmd_id = str(uuid.uuid4())
+            cmd["cmd_id"] = cmd_id
+            future = asyncio.get_running_loop().create_future()
+            with self._pending_lock:
+                self._pending[cmd_id] = ("future", future, None, asyncio.get_running_loop())
+            try:
+                self._cmd_queue.put(cmd, timeout=1.0)
+            except queue.Full:
+                with self._pending_lock:
+                    self._pending.pop(cmd_id, None)
+                return {}
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                with self._pending_lock:
+                    self._pending.pop(cmd_id, None)
+                return {}
+
+        try:
+            caller_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            caller_loop = None
+
+        future = asyncio.run_coroutine_threadsafe(_do_send(), self._cmd_loop)
+        if caller_loop is not None:
+            return await asyncio.wrap_future(future, loop=caller_loop)
+        else:
+            return future.result()

@@ -7,6 +7,7 @@ import time
 
 _terminated = False
 _TIMEOUT = 10
+BLEAK_RESULT_QUEUE_MAXSIZE = 200
 running_tasks = set()
 _runloop: asyncio.AbstractEventLoop = None
 _event_thread: threading.Thread = None
