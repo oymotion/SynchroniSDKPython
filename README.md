@@ -185,6 +185,8 @@ success = sensorProfile.connect()
 
 Use `def disconnect() -> bool` to disconnect.
 
+If data notification is currently active, `disconnect()` will automatically stop it first before closing the BLE connection.
+
 ```python
 success = sensorProfile.disconnect()
 ```
@@ -346,24 +348,31 @@ Please check async_console.py in examples directory
 
 Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor profile. Please call after device in 'Ready' state.
 
+The asynchronous variant is `asyncSetParam(self, key: str, value: str) -> str`.
+
+If the device is already streaming when you change an `NTF_*` or `FILTER_*` key, the SDK will stop and restart the data notification so the new setting takes effect immediately.
+
 Below is available key and value:
 
 ```python
+# Data stream toggles
+result = sensorProfile.setParam("NTF_GEST", "ON")
 result = sensorProfile.setParam("NTF_EMG", "ON")
-# set EMG data to ON or OFF, result is "OK" if succeed
-
 result = sensorProfile.setParam("NTF_EEG", "ON")
-# set EEG data to ON or OFF, result is "OK" if succeed
-
 result = sensorProfile.setParam("NTF_ECG", "ON")
-# set ECG data to ON or OFF, result is "OK" if succeed
-
 result = sensorProfile.setParam("NTF_IMU", "ON")
-# set IMU data to ON or OFF, result is "OK" if succeed
-
 result = sensorProfile.setParam("NTF_BRTH", "ON")
-# set BRTH data to ON or OFF, result is "OK" if succeed
+result = sensorProfile.setParam("NTF_IMPEDANCE", "ON")
+result = sensorProfile.setParam("NTF_MAG_ANGLE", "ON")
+result = sensorProfile.setParam("NTF_PPG_RAW", "ON")
+result = sensorProfile.setParam("NTF_GFORCE_EULER", "ON")
+result = sensorProfile.setParam("NTF_GFORCE_QUAT", "ON")
+result = sensorProfile.setParam("NTF_GFORCE_ACC", "ON")
+result = sensorProfile.setParam("NTF_GFORCE_GYRO", "ON")
+# set data stream to ON or OFF, result is "OK" if succeed
+# Note: on legacy (non-new) EMG devices, NTF_GEST and NTF_EMG are mutually exclusive.
 
+# Firmware filter toggles
 result = sensorProfile.setParam("FILTER_50HZ", "ON")
 # set 50Hz notch filter to ON or OFF, result is "OK" if succeed
 
@@ -380,3 +389,24 @@ result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
 # set debug ble data path, result is "OK" if succeed
 # please give an absolute path and make sure it is valid and writeable by yourself
 ```
+
+
+### getParam method
+
+Use `def getParam(self, key: str) -> str` to query the current parameter state of a sensor profile. Please call after the device reaches the 'Ready' state.
+
+The asynchronous variant is `asyncGetParam(self, key: str) -> str`.
+
+Supported aggregate query keys:
+
+```python
+result = sensorProfile.getParam("FILTER")
+# Returns a pipe-separated string of all filter states, e.g.:
+# "FILTER_50HZ|ON|FILTER_60HZ|ON|FILTER_HPF|ON|FILTER_LPF|ON"
+
+result = sensorProfile.getParam("NTF")
+# Returns a pipe-separated string of all notification states, e.g.:
+# "NTF_BRTH|ON|NTF_ECG|ON|NTF_EEG|ON|NTF_EMG|ON|..."
+```
+
+If the key is not supported, the result starts with `"Error"`.

@@ -6,6 +6,9 @@ import uuid
 
 from sensor.bleak_process import BleakProcess
 from sensor import sensor_utils
+from sensor.sdk_log import SdkLog
+
+_TAG = "BleakHost"
 
 
 class BleakHost:
@@ -14,7 +17,7 @@ class BleakHost:
     def __init__(self):
         self._cmd_queue = multiprocessing.Queue(maxsize=50)
         self._result_queue = multiprocessing.Queue(maxsize=sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE)
-        self._bleak_process = BleakProcess(self._cmd_queue, self._result_queue)
+        self._bleak_process = BleakProcess(self._cmd_queue, self._result_queue, SdkLog.get_log_path())
         self._started = False
 
 
@@ -50,8 +53,8 @@ class BleakHost:
             return
         try:
             self._cmd_queue.put({"type": "terminate"})
-        except Exception:
-            pass
+        except Exception as e:
+            SdkLog.exception(_TAG, "Unexpected error")
 
         if self._bleak_process.is_alive():
             self._bleak_process.join(timeout=5)
@@ -82,13 +85,13 @@ class BleakHost:
         if loop is not None and not loop.is_closed():
             try:
                 loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
         if thread is not None and thread.is_alive():
             try:
                 thread.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
         self._result_loop = None
         self._result_thread = None
 
@@ -109,14 +112,14 @@ class BleakHost:
                 if self.on_scan_once_result is not None:
                     try:
                         self.on_scan_once_result(msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
             elif msg_type == "devices":
                 if self.on_scan_result is not None:
                     try:
                         self.on_scan_result(msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
             elif msg_type == "command_result":
                 self._handle_command_result(msg)
             elif msg_type in ("state_changed", "power_changed", "sensor_data", "error"):
@@ -124,8 +127,8 @@ class BleakHost:
                     device_mac = msg.get("device_mac")
                     try:
                         self.on_device_message(device_mac, msg)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
 
     def _handle_command_result(self, msg):
 
@@ -142,6 +145,15 @@ class BleakHost:
         elif waiter_type == "future":
             if loop is not None and not loop.is_closed() and not waiter.done():
                 loop.call_soon_threadsafe(waiter.set_result, msg)
+
+        # 将 connect 返回的 chip_type 转发给对应 SensorProfile
+        chip_type = msg.get("chip_type")
+        device_mac = msg.get("device_mac")
+        if chip_type is not None and self.on_device_message is not None and device_mac is not None:
+            try:
+                self.on_device_message(device_mac, {"type": "chip_type", "chip_type": chip_type})
+            except Exception as e:
+                SdkLog.exception(_TAG, "Error forwarding chip_type")
 
     # ------------------------------------------------------------------
     # Command loop
@@ -162,13 +174,13 @@ class BleakHost:
         if loop is not None and not loop.is_closed():
             try:
                 loop.call_soon_threadsafe(loop.stop)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
         if thread is not None and thread.is_alive():
             try:
                 thread.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
         self._cmd_loop = None
         self._cmd_thread = None
 
@@ -183,29 +195,29 @@ class BleakHost:
 
         try:
             self._cmd_queue.put_nowait({"type": "scan_once", "period": period})
-        except queue.Full:
-            pass
+        except queue.Full as e:
+            SdkLog.exception(_TAG, "Unexpected error")
 
     def start_scan(self, period):
 
         try:
             self._cmd_queue.put_nowait({"type": "start_scan", "period": period})
-        except queue.Full:
-            pass
+        except queue.Full as e:
+            SdkLog.exception(_TAG, "Unexpected error")
 
     def stop_scan(self):
 
         try:
             self._cmd_queue.put_nowait({"type": "stop_scan"})
-        except queue.Full:
-            pass
+        except queue.Full as e:
+            SdkLog.exception(_TAG, "Unexpected error")
 
     def send_command(self, cmd: dict):
 
         try:
             self._cmd_queue.put_nowait(cmd)
-        except queue.Full:
-            pass
+        except queue.Full as e:
+            SdkLog.exception(_TAG, "Command queue full")
 
     def send_command_sync(self, cmd: dict, timeout: float = 10.0) -> dict:
 
@@ -223,12 +235,14 @@ class BleakHost:
             try:
                 self._cmd_queue.put(cmd, timeout=1.0)
             except queue.Full:
+                SdkLog.e(_TAG, f"send_command_sync queue full: {cmd.get('type')}")
                 with self._pending_lock:
                     self._pending.pop(cmd_id, None)
                 return {}
             try:
                 await asyncio.wait_for(event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
+                SdkLog.e(_TAG, f"send_command_sync timeout: {cmd.get('type')}")
                 with self._pending_lock:
                     self._pending.pop(cmd_id, None)
                 return {}
@@ -240,6 +254,7 @@ class BleakHost:
         try:
             return future.result(timeout=timeout)
         except Exception:
+            SdkLog.exception(_TAG, "send_command_sync future failed")
             return {}
 
     async def send_command_async(self, cmd: dict, timeout: float = 10.0) -> dict:
@@ -257,12 +272,14 @@ class BleakHost:
             try:
                 self._cmd_queue.put(cmd, timeout=1.0)
             except queue.Full:
+                SdkLog.e(_TAG, f"send_command_async queue full: {cmd.get('type')}")
                 with self._pending_lock:
                     self._pending.pop(cmd_id, None)
                 return {}
             try:
                 return await asyncio.wait_for(future, timeout=timeout)
             except asyncio.TimeoutError:
+                SdkLog.e(_TAG, f"send_command_async timeout: {cmd.get('type')}")
                 with self._pending_lock:
                     self._pending.pop(cmd_id, None)
                 return {}

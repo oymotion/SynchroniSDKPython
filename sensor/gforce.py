@@ -19,6 +19,10 @@ from bleak import (
 )
 
 from sensor import sensor_utils
+from sensor.sensor_device import BLEChipType
+
+from sensor.sdk_log import SdkLog
+_TAG = "GForce"
 
 
 @dataclass
@@ -53,6 +57,7 @@ class Command(IntEnum):
     MOTOR_CONTROL = (0x24,)
     LED_CONTROL_TEST = (0x25,)
     PACKAGE_ID_CONTROL = (0x26,)
+    SEND_TRAINING_PACKAGE = (0x27,)
 
     GET_ACCELERATE_CAP = (0x30,)
     SET_ACCELERATE_CONFIG = (0x31,)
@@ -74,6 +79,8 @@ class Command(IntEnum):
 
     GET_GESTURE_CAP = (0x3C,)
     SET_GESTURE_CONFIG = (0x3D,)
+    GET_GESTURE_THRESHOLD = (0x47,)
+    SET_GESTURE_THRESHOLD = (0x48,)
 
     GET_EMG_RAWDATA_CAP = (0x3E,)
     SET_EMG_RAWDATA_CONFIG = (0x3F,)
@@ -108,6 +115,7 @@ class Command(IntEnum):
     CMD_SET_IMU_CONFIG = (0xAD,)
     CMD_GET_BLE_MTU_INFO = (0xAE,)
     CMD_GET_BRT_CONFIG = (0xB3,)
+    CMD_GET_PPG_CAP = (0xB5,)
     CMD_GET_PPG_CONFIG = (0xB6,)
     CMD_SET_PPG_CONFIG = (0xB7,)
 
@@ -156,6 +164,8 @@ class DataSubscription(IntEnum):
 
     # Device Log On
     LOG = (0x00000800,)
+
+    DNF_TYPE_GEST_EXT = (0x00001000,)
 
     DNF_MAG_ANGLE_EXT = (0x00002000,)
     
@@ -320,12 +330,14 @@ class ImuRawDataConfig:
     gyroK: float = 0
 
     def to_bytes(self) -> bytes:
+        """生成 CMD_SET_IMU_CONFIG 命令体，与 Android setImuDataConfig 协议一致。
+
+        协议格式：channel_count(int32) + sample_rate(uint16) + sample_count(uint8)
+        """
         body = b""
         body += struct.pack("<i", self.channel_count)
         body += struct.pack("<H", self.fs)
         body += struct.pack("<B", self.batch_len)
-        body += struct.pack("<d", self.accK)
-        body += struct.pack("<d", self.gyroK)
         return body
 
     @classmethod
@@ -432,6 +444,7 @@ class GForce:
         isUniversalStream: bool,
         event_loop: asyncio.AbstractEventLoop,
         gforce_event_loop: asyncio.AbstractEventLoop,
+        chip_type: BLEChipType = BLEChipType.Unknown,
     ):
         self.device_name = ""
         self.client = None
@@ -444,9 +457,13 @@ class GForce:
         self._num_channels = 8
         self._device = device
         self._is_universal_stream = isUniversalStream
+        self._chip_type = chip_type
         self._raw_data_buf: queue.Queue[bytes] = None
         self.packet_id = 0
         self.data_packet = []
+
+    def get_chip_type(self) -> BLEChipType:
+        return self._chip_type
 
     async def _run_in_gforce_loop(self, coro, timeout=None):
 
@@ -505,8 +522,16 @@ class GForce:
         try:
             q.put_nowait(bytes(bs))
         except queue.Full:
-            while not q.empty():
-                q.get_nowait()
+            # Drop only a few oldest items instead of clearing the whole queue
+            # to avoid losing too many raw data packets at once.
+            SdkLog.w(_TAG, "Raw data queue full, dropping oldest packets")
+            dropped = 0
+            while dropped < 16 and not q.empty():
+                try:
+                    q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
 
     @staticmethod
     def _convert_acceleration_to_g(data: bytes) -> np.ndarray[np.float32]:
@@ -572,8 +597,15 @@ class GForce:
         try:
             q.put_nowait(bytes(bs))
         except queue.Full:
-            while not q.empty():
-                q.get_nowait()
+            # Drop only a few oldest items instead of clearing the whole queue.
+            SdkLog.w(_TAG, "Universal raw data queue full, dropping oldest packets")
+            dropped = 0
+            while dropped < 16 and not q.empty():
+                try:
+                    q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
 
     def _on_cmd_response(self, _: BleakGATTCharacteristic, bs: bytearray):
         sensor_utils.async_exec(self.async_on_cmd_response(bs), self.event_loop)
@@ -1022,41 +1054,34 @@ class GForce:
         q = None
         if req.has_res:
             q = self._get_response_channel(req.cmd)
-
-        timeStamp_old = -1
-        while not q.empty():
-            timeStamp_old = q.get_nowait()
-
-        now = datetime.now()
-        timestamp_now = now.timestamp()
-        if (timeStamp_old > -1) and ((timestamp_now - timeStamp_old) < 3):
-            q.put_nowait(timeStamp_old)
-            raise RuntimeError("Send request too fast")
+            # 清空可能残留的旧响应，避免拿到上次超时的数据
+            while not q.empty():
+                q.get_nowait()
 
         bs = bytes([req.cmd])
         if req.body is not None:
             bs += req.body
 
         # print(str(req.cmd) + str(req.body))
+        response = False if self._chip_type == BLEChipType.RFSTAR else None
         try:
             await self._run_in_gforce_loop(
-                self.client.write_gatt_char(self.cmd_char, bs),
-                timeout=1
+                self.client.write_gatt_char(self.cmd_char, bs, response=response),
+                timeout=2
             )
         except Exception as e:
-            self.responses[req.cmd] = None
+            SdkLog.exception(_TAG, f"_send_request write_gatt_char failed: {req.cmd}")
+            if req.has_res:
+                self.responses[req.cmd] = None
             return None
 
         if not req.has_res:
-            self.responses[req.cmd] = None
             return None
 
         try:
             ret = q.get(timeout=2)
-            now = datetime.now()
-            timestamp_now = now.timestamp()
-            q.put_nowait(timestamp_now)
             return ret
         except Exception as e:
+            SdkLog.exception(_TAG, f"_send_request wait response failed: {req.cmd}")
             self.responses[req.cmd] = None
-            return None
+            raise RuntimeError(f"_send_request wait response failed: {req.cmd}") from e

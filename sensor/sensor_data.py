@@ -30,7 +30,6 @@ class Sample:
         self.isLost = False
         self.timeStampInMs = 0
         self.channelIndex = 0
-        self.sampleIndex = 0
 
 
 
@@ -40,6 +39,7 @@ class DataType(IntEnum):
     NTF_GYRO = 0x2
     NTF_EULER_DATA = 0x4
     NTF_QUATERNION = 0x5
+    NTF_GEST = 0x07
     NTF_EMG = 0x8
     NTF_MAG_ANGLE_DATA = 0x0D
     NTF_EEG = 0x10
@@ -49,11 +49,8 @@ class DataType(IntEnum):
     NTF_ADS = 0x14
     NTF_BRTH = 0x15
     NTF_IMPEDANCE_EXT = 0x16
-    NTF_PPG = 0x18
     NTF_SPO2 = 0x17
-
-
-
+    NTF_PPG = 0x18
 
 
 class SensorData:
@@ -94,6 +91,7 @@ class SensorData:
         self.lastPackageIndex = 0
         self.lostPackageCount = 0
         self.resolutionBits = 0
+        self.resolutionSigned = 0
         self.channelMask = 0
         self.minPackageSampleCount = 0
         self.K = 0

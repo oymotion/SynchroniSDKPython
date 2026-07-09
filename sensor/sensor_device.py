@@ -41,7 +41,10 @@ class DeviceInfo:
         self.FirmwareVersion = ""
         self.PpgChannelCount =0
         self.PpgSampleRate = 0
+        self.Spo2ChannelCount = 0
         self.Spo2SampleRate = 0
+        self.ImpeChannelCount = 0
+        self.ImpeSampleRate = 0
         self.EmgChannelCount = 0
         self.EmgSampleRate = 0
         self.EegChannelCount = 0
@@ -72,6 +75,10 @@ class DeviceStateEx(Enum):
     Invalid = 5
 
 
+class BLEChipType(Enum):
+    Unknown = -1
+    OYM = 0
+    RFSTAR = 1
 
 
 class BLEDevice:

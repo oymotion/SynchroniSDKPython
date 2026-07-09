@@ -1,5 +1,6 @@
 import asyncio
 import multiprocessing
+import os
 import platform
 import queue
 import threading
@@ -10,6 +11,10 @@ from bleak import BleakScanner
 from bleak import AdvertisementData
 
 from sensor import sensor_utils
+from sensor.sensor_device import BLEChipType
+from sensor.sdk_log import SdkLog
+
+_TAG = "BleakProcess"
 
 SERVICE_GUID = "0000ffd0-0000-1000-8000-00805f9b34fb"
 RFSTAR_SERVICE_GUID = "00001812-0000-1000-8000-00805f9b34fb"
@@ -67,10 +72,12 @@ class BleakProcess(multiprocessing.Process):
         self,
         cmd_queue: multiprocessing.Queue,
         result_queue: multiprocessing.Queue,
+        log_path: str = None,
     ):
         super().__init__(daemon=True)
         self.cmd_queue = cmd_queue
         self.result_queue = result_queue
+        self._log_path = log_path
         self._scanner = None
         self._is_scanning = False
         self._should_exit = False
@@ -96,17 +103,41 @@ class BleakProcess(multiprocessing.Process):
         self._gforce_event_loop = None
         self._gforce_event_thread = None
 
+    # Message types that can be dropped when the result queue is full.
+    _DROPABLE_MSG_TYPES = ("sensor_data", "devices", "scan_once_result", "error")
+
     def _publish(self, msg_type: str, **kwargs):
 
         try:
             msg = {"type": msg_type, **kwargs}
 
-            if msg_type in ("sensor_data", "devices", "scan_once_result", "error"):
-                if self._msg_queue.qsize() > sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE:
+            # Memory guard: prevent the internal message queue from growing without bound.
+            if self._msg_queue.qsize() > sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE:
+                if msg_type in self._DROPABLE_MSG_TYPES:
                     return
-            self._msg_queue.put_nowait(msg)
-        except Exception:
-            pass
+                # For non-droppable messages, try to evict one old droppable message.
+                try:
+                    old_msg = self._msg_queue.get_nowait()
+                    old_type = old_msg.get("type")
+                    if old_type not in self._DROPABLE_MSG_TYPES:
+                        # If the oldest message is also non-droppable, put it back.
+                        self._msg_queue.put_nowait(old_msg)
+                except queue.Empty:
+                    pass
+                except Exception:
+                    pass
+
+            try:
+                self._msg_queue.put_nowait(msg)
+            except queue.Full:
+                # If still full, use a short blocking put for important messages.
+                if msg_type not in self._DROPABLE_MSG_TYPES:
+                    try:
+                        self._msg_queue.put(msg, timeout=1.0)
+                    except queue.Full:
+                        SdkLog.w(_TAG, f"Message queue still full, dropping important message: {msg_type}")
+        except Exception as e:
+            SdkLog.exception(_TAG, "Unexpected error")
 
     def _flush_msg_queue(self):
 
@@ -114,35 +145,70 @@ class BleakProcess(multiprocessing.Process):
             try:
                 msg = self._msg_queue.get_nowait()
                 msg_type = msg.get("type")
-                if msg_type in ("sensor_data", "devices", "scan_once_result", "error"):
+                if msg_type in self._DROPABLE_MSG_TYPES:
                     self.result_queue.put_nowait(msg)
                 else:
-                    self.result_queue.put(msg, timeout=sensor_utils._TIMEOUT)
+                    # Use a short timeout during shutdown so the child process can exit cleanly.
+                    self.result_queue.put(msg, timeout=2.0)
             except queue.Empty:
                 break
             except queue.Full:
-                break
+                # Drop one old droppable message to make room for important messages.
+                SdkLog.w(_TAG, "Result queue full, trying to drop one old droppable message")
+                try:
+                    old_msg = self._msg_queue.get_nowait()
+                    old_type = old_msg.get("type")
+                    if old_type not in self._DROPABLE_MSG_TYPES:
+                        self._msg_queue.put_nowait(old_msg)
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
             except Exception:
                 break
 
     async def _publisher_task(self):
+        # Throttle queue-full logs to avoid blocking stdout on Windows.
+        _last_queue_full_log = 0.0
 
         while True:
+            msg = None
+            msg_type = None
             try:
                 msg = self._msg_queue.get_nowait()
                 msg_type = msg.get("type")
-                if msg_type in ("sensor_data", "devices", "scan_once_result", "error"):
+                if msg_type in self._DROPABLE_MSG_TYPES:
                     self.result_queue.put_nowait(msg)
                 else:
-                    self.result_queue.put(msg, timeout=sensor_utils._TIMEOUT)
+                    # Use a short timeout for important messages so the publisher does not stall.
+                    self.result_queue.put(msg, timeout=2.0)
             except queue.Empty:
                 if self._should_exit:
                     break
                 await asyncio.sleep(0.001)
-            except queue.Full:
-                pass
-            except Exception:
-                pass
+            except queue.Full as e:
+                if msg is not None:
+                    if msg_type not in self._DROPABLE_MSG_TYPES:
+                        # Put important messages back so they can be retried later.
+                        try:
+                            self._msg_queue.put_nowait(msg)
+                        except queue.Full:
+                            pass
+                    else:
+                        # Droppable messages are discarded to avoid unbounded memory growth.
+                        pass
+                # Log at most once every 2 seconds to prevent stdout flooding.
+                now = time.time()
+                if now - _last_queue_full_log >= 2.0:
+                    _last_queue_full_log = now
+                    SdkLog.w(_TAG, f"Result queue is full, dropping message: {e}")
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                now = time.time()
+                if now - _last_queue_full_log >= 2.0:
+                    _last_queue_full_log = now
+                    SdkLog.e(_TAG, f"Error in publisher_task: {e}")
+                await asyncio.sleep(0.001)
 
     def _init_scanner(self):
         if self._scanner is None:
@@ -203,8 +269,8 @@ class BleakProcess(multiprocessing.Process):
                     loop = self._data_event_loops.get(device_mac)
                     if loop and not loop.is_closed():
                         loop.call_soon_threadsafe(task.cancel)
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
         # Stop loops and join threads (gforce loop is singleton, do not stop here)
         for loop_dict, thread_dict in [
@@ -216,24 +282,30 @@ class BleakProcess(multiprocessing.Process):
             if loop is not None and not loop.is_closed():
                 try:
                     loop.call_soon_threadsafe(loop.stop)
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
             if thread is not None and thread.is_alive():
                 try:
                     thread.join(timeout=2)
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
         self._cleanup_locks.pop(device_mac, None)
 
     def run(self):
 
+        if self._log_path:
+            SdkLog.set_log_path(self._log_path)
+
+        data_log_enabled = os.environ.get("SENSORSKD_DATA_LOG_ENABLED", "0") == "1"
+        SdkLog.set_data_log_enabled(data_log_enabled)
+
         if platform.system() == "Windows":
             try:
                 from bleak.backends.winrt.util import allow_sta
                 allow_sta()
-            except ImportError:
-                pass
+            except ImportError as e:
+                SdkLog.exception(_TAG, "Unexpected error")
 
 
         # "cannot pickle '_thread.lock' object"
@@ -252,8 +324,8 @@ class BleakProcess(multiprocessing.Process):
                     publisher_task.cancel()
                     try:
                         await publisher_task
-                    except asyncio.CancelledError:
-                        pass
+                    except asyncio.CancelledError as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
 
                 self._flush_msg_queue()
 
@@ -263,13 +335,13 @@ class BleakProcess(multiprocessing.Process):
         if self._gforce_event_loop is not None and not self._gforce_event_loop.is_closed():
             try:
                 self._gforce_event_loop.call_soon_threadsafe(self._gforce_event_loop.stop)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
         if self._gforce_event_thread is not None and self._gforce_event_thread.is_alive():
             try:
                 self._gforce_event_thread.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
 
         for device_mac in list(self._event_loops.keys()):
             self._stop_device_loops(device_mac)
@@ -295,8 +367,8 @@ class BleakProcess(multiprocessing.Process):
                         self._cleanup_device(device_mac, disconnect_client=False), loop
                     )
                     await asyncio.wait_for(asyncio.wrap_future(future), timeout=3)
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
             self._stop_device_loops(device_mac)
 
     async def _handle_command(self, cmd: dict):
@@ -335,6 +407,7 @@ class BleakProcess(multiprocessing.Process):
             "start_notification": self._do_start_notification,
             "stop_notification": self._do_stop_notification,
             "get_battery": self._do_get_battery,
+            "get_param": self._do_get_param,
             "set_neucir_app_control": self._do_set_neucir_app_control,
             "set_neucir_mode": self._do_set_neucir_mode,
             "set_param": self._do_set_param,
@@ -360,6 +433,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=25)
         except asyncio.TimeoutError:
+            SdkLog.e(_TAG, f"_handle_command timeout: {cmd_type}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -368,6 +442,7 @@ class BleakProcess(multiprocessing.Process):
                 result="Timeout",
             )
         except Exception as e:
+            SdkLog.exception(_TAG, f"_handle_command failed: {cmd_type}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -389,6 +464,7 @@ class BleakProcess(multiprocessing.Process):
             devices = self._process_ble_devices(found_devices)
             self._publish("scan_once_result", devices=devices)
         except Exception as e:
+            SdkLog.exception(_TAG, f"scan_once failed: {e}")
             self._publish("error", message=f"scan_once failed: {e}")
 
     async def _do_start_scan(self, period: int):
@@ -401,6 +477,7 @@ class BleakProcess(multiprocessing.Process):
             devices = self._process_ble_devices(found_devices)
             self._publish("devices", devices=devices)
         except Exception as e:
+            SdkLog.exception(_TAG, f"start_scan failed: {e}")
             self._publish("error", message=f"start_scan failed: {e}")
 
     def _process_ble_devices(self, found_devices: dict) -> list:
@@ -444,6 +521,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=25)
         except asyncio.TimeoutError:
+            SdkLog.e(_TAG, f"_do_connect timeout: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -452,6 +530,7 @@ class BleakProcess(multiprocessing.Process):
                 result="Connect timeout",
             )
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_connect failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -484,15 +563,18 @@ class BleakProcess(multiprocessing.Process):
             )
             return
 
-        # Determine service type
+        # Determine service type and BLE chip type
+        chip_type = BLEChipType.Unknown
         if service_data.get(SERVICE_GUID) is not None:
             cmd_char = OYM_CMD_NOTIFY_CHAR_UUID
             data_char = OYM_DATA_NOTIFY_CHAR_UUID
             is_universal = False
+            chip_type = BLEChipType.OYM
         elif service_data.get(RFSTAR_SERVICE_GUID) is not None:
             cmd_char = RFSTAR_CMD_UUID
             data_char = RFSTAR_DATA_UUID
             is_universal = True
+            chip_type = BLEChipType.RFSTAR
         else:
             self._publish(
                 "command_result",
@@ -519,7 +601,7 @@ class BleakProcess(multiprocessing.Process):
         raw_buf = queue.Queue(maxsize=sensor_utils.BLEAK_RESULT_QUEUE_MAXSIZE)
 
         # Create GForce with per-device event loops
-        gforce = GForce(bleak_device, cmd_char, data_char, is_universal, event_loop, gforce_event_loop)
+        gforce = GForce(bleak_device, cmd_char, data_char, is_universal, event_loop, gforce_event_loop, chip_type)
 
         # Define disconnect callback: schedule cleanup in event_loop
         def handle_disconnect(_):
@@ -529,12 +611,13 @@ class BleakProcess(multiprocessing.Process):
                     asyncio.run_coroutine_threadsafe(
                         self._cleanup_device(device_mac, disconnect_client=False), loop
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
         try:
             await gforce.connect(handle_disconnect, raw_buf)
         except Exception as e:
+            SdkLog.exception(_TAG, f"gforce.connect failed: {device_mac}")
             await self._cleanup_device(device_mac, disconnect_client=False)
             self._publish(
                 "command_result",
@@ -577,6 +660,7 @@ class BleakProcess(multiprocessing.Process):
             device_mac=device_mac,
             success=True,
             result=True,
+            chip_type=chip_type.value,
         )
 
     async def _cleanup_device(self, device_mac: str, disconnect_client: bool = False):
@@ -595,8 +679,8 @@ class BleakProcess(multiprocessing.Process):
                 if task is not None:
                     try:
                         task.cancel()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
 
             # Cancel battery task
             if device_mac in self._battery_tasks:
@@ -609,19 +693,19 @@ class BleakProcess(multiprocessing.Process):
                     if ctx.isDataTransfering:
                         try:
                             await ctx.stop_streaming()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            SdkLog.exception(_TAG, "Unexpected error")
                 try:
                     await self._gforces[device_mac].disconnect()
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
             # Close data context
             if device_mac in self._data_ctxs:
                 try:
                     self._data_ctxs[device_mac].close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
                 self._data_ctxs.pop(device_mac, None)
 
             # Pop state
@@ -680,6 +764,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             success = await ctx.init(package_sample_count)
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_init failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -697,8 +782,8 @@ class BleakProcess(multiprocessing.Process):
                 try:
                     power = await self._gforces[device_mac].get_battery_level()
                     self._publish("power_changed", device_mac=device_mac, power=power)
-                except Exception:
-                    pass
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
 
             # Start battery polling task (runs in event_loop)
             if power_refresh_interval > 0:
@@ -747,10 +832,10 @@ class BleakProcess(multiprocessing.Process):
                 await ctx.processUniversalData(local_buf, on_data, on_error)
             else:
                 await ctx.process_data(local_buf, on_data, on_error)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+        except asyncio.CancelledError as e:
+            SdkLog.exception(_TAG, "Data loop cancelled")
+        except Exception as e:
+            SdkLog.exception(_TAG, "Error in data loop")
 
     async def _do_start_notification(self, cmd: dict):
 
@@ -779,6 +864,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             result = await ctx.start_streaming()
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_start_notification failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -813,6 +899,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             result = await ctx.stop_streaming()
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_stop_notification failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -846,6 +933,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             power = await self._gforces[device_mac].get_battery_level()
         except Exception:
+            SdkLog.exception(_TAG, f"_do_get_battery failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -884,6 +972,7 @@ class BleakProcess(multiprocessing.Process):
                 cmd.get("stop", False),
             )
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_set_neucir_app_control failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -918,6 +1007,7 @@ class BleakProcess(multiprocessing.Process):
         try:
             ret = await self._gforces[device_mac].set_neucir_mode(cmd.get("mode", 0))
         except Exception as e:
+            SdkLog.exception(_TAG, f"_do_set_neucir_mode failed: {device_mac}")
             self._publish(
                 "command_result",
                 cmd_id=cmd.get("cmd_id"),
@@ -933,6 +1023,56 @@ class BleakProcess(multiprocessing.Process):
             cmd_id=cmd.get("cmd_id"),
             device_mac=device_mac,
             success=True,
+            result=result,
+        )
+
+    async def _do_get_param(self, cmd: dict):
+
+        device_mac = cmd["device_mac"]
+        key = cmd.get("key", "")
+
+        if device_mac not in self._data_ctxs:
+            self._publish(
+                "command_result",
+                cmd_id=cmd.get("cmd_id"),
+                device_mac=device_mac,
+                success=False,
+                result="Error: Please connect first",
+            )
+            return
+
+        ctx = self._data_ctxs[device_mac]
+        if not ctx.hasInit():
+            self._publish(
+                "command_result",
+                cmd_id=cmd.get("cmd_id"),
+                device_mac=device_mac,
+                success=False,
+                result="Error: Not initialized",
+            )
+            return
+
+        result = "Error: Not supported"
+
+        if key == "FILTER":
+            sorted_keys = sorted(ctx.filter_map.keys())
+            result = "|".join(f"{k}|{ctx.filter_map[k]}" for k in sorted_keys)
+
+        if key == "NTF":
+            sorted_keys = sorted(ctx.notify_map.keys())
+            result = "|".join(f"{k}|{ctx.notify_map[k]}" for k in sorted_keys)
+
+        if key == "DEBUG_LOG_PATH":
+            result = SdkLog.get_log_path() or ""
+
+        if key == "DEBUG_BLE_DATA_PATH":
+            result = ctx._data_log_path if ctx._data_log_enabled else ""
+
+        self._publish(
+            "command_result",
+            cmd_id=cmd.get("cmd_id"),
+            device_mac=device_mac,
+            success=(not result.startswith("Error")),
             result=result,
         )
 
@@ -964,23 +1104,96 @@ class BleakProcess(multiprocessing.Process):
             return
 
         result = "Error: Not supported"
+        needs_restart = False
 
-        if key in ["NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH", "NTF_IMPEDANCE"]:
+        ntf_keys = [
+            "NTF_GEST", "NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU", "NTF_BRTH", "NTF_IMPEDANCE",
+            "NTF_MAG_ANGLE", "NTF_PPG", "NTF_PPG_RAW", "NTF_SPO2",
+            "NTF_GFORCE_EULER", "NTF_GFORCE_QUAT",
+            "NTF_GFORCE_ACC", "NTF_GFORCE_GYRO",
+        ]
+        if key in ntf_keys:
             if value in ["ON", "OFF"]:
-                ctx.init_map[key] = value
-                result = "OK"
+                # 统一 PPG 开关别名
+                map_key = key
+                if key == "NTF_PPG_RAW":
+                    map_key = "NTF_PPG"
+
+                # 老版本 EMG 设备上 Gesture 与 EMG 互斥，与 initGesture 逻辑保持一致
+                if not ctx.isNewEMG:
+                    if map_key == "NTF_GEST" and value == "ON" and ctx.notify_map.get("NTF_EMG") == "ON":
+                        result = "Error: NTF_GEST conflicts with NTF_EMG on legacy EMG device"
+                    elif map_key == "NTF_EMG" and value == "ON" and ctx.notify_map.get("NTF_GEST") == "ON":
+                        ctx.notify_map["NTF_GEST"] = "OFF"
+                        ctx.notify_map[map_key] = value
+                        result = "OK"
+                    else:
+                        ctx.notify_map[map_key] = value
+                        result = "OK"
+                else:
+                    ctx.notify_map[map_key] = value
+                    result = "OK"
+                if result == "OK" and ctx.hasInit() and ctx.isDataTransfering:
+                    ctx._buildNotifyDataFlag()
+                    needs_restart = True
+                    if ctx.getChipType() == BLEChipType.OYM:
+                        try:
+                            await ctx.gForce.set_subscription(ctx.notifyDataFlag)
+                        except Exception as e:
+                            SdkLog.exception(_TAG, f"_do_set_param set_subscription failed: {device_mac}")
+                            result = "ERROR: set_subscription fail: " + str(e)
 
         if key in ["FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF"]:
             if value in ["ON", "OFF"]:
                 try:
                     result = await ctx.setFilter(key, value)
+                    if result == "OK" and ctx.hasInit() and ctx.isDataTransfering:
+                        needs_restart = True
                 except Exception as e:
+                    SdkLog.exception(_TAG, f"_do_set_param setFilter failed: {device_mac} {key}={value}")
                     result = "ERROR: " + str(e)
+
+        if needs_restart:
+            try:
+                await ctx.stop_streaming()
+                await ctx.start_streaming()
+            except Exception as e:
+                SdkLog.exception(_TAG, f"_do_set_param restart stream failed: {device_mac}")
+                result = "ERROR: restart stream fail: " + str(e)
+
+        if key == "DEBUG_LOG_PATH":
+            try:
+                if value == "False" or value == "":
+                    SdkLog.set_log_path("")
+                    result = "OK"
+                elif value == "True":
+                    path = SdkLog.get_default_log_path()
+                    SdkLog.set_log_path(path)
+                    result = path
+                else:
+                    SdkLog.set_log_path(value)
+                    result = value
+            except Exception as e:
+                SdkLog.exception(_TAG, f"_do_set_param DEBUG_LOG_PATH failed: {e}")
+                result = "ERROR: " + str(e)
 
         if key == "DEBUG_BLE_DATA_PATH":
             try:
-                result = await ctx.setDebugCSV(value)
+                if value == "False" or value == "":
+                    SdkLog.set_data_log_enabled(False)
+                    await ctx.setDebugCSV("")
+                    result = "OK"
+                elif value == "True":
+                    SdkLog.set_data_log_enabled(True)
+                    path = SdkLog.get_default_data_log_path()
+                    csv_result = await ctx.setDebugCSV(path)
+                    result = path if csv_result == "OK" else csv_result
+                else:
+                    SdkLog.set_data_log_enabled(True)
+                    csv_result = await ctx.setDebugCSV(value)
+                    result = value if csv_result == "OK" else csv_result
             except Exception as e:
+                SdkLog.exception(_TAG, f"_do_set_param setDebugCSV failed: {device_mac} path={value}")
                 result = "ERROR: " + str(e)
 
         if key == "NEUCIR_SET_MODE":
@@ -989,6 +1202,7 @@ class BleakProcess(multiprocessing.Process):
                     ret = await self._gforces[device_mac].set_neucir_mode(1)
                     result = "OK" if ret else "Error: Unknown error"
                 except Exception as e:
+                    SdkLog.exception(_TAG, f"_do_set_param NEUCIR_SET_MODE failed: {device_mac}")
                     result = "ERROR: " + str(e)
 
         if key == "NEUCIR_APP_CONTROL":
@@ -1002,6 +1216,7 @@ class BleakProcess(multiprocessing.Process):
                         ret = await self._gforces[device_mac].set_neucir_app_control(False, False, True)
                     result = "OK" if ret else "Error: Unknown error"
                 except Exception as e:
+                    SdkLog.exception(_TAG, f"_do_set_param NEUCIR_APP_CONTROL failed: {device_mac} {value}")
                     result = "ERROR: " + str(e)
 
         self._publish(

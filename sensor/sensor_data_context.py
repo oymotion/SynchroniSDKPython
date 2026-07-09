@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from datetime import datetime
 import os
 import platform
 from queue import Queue
@@ -9,13 +10,17 @@ from typing import Deque, List
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from sensor import sensor_utils
-from sensor.gforce import DataSubscription, GForce, SamplingRate
+from sensor.gforce import DataSubscription, GForce, ImuRawDataConfig, SamplingRate
 from sensor.sensor_data import DataType, Sample, SensorData
 
 from enum import Enum, IntEnum
 
-from sensor.sensor_device import DeviceInfo
+from sensor.sensor_device import BLEChipType, DeviceInfo
+from sensor.sdk_log import SdkLog
 
+_TAG = "SensorProfileDataCtx"
+
+QUAT_SCALE = 1 / 1073741824.0  # 2^30
 
 class SensorDataType(IntEnum):
     DATA_TYPE_EEG = 0
@@ -27,14 +32,17 @@ class SensorDataType(IntEnum):
     DATA_TYPE_MAG_ANGLE = 6
     DATA_TYPE_QUATERNION = 7
     DATA_TYPE_PPG = 8
-    DATA_TYPE_SPO2 = 10
-    DATA_TYPE_EULER = 9
+    DATA_TYPE_SPO2 = 9
+    DATA_TYPE_EULER = 10
     DATA_TYPE_GFORCE_QUAT = 11
-    DATA_TYPE_COUNT = 12
+    DATA_TYPE_IMPEDANCE = 12
+    DATA_TYPE_GEST = 13
+    DATA_TYPE_COUNT = 14
 
 
 
 class FeatureMaps(Enum):
+    GFD_FEAT_GEST = 0x000001000
     GFD_FEAT_EMG = 0x000002000
     GFD_FEAT_MAGANG = 0x00080000
     GFD_FEAT_EEG = 0x000400000
@@ -64,6 +72,7 @@ class SensorProfileDataCtx:
         self.notifyDataFlag: DataSubscription = 0
 
         self.gForce = gForce
+        self._chip_type = gForce.get_chip_type() if gForce is not None else BLEChipType.Unknown
         self.deviceMac = deviceMac
         self._device_info: DeviceInfo = None
 
@@ -73,15 +82,13 @@ class SensorProfileDataCtx:
         self.isUniversalStream: bool = gForce._is_universal_stream
         self._rawDataBuffer: Queue[bytes] = buf
         self._concatDataBuffer = bytearray()
-
+        # EMG support
+        self.isNewEMG = False
         # Quaternion support
         self.isContainQAT6 = False
-        self.lastQuatData: List[float] = [0.0, 0.0, 0.0, 0.0]
-        self.lastEulerData: List[float] = [0.0, 0.0, 0.0]
-        self.lastAccData: List[float] = [0.0, 0.0, 0.0]
-        self.lastGyroData: List[float] = [0.0, 0.0, 0.0]
         # PPG configuration
-        self.model = PPGDataMode.PPG_RAW
+        self.ppgModel = PPGDataMode.PPG_AND_SPO2
+        # self.ppgModel = PPGDataMode.PPG_RAW
 
         self.sensorDatas: List[SensorData] = list()
         for idx in range(0, SensorDataType.DATA_TYPE_COUNT):
@@ -89,8 +96,8 @@ class SensorProfileDataCtx:
         self.impedanceData: List[float] = list()
         self.saturationData: List[float] = list()
         self.dataPool = ThreadPoolExecutor(1, "data")
-        self.init_map = {"NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON",
-                         "NTF_MAG_ANGLE": "ON", "NTF_IMPEDANCE": "ON", "NTF_PPG_RAW": "ON", "NTF_SPO2": "ON",
+        self.notify_map = {"NTF_GEST": "ON", "NTF_EMG": "ON", "NTF_EEG": "ON", "NTF_ECG": "ON", "NTF_IMU": "ON", "NTF_BRTH": "ON",
+                         "NTF_MAG_ANGLE": "ON", "NTF_IMPEDANCE": "ON", "NTF_PPG": "ON", "NTF_SPO2": "ON",
                          "NTF_GFORCE_EULER": "ON",
                          "NTF_GFORCE_QUAT": "ON",
                          "NTF_GFORCE_ACC": "ON",
@@ -100,10 +107,23 @@ class SensorProfileDataCtx:
         self.debugCSVWriter = None
         self.debugCSVPath = None
 
-    def close(self):  
+        # 每个 SensorProfile 独立的 data 日志开关与 CSV 写入器
+        self._data_log_enabled = False
+        self._data_log_path = None
+        self._data_log_file = None
+        self._data_log_writer = None
+
+    def close(self):
         self._is_running = False
         if self.debugCSVWriter != None:
             self.debugCSVWriter = None
+        if self._data_log_file is not None:
+            try:
+                self._data_log_file.close()
+            except Exception:
+                pass
+            self._data_log_file = None
+        self._data_log_writer = None
 
     def clear(self):
         for sensorData in self.sensorDatas:
@@ -125,6 +145,50 @@ class SensorProfileDataCtx:
     def hasInit(self):
         return not self._is_initing and self.featureMap != 0 and self.notifyDataFlag != 0
 
+    def getChipType(self) -> BLEChipType:
+        return self._chip_type
+
+    def _buildNotifyDataFlag(self):
+        """根据当前 notify_map 和能力位重建 notifyDataFlag 订阅掩码。
+
+        此方法在 init() 结束以及 setParam 动态切换数据流时调用。
+        """
+        flag = DataSubscription(0)
+        if self.hasConcatBLE():
+            flag |= DataSubscription.DNF_CONCAT_BLE
+
+        if self.hasEMG() and self.notify_map.get("NTF_EMG") == "ON":
+            flag |= DataSubscription.EMG_RAW
+        if self.hasGEST() and self.notify_map.get("NTF_GEST") == "ON":
+            flag |= DataSubscription.DNF_TYPE_GEST_EXT
+        if self.hasEEG() and self.notify_map.get("NTF_EEG") == "ON":
+            flag |= DataSubscription.DNF_EEG
+        if self.hasECG() and self.notify_map.get("NTF_ECG") == "ON":
+            flag |= DataSubscription.DNF_ECG
+        if self.hasImpedance() and self.notify_map.get("NTF_IMPEDANCE") == "ON":
+            flag |= DataSubscription.DNF_IMPEDANCE
+        if self.hasBrth() and self.notify_map.get("NTF_BRTH") == "ON":
+            flag |= DataSubscription.DNF_BRTH
+        if self.hasIMU() and self.notify_map.get("NTF_IMU") == "ON":
+            flag |= DataSubscription.DNF_IMU
+        if self.hasEuler() and self.notify_map.get("NTF_GFORCE_EULER") == "ON":
+            flag |= DataSubscription.EULERANGLE
+        if self.hasQuat() and self.notify_map.get("NTF_GFORCE_QUAT") == "ON":
+            flag |= DataSubscription.QUATERNION
+        if self.hasAcc() and self.notify_map.get("NTF_GFORCE_ACC") == "ON":
+            flag |= DataSubscription.ACCELERATE
+        if self.hasGyro() and self.notify_map.get("NTF_GFORCE_GYRO") == "ON":
+            flag |= DataSubscription.GYROSCOPE
+        if self.hasPPG() and (self.notify_map.get("NTF_PPG") == "ON" or self.notify_map.get("NTF_SPO2") == "ON"):
+            flag |= DataSubscription.DNF_PPG
+        if self.hasMagAngle() and self.notify_map.get("NTF_MAG_ANGLE") == "ON":
+            flag |= DataSubscription.DNF_MAG_ANGLE_EXT
+
+        self.notifyDataFlag = flag
+
+    def hasGEST(self):
+        return (self.featureMap & FeatureMaps.GFD_FEAT_GEST.value) != 0
+    
     def hasEMG(self):
         return (self.featureMap & FeatureMaps.GFD_FEAT_EMG.value) != 0
 
@@ -167,7 +231,6 @@ class SensorProfileDataCtx:
     def hasGyro(self):
 
         return (self.featureMap & FeatureMaps.GFD_FEAT_GYRO.value) != 0
-    
 
 
     async def initEMG(self, packageCount: int) -> int:
@@ -177,6 +240,7 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_EMG
         data.sampleRate = 500
         data.resolutionBits = 0
+        data.resolutionSigned = 0
         data.channelCount = 8
         data.channelMask = config.channel_mask
         data.minPackageSampleCount = packageCount
@@ -191,12 +255,13 @@ class SensorProfileDataCtx:
                     "OYEM-") or self._device_info.DeviceName.startswith("ORehab"):
                 isNewEMG = False
         except Exception as e:
-            pass
+            SdkLog.exception(_TAG, "Unexpected error")
 
         if (isNewEMG):
             # new emg
             data.packageIndexLength = 2
             data.resolutionBits = 0
+            data.resolutionSigned = 1
             gain = 6
             data.K = 4000000.0 / 8388607.0 / gain
             config.resolution = 8
@@ -204,6 +269,7 @@ class SensorProfileDataCtx:
             # old emg
             data.packageIndexLength = 1
             data.resolutionBits = 7
+            data.resolutionSigned = 1
             gain = 1200
             min_voltage = -1.25 * 1000000
             max_voltage = 1.25 * 100000
@@ -217,22 +283,49 @@ class SensorProfileDataCtx:
         config.batch_len = 128
 
         if isNewEMG:
-            await self.gForce.set_function_switch(2)
+            await self.gForce.set_function_switch(0b11)
     
         await self.gForce.set_emg_raw_data_config(config)
         await self.gForce.set_package_id(True)
 
         if isNewEMG:
-            if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
+            if self.hasConcatBLE():
                 data.packageSampleCount = 15
             else:
                 data.packageSampleCount = 8
 
         self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
-        self.notifyDataFlag |= DataSubscription.EMG_RAW
+        self.isNewEMG = isNewEMG
 
         return data.channelCount
 
+    
+    async def initGesture(self, packageCount: int) -> int:
+        emgSampleRate = self._device_info.EmgSampleRate
+        if emgSampleRate <= 0:
+            return 0
+        
+        data = SensorData()
+        data.deviceMac = self.deviceMac
+        data.dataType = DataType.NTF_GEST
+        data.sampleRate = emgSampleRate / 32
+        data.resolutionBits = 0
+        data.resolutionSigned = 0
+        data.channelCount = 1
+        data.channelMask = 1
+        data.minPackageSampleCount = 1
+        data.packageSampleCount = 1
+        data.K = 1
+        if not self.isNewEMG:
+            data.packageIndexLength = 1
+            if self.notify_map["NTF_EMG"] == "ON":
+                self.notify_map["NTF_GEST"] = "OFF"
+
+        data.clear()
+        self.sensorDatas[SensorDataType.DATA_TYPE_GEST] = data
+
+        return data.channelCount
+    
     async def initEEG(self, packageCount: int) -> int:
         config = await self.gForce.get_eeg_raw_data_config()
         cap = await self.gForce.get_eeg_raw_data_cap()
@@ -241,6 +334,7 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_EEG
         data.sampleRate = config.fs
         data.resolutionBits = config.resolution
+        data.resolutionSigned = 1
         data.channelCount = cap.channel_count
         data.channelMask = config.channel_mask
         data.minPackageSampleCount = packageCount
@@ -248,7 +342,6 @@ class SensorProfileDataCtx:
         data.K = config.K
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_EEG] = data
-        self.notifyDataFlag |= DataSubscription.DNF_EEG
         return data.channelCount
 
     async def initECG(self, packageCount: int) -> int:
@@ -258,6 +351,7 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_ECG
         data.sampleRate = config.fs
         data.resolutionBits = config.resolution
+        data.resolutionSigned = 1   
         data.channelCount = 1
         data.channelMask = config.channel_mask
         data.minPackageSampleCount = packageCount
@@ -265,86 +359,109 @@ class SensorProfileDataCtx:
         data.K = config.K
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_ECG] = data
-        self.notifyDataFlag |= DataSubscription.DNF_ECG
         return data.channelCount
+    
+    async def initImpedance(self, packageCount: int) -> int:
+
+        channelCount = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].channelCount + self.sensorDatas[SensorDataType.DATA_TYPE_ECG].channelCount + self.sensorDatas[SensorDataType.DATA_TYPE_EMG].channelCount
+        if channelCount <= 0:
+            return 0
+        
+        data = SensorData()
+        data.deviceMac = self.deviceMac
+        data.dataType = DataType.NTF_IMPEDANCE
+        if self.sensorDatas[SensorDataType.DATA_TYPE_EEG].sampleRate > 0:
+            data.sampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].sampleRate
+        elif self.sensorDatas[SensorDataType.DATA_TYPE_ECG].sampleRate > 0:
+            data.sampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ECG].sampleRate
+        elif self.sensorDatas[SensorDataType.DATA_TYPE_EMG].sampleRate > 0:
+            data.sampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EMG].sampleRate
+        else:
+            data.sampleRate = 0
+            
+        data.resolutionBits = 0
+        data.resolutionSigned = 0
+        data.channelCount = channelCount
+        data.channelMask = 1 << channelCount - 1
+        data.minPackageSampleCount = 1
+        data.packageSampleCount = 1
+        data.K = 1
+        data.clear()
+        self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE] = data
+
+        return data.channelCount
+    
     async def initPPG(self, packageCount: int) -> int:
 
-
         config = await self.gForce.get_ppg_raw_data_config()
-        
-
-        config.fs = self.sampleRate
-        config.mode = self.model
-        
+        config.mode = self.ppgModel
+        config.period = 1
+        config.fs = 50
+        await self.gForce.set_ppg_raw_data_config(config)
 
         data = SensorData()
+        data.dataType = DataType.NTF_PPG
         data.deviceMac = self.deviceMac
         data.sampleRate = config.fs
         data.channelMask = 255
         data.minPackageSampleCount = packageCount
         data.packageSampleCount = config.batch_len
         data.K = 1.0
-        if self.model == PPGDataMode.PPG_RAW:
-
-            data.dataType = DataType.NTF_PPG
-            data.resolutionBits = 24
-            data.channelCount = 2
-            self.sensorDatas[SensorDataType.DATA_TYPE_PPG] = data
-        elif self.model == PPGDataMode.SPO2_AND_HR:
-            data.dataType = DataType.NTF_SPO2
-            config.period = self.period
-            config.fs = SamplingRate.HZ_100
-            data.resolutionBits = 16
-            data.channelCount = 2
-            self.sensorDatas[SensorDataType.DATA_TYPE_SPO2] = data
-        else:
-
-            data.dataType = DataType.NTF_PPG
-            data.resolutionBits = 24
-            data.channelCount = 2
-            self.sensorDatas[SensorDataType.DATA_TYPE_PPG] = data
-            data.dataType = DataType.NTF_SPO2
-            config.period = self.period
-            config.fs = self.sampleRate
-            data.resolutionBits = 16
-            data.channelCount = 1
-            self.sensorDatas[SensorDataType.DATA_TYPE_SPO2] = data
-
-        await self.gForce.set_ppg_raw_data_config(config)
-        self.notifyDataFlag=DataSubscription.DNF_PPG;
+        data.resolutionBits = 24
+        data.resolutionSigned = 0
+        data.channelCount = 2
+        self.sensorDatas[SensorDataType.DATA_TYPE_PPG] = data
         data.clear()
-        
+
+        data = SensorData()
+        data.dataType = DataType.NTF_SPO2
+        data.deviceMac = self.deviceMac
+        data.sampleRate = config.period
+        data.channelMask = 255
+        data.minPackageSampleCount = 1
+        data.packageSampleCount = 1
+        data.K = 1.0
+        data.resolutionBits = 17
+        data.resolutionSigned = 1
+        data.channelCount = 2
+        self.sensorDatas[SensorDataType.DATA_TYPE_SPO2] = data
+        data.clear()
+
         return data.channelCount
-
-    def setPPGMode(self, mode: int, sampleRate: int = None, period: int = None):
-
-        if mode not in [PPGDataMode.SPO2_AND_HR, PPGDataMode.PPG_RAW]:
-            raise ValueError(f"Invalid PPG mode: {mode}. Must be 0 (SPO2AndHR) or 1 (PPGRaw)")
-        
-        self.model = mode
-        self.period = period
-        self.sampleRate = sampleRate
-        
-        print(f"PPG mode set to: {'SPO2AndHR' if mode == 0 else 'PPGRaw'}, Sample rate: {self.sampleRate}Hz")
 
 
     async def initIMU(self, packageCount: int) -> int:
+        SdkLog.d(_TAG, "initIMU(...)")
         IMU_TYPE_QAT6 = 0x0004
         min_package_sample_count = 2
         self.isContainQAT6 = False
-        config = await self.gForce.get_imu_raw_data_config()
+
+        if not self.hasIMU():
+            SdkLog.w(_TAG, "IMU not supported")
+            return -1
+
         imu_cap = await self.gForce.get_imu_cap_data_config()
         if imu_cap is not None:
-            channel_count, samp_rate, sample_count = imu_cap
-            if (channel_count & IMU_TYPE_QAT6) == IMU_TYPE_QAT6:
+            channel_mask, samp_rate, sample_count = imu_cap
+            if (channel_mask & IMU_TYPE_QAT6) == IMU_TYPE_QAT6:
                 self.isContainQAT6 = True
-                config.channel_count = channel_count
-                await self.gForce.set_imu_raw_data_config(config)
+
+            cfg = ImuRawDataConfig()
+            cfg.channel_count = channel_mask
+            cfg.fs = samp_rate
+            cfg.batch_len = 1
+            await self.gForce.set_imu_raw_data_config(cfg)
+
+        config = await self.gForce.get_imu_raw_data_config()
+        if config is None:
+            return -1
+
         data = SensorData()
         data.deviceMac = self.deviceMac
         data.dataType = DataType.NTF_ACC
         data.sampleRate = config.fs
         data.resolutionBits = 16
+        data.resolutionSigned = 1
         data.channelCount = 3
         data.channelMask = 255
         data.minPackageSampleCount = min_package_sample_count
@@ -358,6 +475,7 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_GYRO
         data.sampleRate = config.fs
         data.resolutionBits = 16
+        data.resolutionSigned = 1
         data.channelCount = 3
         data.channelMask = 255
         data.minPackageSampleCount = min_package_sample_count
@@ -372,9 +490,10 @@ class SensorProfileDataCtx:
             data.deviceMac = self.deviceMac
             data.dataType = DataType.NTF_QUATERNION
             data.sampleRate = config.fs
-            data.resolutionBits = 32
+            data.resolutionBits = 31 # 32-bit signed integer
+            data.resolutionSigned = 1
             data.channelCount = 4  # w, x, y, z
-            data.channelMask = 15  # 0b1111
+            data.channelMask = 0b1110  # we don't read the first channel for quaternion data
             data.minPackageSampleCount = min_package_sample_count
             data.packageSampleCount = config.batch_len
             data.K = 1.0 / 1073741824.0  # 1 / 2^30
@@ -385,7 +504,8 @@ class SensorProfileDataCtx:
             data.deviceMac = self.deviceMac
             data.dataType = DataType.NTF_EULER_DATA
             data.sampleRate = config.fs
-            data.resolutionBits = 32        # float32
+            data.resolutionBits = 0
+            data.resolutionSigned = 1
             data.channelCount = 3           # pitch, roll, yaw
             data.channelMask = 0b0111
             data.packageIndexLength = 0
@@ -396,6 +516,16 @@ class SensorProfileDataCtx:
             self.sensorDatas[SensorDataType.DATA_TYPE_EULER] = data
 
         self.notifyDataFlag |= DataSubscription.DNF_IMU
+        if self._device_info is not None:
+            self._device_info.AccChannelCount = 3
+            self._device_info.GyroChannelCount = 3
+            self._device_info.AccSampleRate = config.fs
+            self._device_info.GyroSampleRate = config.fs
+            if self.isContainQAT6:
+                self._device_info.QuatChannelCount = 4
+                self._device_info.EulerChannelCount = 3
+                self._device_info.QuatSampleRate = config.fs
+                self._device_info.EulerSampleRate = config.fs
 
         return config.channel_count
 
@@ -410,13 +540,12 @@ class SensorProfileDataCtx:
         data.resolutionBits = 32        # float32
         data.channelCount = 3           # roll, pitch, yaw
         data.channelMask = 0b0111
-        data.packageIndexLength = 0
-        data.minPackageSampleCount = 2
+        data.packageIndexLength = 1
+        data.minPackageSampleCount = 1
         data.packageSampleCount = 1
         data.K = 1.0
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_EULER] = data
-        self.notifyDataFlag |= DataSubscription.EULERANGLE
         return data.channelCount
 
     async def initGForceQuat(self, packageCount: int) -> int:
@@ -430,13 +559,12 @@ class SensorProfileDataCtx:
         data.resolutionBits = 32        # float32
         data.channelCount = 4           # w, x, y, z
         data.channelMask = 0b1111
-        data.packageIndexLength = 0
-        data.minPackageSampleCount = 2
+        data.packageIndexLength = 1
+        data.minPackageSampleCount = 1
         data.packageSampleCount = 1
         data.K = 1.0
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT] = data
-        self.notifyDataFlag |= DataSubscription.QUATERNION
         return data.channelCount
 
     async def initGForceAcc(self, packageCount: int) -> int:
@@ -445,16 +573,16 @@ class SensorProfileDataCtx:
         data.deviceMac = self.deviceMac
         data.dataType = DataType.NTF_ACC
         data.sampleRate = 40
-        data.resolutionBits = 32        # int32
+        data.resolutionBits = 31        # int32
+        data.resolutionSigned = 1
         data.channelCount = 3           # x, y, z
         data.channelMask = 0b0111
         data.packageIndexLength = 1
-        data.minPackageSampleCount = 2
+        data.minPackageSampleCount = 1
         data.packageSampleCount = 1
-        data.K = 1.0
+        data.K = 1.0 / 65536.0
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_ACC] = data
-        self.notifyDataFlag |= DataSubscription.ACCELERATE
         return data.channelCount
 
     async def initGForceGyro(self, packageCount: int) -> int:
@@ -463,16 +591,16 @@ class SensorProfileDataCtx:
         data.deviceMac = self.deviceMac
         data.dataType = DataType.NTF_GYRO
         data.sampleRate = 40
-        data.resolutionBits = 32        # int32
+        data.resolutionBits = 31        # int32
+        data.resolutionSigned = 1
         data.channelCount = 3           # x, y, z
         data.channelMask = 0b0111
         data.packageIndexLength = 1
-        data.minPackageSampleCount = 2
+        data.minPackageSampleCount = 1
         data.packageSampleCount = 1
-        data.K = 1.0
+        data.K = 1.0 / 65536.0
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_GYRO] = data
-        self.notifyDataFlag |= DataSubscription.GYROSCOPE
         return data.channelCount
 
 
@@ -483,14 +611,14 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_BRTH
         data.sampleRate = config.fs
         data.resolutionBits = config.resolution
+        data.resolutionSigned = 1
         data.channelCount = 1
         data.channelMask = config.channel_mask
-        data.minPackageSampleCount = packageCount
+        data.minPackageSampleCount = 1
         data.packageSampleCount = config.batch_len
         data.K = config.K
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_BRTH] = data
-        self.notifyDataFlag |= DataSubscription.DNF_ECG
         return data.channelCount
 
     async def initMagAngle(self, packageCount: int) -> int:
@@ -499,15 +627,15 @@ class SensorProfileDataCtx:
         data.dataType = DataType.NTF_MAG_ANGLE_DATA
         data.sampleRate = 40
         data.resolutionBits = 8
+        data.resolutionSigned = 0
         data.channelCount = 1
         data.channelMask = 1
-        data.minPackageSampleCount = 2
+        data.minPackageSampleCount = 1
         data.packageSampleCount = 1
         data.K = 1
         data.packageIndexLength = 2
         data.clear()
         self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE] = data
-        self.notifyDataFlag |= DataSubscription.DNF_MAG_ANGLE_EXT
         return data.channelCount
 
     async def initDataTransfer(self, isGetFeature: bool) -> int:
@@ -546,26 +674,30 @@ class SensorProfileDataCtx:
             if self.hasConcatBLE():
                 self.notifyDataFlag |= DataSubscription.DNF_CONCAT_BLE
 
-            if self.hasImpedance() and (self.init_map["NTF_IMPEDANCE"] == "ON"):
-                self.notifyDataFlag |= DataSubscription.DNF_IMPEDANCE
-
-            if self.hasEMG() and (self.init_map["NTF_EMG"] == "ON"):
+            if self.hasEMG():
                 info.EmgChannelCount = await self.initEMG(packageCount)
                 info.EmgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EMG].sampleRate
 
-            if self.hasEEG() and (self.init_map["NTF_EEG"] == "ON"):
+            if self.hasGEST():
+                await self.initGesture(packageCount)
+
+            if self.hasEEG():
                 info.EegChannelCount = await self.initEEG(packageCount)
                 info.EegSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EEG].sampleRate
 
-            if self.hasECG() and (self.init_map["NTF_ECG"] == "ON"):
+            if self.hasECG():
                 info.EcgChannelCount = await self.initECG(packageCount)
                 info.EcgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ECG].sampleRate
 
-            if self.hasBrth() and (self.init_map["NTF_BRTH"] == "ON"):
+            if self.hasImpedance():
+                info.ImpeChannelCount = await self.initImpedance(packageCount)
+                info.ImpeSampleRate = 1
+
+            if self.hasBrth():
                 info.BrthChannelCount = await self.initBrth(packageCount)
                 info.BrthSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH].sampleRate
 
-            if self.hasIMU() and (self.init_map["NTF_IMU"] == "ON"):
+            if self.hasIMU():
                 await self.initIMU(packageCount)
                 info.AccChannelCount = 3
                 info.GyroChannelCount = 3
@@ -577,42 +709,44 @@ class SensorProfileDataCtx:
                     info.QuatSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION].sampleRate
                     info.EulerSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EULER].sampleRate
 
-            if self.hasEuler() and (self.init_map["NTF_GFORCE_EULER"] == "ON"):
+            if self.hasEuler():
                 info.EulerChannelCount = await self.initEuler(packageCount)
                 info.EulerSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_EULER].sampleRate
 
-
-            if self.hasQuat() and (self.init_map["NTF_GFORCE_QUAT"] == "ON"):
+            if self.hasQuat():
                 info.QuatChannelCount = await self.initGForceQuat(packageCount)
                 info.QuatSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT].sampleRate
 
-
-            if self.hasAcc() and (self.init_map["NTF_GFORCE_ACC"] == "ON"):
+            if self.hasAcc():
                 info.AccChannelCount = await self.initGForceAcc(packageCount)
                 info.AccSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_ACC].sampleRate
 
-
-            if self.hasGyro() and (self.init_map["NTF_GFORCE_GYRO"] == "ON"):
+            if self.hasGyro():
                 info.GyroChannelCount = await self.initGForceGyro(packageCount)
                 info.GyroSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO].sampleRate
-            if self.hasPPG() and (self.init_map["NTF_PPG_RAW"] == "ON"):
-                info.PpgChannelCount = await self.initPPG(packageCount)
 
-                if self.model == PPGDataMode.PPG_RAW:
+            if self.hasPPG():
+                info.PpgChannelCount = await self.initPPG(packageCount)
+                info.Spo2ChannelCount = 2
+
+                if self.ppgModel == PPGDataMode.PPG_RAW:
 
                     info.Spo2SampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2].sampleRate
-                if self.model == PPGDataMode.SPO2_AND_HR:
+                if self.ppgModel == PPGDataMode.SPO2_AND_HR:
 
                     info.PpgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2].sampleRate
                 else:
                     info.PpgSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_PPG].sampleRate
                     info.Spo2SampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2].sampleRate
-            if self.hasMagAngle() and (self.init_map["NTF_MAG_ANGLE"] == "ON"):
+
+            if self.hasMagAngle():
                 magAngleChannelCount = await self.initMagAngle(packageCount)
                 info.MagAngleChannelCount = magAngleChannelCount
                 info.MagAngleSampleRate = self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE].sampleRate
 
             self._device_info = info
+
+            self._buildNotifyDataFlag()
 
             if not self.isUniversalStream:
                 await self.initDataTransfer(False)
@@ -621,7 +755,8 @@ class SensorProfileDataCtx:
             return True
         except Exception as e:
             self._is_initing = False
-            raise RuntimeError("Init %s fail: %s" % (self._device_info.DeviceName, e))
+            device_name = self._device_info.DeviceName if self._device_info else "Unknown"
+            raise RuntimeError("Init %s fail: %s" % (device_name, e))
             return False
 
     async def start_streaming(self) -> bool:
@@ -684,20 +819,102 @@ class SensorProfileDataCtx:
                 return "ERROR: not success"
             return "OK"
         except Exception as e:
+            SdkLog.exception(_TAG, f"setFilter failed: {e}")
             return "ERROR: " + str(e)
 
     async def setDebugCSV(self, debugFilePath) -> str:
-        if self.debugCSVWriter != None:
-            self.debugCSVWriter = None
-        if debugFilePath != None:
-            self.debugCSVPath = debugFilePath
+        """设置/关闭 per-profile 的 data 日志 CSV 文件。"""
+        if self._data_log_file is not None:
             try:
-                if self.debugCSVPath != "":
-                    CSVWriter = csv.writer(open(self.debugCSVPath, "w", newline=""), delimiter=",")
-                    CSVWriter = None
-            except Exception as e:
-                return "ERROR: " + str(e)
-        return "OK"
+                self._data_log_file.close()
+            except Exception:
+                pass
+            self._data_log_file = None
+        self._data_log_writer = None
+
+        if debugFilePath == "False" or debugFilePath is None or debugFilePath == "":
+            self._data_log_enabled = False
+            self._data_log_path = None
+            return "OK"
+
+        if debugFilePath == "True":
+            debugFilePath = SdkLog.get_default_data_log_path()
+
+        self._data_log_path = debugFilePath
+        self._data_log_enabled = True
+        try:
+            self._ensure_dir(os.path.dirname(self._data_log_path))
+            self._data_log_file = open(self._data_log_path, "w", newline="", encoding="utf-8")
+            self._data_log_writer = csv.writer(self._data_log_file, delimiter=",")
+            self._data_log_writer.writerow([
+                "timestamp", "mac", "type", "raw_hex", "data_type",
+                "sample_rate", "channel_count", "lost_count", "samples_info", "first_sample",
+            ])
+            self._data_log_file.flush()
+            return "OK"
+        except Exception as e:
+            self._data_log_enabled = False
+            SdkLog.exception(_TAG, f"setDebugCSV failed: {self._data_log_path} {e}")
+            return "ERROR: " + str(e)
+
+    def _ensure_dir(self, path: str):
+        if path:
+            try:
+                os.makedirs(path, exist_ok=True)
+            except Exception:
+                pass
+
+    def _write_data_log_raw(self, data: bytes):
+        """将收到的原始蓝牙数据包写入 data 日志 CSV。"""
+        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled or self._data_log_writer is None:
+            return
+        try:
+            self._data_log_writer.writerow([
+                datetime.now().isoformat(),
+                self.deviceMac,
+                "raw",
+                data.hex(),
+                "", "", "", "", "",
+            ])
+            self._data_log_file.flush()
+        except Exception as e:
+            SdkLog.e(_TAG, f"Failed to write raw data log: {e}")
+
+    def _write_data_log_parsed(self, sensorData: SensorData):
+        """将解析后的 SensorData 写入 data 日志 CSV。"""
+        if not SdkLog.is_data_log_enabled() or not self._data_log_enabled or self._data_log_writer is None:
+            return
+        try:
+            sample_counts = [len(ch) for ch in sensorData.channelSamples]
+            first_sample = None
+            for ch in sensorData.channelSamples:
+                if ch:
+                    first_sample = ch[0]
+                    break
+            first_sample_str = ""
+            if first_sample is not None:
+                first_sample_str = (
+                    f"data={first_sample.data}|raw={first_sample.rawData}|"
+                    f"imp={first_sample.impedance}|sat={first_sample.saturation}|"
+                    f"idx={first_sample.sampleIndex}|ts={first_sample.timeStampInMs}|"
+                    f"ch={first_sample.channelIndex}|lost={first_sample.isLost}"
+                )
+            type_name = sensorData.dataType.name if hasattr(sensorData.dataType, "name") else sensorData.dataType
+            self._data_log_writer.writerow([
+                datetime.now().isoformat(),
+                sensorData.deviceMac or self.deviceMac,
+                "parsed",
+                "",
+                type_name,
+                sensorData.sampleRate,
+                sensorData.channelCount,
+                sensorData.lostPackageCount,
+                str(sample_counts),
+                first_sample_str,
+            ])
+            self._data_log_file.flush()
+        except Exception as e:
+            SdkLog.e(_TAG, f"Failed to write parsed data log: {e}")
 
     ####################################################################################
 
@@ -715,7 +932,7 @@ class SensorProfileDataCtx:
                             # on_data_callback(sensorData)
                             asyncio.get_event_loop().run_in_executor(self.dataPool, on_data_callback, sensorData)
                         except Exception as e:
-                            pass
+                            SdkLog.exception(_TAG, "Unexpected error")
 
                     buf.task_done()
                 else:
@@ -725,6 +942,7 @@ class SensorProfileDataCtx:
             try:
                 while self._is_running and not self._rawDataBuffer.empty():
                     data = self._rawDataBuffer.get_nowait()
+                    self._write_data_log_raw(data)
 
                     if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
                         self._concatDataBuffer.extend(data)
@@ -733,7 +951,7 @@ class SensorProfileDataCtx:
 
                     self._rawDataBuffer.task_done()
             except Exception as e:
-                pass
+                SdkLog.exception(_TAG, "Unexpected error")
 
             if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
                 index = 0
@@ -773,49 +991,9 @@ class SensorProfileDataCtx:
     def _processDataPackage(self, data: bytes, buf: Queue[SensorData], on_error_callback=None):
         v = data[0] & 0x7F
         if v == DataType.NTF_IMPEDANCE:
-            offset = 1
-            # packageIndex = ((data[offset + 1] & 0xff) << 8) | (data[offset] & 0xff)
-            offset += 2
-
-            impedanceData = []
-            saturationData = []
-
-            dataCount = (len(data) - 3) // 4 // 2
-
-            for index in range(dataCount):
-                impedance = struct.unpack_from("<f", data, offset)[0]
-                offset += 4
-                impedanceData.append(impedance)
-
-            for index in range(dataCount):
-                saturation = struct.unpack_from("<f", data, offset)[0]
-                offset += 4
-                saturationData.append(saturation / 10)  # firmware value range 0 - 1000
-
-            self.impedanceData = impedanceData
-            self.saturationData = saturationData
+            self._process_impedance_samples(v, data, buf, on_error_callback)
         elif v == DataType.NTF_IMPEDANCE_EXT:
-            offset = 1
-            # packageIndex = ((data[offset + 1] & 0xff) << 8) | (data[offset] & 0xff)
-            offset += 2
-
-            impedanceData = []
-            saturationData = []
-
-            dataCount = self._device_info.EegChannelCount + self._device_info.EcgChannelCount
-
-            for index in range(dataCount):
-                impedance = struct.unpack_from("<f", data, offset)[0]
-                offset += 4
-                impedanceData.append(impedance)
-
-            for index in range(dataCount):
-                saturation = struct.unpack_from("<H", data, offset)[0]
-                offset += 2
-                saturationData.append(saturation / 10)  # firmware value range 0 - 1000
-
-            self.impedanceData = impedanceData
-            self.saturationData = saturationData
+            self._process_impedance_samples(v, data, buf, on_error_callback)
         elif v == DataType.NTF_MAG_ANGLE_DATA:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_MAG_ANGLE]
             if self.checkReadSamples(data, sensor_data, 4, 0, on_error_callback):
@@ -824,6 +1002,8 @@ class SensorProfileDataCtx:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EMG]
             if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
                 self.sendSensorData(sensor_data, buf)
+        elif v == DataType.NTF_GEST:
+            self._process_gesture_samples(v, data, buf, on_error_callback)
         elif v == DataType.NTF_EEG:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EEG]
             if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
@@ -836,284 +1016,130 @@ class SensorProfileDataCtx:
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_BRTH]
             if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
                 self.sendSensorData(sensor_data, buf)
-        elif v == DataType.NTF_IMU:
+        elif v == DataType.NTF_IMU and self.hasIMU():
             self._process_imu_samples(data, buf, on_error_callback)
-        elif v == DataType.NTF_PPG:
+        elif v == DataType.NTF_PPG and self.hasPPG() and self.notify_map.get("NTF_PPG") == "ON":
             sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_PPG]
             if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
                 self.sendSensorData(sensor_data, buf)
-        elif v == DataType.NTF_SPO2:
-            self._process_spo2_data(data, buf)
-        elif v == DataType.NTF_EULER_DATA:
-            self._process_gforce_float_data(data, buf, SensorDataType.DATA_TYPE_EULER, 3)
-        elif v == DataType.NTF_QUATERNION:
-            self._process_gforce_float_data(data, buf, SensorDataType.DATA_TYPE_GFORCE_QUAT, 4)
-        elif v == DataType.NTF_ACC:
-            self._process_gforce_int_data(data, buf, SensorDataType.DATA_TYPE_ACC, 3)
-        elif v == DataType.NTF_GYRO:
-            self._process_gforce_int_data(data, buf, SensorDataType.DATA_TYPE_GYRO, 3)
-
-    def _process_gforce_float_data(self, data: bytes, buf: Queue[SensorData],
-                                    data_type_index: int, channel_count: int):
-
-        HEADER_SIZE = 2
-        FLOAT_SIZE = 4
-
-        EXPECTED_SIZE = HEADER_SIZE + channel_count * FLOAT_SIZE
-
-        
-        if len(data) != EXPECTED_SIZE:
-            print(f"[DataTask] 异常: len(data){len(data)} ")
-            return
-
-        sensor_data = self.sensorDatas[data_type_index]
-
-
-        if not sensor_data.channelSamples:
-            sensor_data.channelSamples = [[] for _ in range(channel_count)]
-
-        if sensor_data.lastPackageCounter < 0:
-            sensor_data.lastPackageCounter = 0
-
-        offset = HEADER_SIZE
-        sample_idx = sensor_data.lastPackageCounter
-        interval_ms = (1000 // sensor_data.sampleRate) if sensor_data.sampleRate > 0 else 0
-
-        for ch in range(channel_count):
-            raw_float = struct.unpack_from("<f", data, offset)[0]
-            offset += FLOAT_SIZE
-            val = raw_float if math.isfinite(raw_float) else 0.0
-
-            sample = Sample()
-            sample.channelIndex = ch
-            sample.sampleIndex = sample_idx
-            sample.timeStampInMs = sample_idx * interval_ms
-            sample.rawData = raw_float
-            sample.data = val
-            sample.impedance = 0.0
-            sample.saturation = 0.0
-            sample.isLost = False
-            sensor_data.channelSamples[ch].append(sample)
-
-        sensor_data.lastPackageCounter += 1
-        self.sendSensorData(sensor_data, buf)
-
-    def _process_gforce_int_data(self, data: bytes, buf: Queue[SensorData],
-                                  data_type_index: int, channel_count: int):
-
-        HEADER_SIZE  = 1
-        PKG_IDX_SIZE = 1
-        INT_SIZE     = 4
-        EXPECTED_SIZE = HEADER_SIZE + PKG_IDX_SIZE + channel_count * INT_SIZE
-
-        if len(data) != EXPECTED_SIZE:
-            print(f"[INT_DATA] type=0x{data[0]:02X} 包长不匹配 expected={EXPECTED_SIZE} actual={len(data)}")
-            return
-
-        sensor_data = self.sensorDatas[data_type_index]
-
-
-        pkg_index = data[HEADER_SIZE] & 0xFF
-
-
-        if not sensor_data.channelSamples:
-            sensor_data.channelSamples = [[] for _ in range(channel_count)]
-
-
-        if sensor_data.lastPackageCounter < 0:
-            sensor_data.lastPackageCounter = 0
-            sensor_data.lastPackageIndex = pkg_index
-        else:
-            if pkg_index == sensor_data.lastPackageIndex:
-                return
-        sensor_data.lastPackageIndex = pkg_index
-
-
-        offset = HEADER_SIZE + PKG_IDX_SIZE
-        sample_idx = sensor_data.lastPackageCounter
-        interval_ms = (1000 // sensor_data.sampleRate) if sensor_data.sampleRate > 0 else 0
-
-        channel_values = []
-        for ch in range(channel_count):
-            raw_int = struct.unpack_from("<i", data, offset)[0]
-            offset += INT_SIZE
-            channel_values.append(raw_int)
-
-            sample = Sample()
-            sample.channelIndex  = ch
-            sample.sampleIndex   = sample_idx
-            sample.timeStampInMs = sample_idx * interval_ms
-            sample.rawData       = raw_int
-            sample.data          = float(raw_int)
-            sample.impedance     = 0.0
-            sample.saturation    = 0.0
-            sample.isLost        = False
-            sensor_data.channelSamples[ch].append(sample)
-
-        # type_name = "ACC" if data[0] & 0x7F == DataType.NTF_ACC else "GYRO"
-        # print(f"[{type_name}] pkgIdx={pkg_index} x={channel_values[0]} y={channel_values[1]} z={channel_values[2]}")
-
-        sensor_data.lastPackageCounter += 1
-        self.sendSensorData(sensor_data, buf)
-
-    def _process_spo2_data(self, data: bytes, buf: Queue[SensorData]):
-
-
-        DATA_HEADER_SIZE = 3
-        SPO2_CHANNEL_INDEX = 0
-        HEART_RATE_CHANNEL_INDEX = 1
-        REQUIRED_DATA_SIZE = 4
-
-        offset = DATA_HEADER_SIZE
-
-        if len(data) < offset + REQUIRED_DATA_SIZE:
-            return
-
-
-        spo2_value = struct.unpack_from(">H", data, offset)[0]
-        offset += 2
-        heart_rate = struct.unpack_from(">H", data, offset)[0]
-
-
-        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2]
-        if not sensor_data.channelSamples:
-            sensor_data.channelSamples = [[], []]
-
-
-        self._append_spo2_sample(sensor_data, SPO2_CHANNEL_INDEX, spo2_value)
-        self._append_spo2_sample(sensor_data, HEART_RATE_CHANNEL_INDEX, heart_rate)
-
-
-        sensor_data.lastPackageCounter += 1
-        self.sendSensorData(sensor_data, buf)
-
-    def _append_spo2_sample(self, sensor_data: SensorData, channel_index: int, raw_value: int):
-
-        sample = Sample()
-        sample.channelIndex = channel_index
-        sample.sampleIndex = sensor_data.lastPackageCounter
-        sample.timeStampInMs = self._calculate_timestamp(sensor_data)
-        sample.rawData = raw_value
-        sample.data = float(raw_value)
-        sample.impedance = 0.0
-        sample.saturation = 0.0
-        sample.isLost = False
-
-        sensor_data.channelSamples[channel_index].append(sample)
-
-    def _calculate_timestamp(self, sensor_data: SensorData) -> int:
-
-        if sensor_data.sampleRate > 0:
-            return sensor_data.lastPackageCounter * (1000 // sensor_data.sampleRate)
-        return 0
-
-    def _process_imu_samples(self, data: bytes, buf: Queue[SensorData], on_error_callback=None):
-        sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
-        sensor_data_gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
-        sensor_data_quat = None
-        sensor_data_euler = None
-
-        sensor_datas = [sensor_data_acc, sensor_data_gyro]
-        if self.isContainQAT6:
-            sensor_data_quat = self.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION]
-            sensor_data_euler = self.sensorDatas[SensorDataType.DATA_TYPE_EULER]
-            sensor_datas.append(sensor_data_quat)
-            sensor_datas.append(sensor_data_euler)
-
-        if self._check_read_imu_samples(data, sensor_datas, sensor_data_quat, sensor_data_euler, on_error_callback):
-            for sensor_data in sensor_datas:
+        elif v == DataType.NTF_SPO2 and self.hasPPG() and self.notify_map.get("NTF_SPO2") == "ON":
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_SPO2]
+            if self.checkReadSamples(data, sensor_data, 3, 0, on_error_callback):
                 self.sendSensorData(sensor_data, buf)
+        elif v == DataType.NTF_EULER_DATA and self.hasEuler():
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_EULER]
+            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
+                self.sendSensorData(sensor_data, buf)
+        elif v == DataType.NTF_QUATERNION and self.hasQuat():
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GFORCE_QUAT]
+            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
+                self.sendSensorData(sensor_data, buf)
+        elif v == DataType.NTF_ACC and self.hasAcc():
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
+            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
+                self.sendSensorData(sensor_data, buf)
+        elif v == DataType.NTF_GYRO and self.hasGyro():
+            sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
+            if self.checkReadSamples(data, sensor_data, sensor_data.packageIndexLength + 1, 0, on_error_callback):
+                self.sendSensorData(sensor_data, buf)
+        else:
+            SdkLog.w(_TAG, f"Unknown data type received: {v}")
+            
+    def _process_gesture_samples(self, type, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+        if (len(data) < 7):
+            if on_error_callback:
+                on_error_callback("Incomplete Gesture packet received")
+            return
+        
+        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_GEST]
+        self.checkReadSamples(data, sensor_data, 0, -1)
+        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
+        lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
+        sensor_data.channelSamples = []
 
-    def _check_read_imu_samples(self, data: bytes, sensor_datas: List[SensorData], sensor_data_quat, sensor_data_euler,on_error_callback=None):
-        if not self._is_data_transfering or not sensor_datas:
-            return False
+        samples = []
+        sample = Sample()
+        
+        offset = sensor_data.packageIndexLength + 1
+        sample.data = data[offset]
+        offset += 1
+        sample.rawData = data[offset]
+        offset += 1
+        sample.impedance = data[offset]
+        offset += 1 
+        sample.saturation = data[offset]
+        
+        if (sample.data != sample.rawData) and (sample.data > 0):
+            sample.data = 0
 
-        try:
-            sensor_data_ref = sensor_datas[0]
-            offset = 1
-            packageIndex = 0
-            maxPackageIndex = 0
+        if (sample.impedance > 100):
+            sample.impedance = 100
 
-            if len(data) < offset + sensor_data_ref.packageIndexLength:
-                return False
+        if (sample.saturation > 100):
+            sample.saturation = 100
+            
+        sample.sampleIndex = lastSampleIndex
+        sample.timeStampInMs = lastSampleIndex * sampleInterval
+        sample.channelIndex = 0
+        samples.append(sample)
+        sensor_data.channelSamples.append(samples)
+        
+        self.sendSensorData(sensor_data, buf)
 
-            if sensor_data_ref.packageIndexLength == 2:
-                packageIndex = ((data[offset + 1] & 0xFF) << 8) | (data[offset] & 0xFF)
-                maxPackageIndex = 65535
-            elif sensor_data_ref.packageIndexLength == 1:
-                packageIndex = data[offset] & 0xFF
-                maxPackageIndex = 255
+    def _process_impedance_samples(self, type, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+        offset = 3
 
-            offset += sensor_data_ref.packageIndexLength
-            if not self._has_complete_imu_packet(data, sensor_data_ref, sensor_data_quat, offset):
-                return False
+        impedanceData = []
+        saturationData = []
 
-            if sensor_data_ref.packageIndexLength <= 0:
-                for sensor_data in sensor_datas:
-                    if sensor_data.lastPackageCounter < 0:
-                        sensor_data.lastPackageIndex = 0
-                        sensor_data.lastPackageCounter = 0
+        channelCount = self._device_info.EegChannelCount + self._device_info.EcgChannelCount + self._device_info.EmgChannelCount
+
+        bytesPerChannel = 8
+        if (type == DataType.NTF_IMPEDANCE_EXT):
+            bytesPerChannel = 6
+
+        if (len(data) < (offset + bytesPerChannel * channelCount)):
+            if on_error_callback:
+                on_error_callback("Incomplete Impedance packet received")
+            return
+        
+        for index in range(channelCount):
+            impedance = struct.unpack_from("<f", data, offset)[0]
+            offset += 4
+            impedanceData.append(impedance)
+
+        for index in range(channelCount):
+            if (type == DataType.NTF_IMPEDANCE):
+                saturation = struct.unpack_from("<f", data, offset)[0]
+                offset += 4
             else:
-                newPackageIndex = packageIndex
-                lastPackageIndex = sensor_data_ref.lastPackageIndex
+                saturation = struct.unpack_from("<H", data, offset)[0]
+                offset += 2
+            saturationData.append(saturation / 10)  # firmware value range 0 - 1000
 
-                if sensor_data_ref.lastPackageCounter < 0:
-                    if newPackageIndex == 0:
-                        lastPackageIndex = maxPackageIndex
-                    else:
-                        lastPackageIndex = newPackageIndex - 1
+        self.impedanceData = impedanceData
+        self.saturationData = saturationData
 
-                    for sensor_data in sensor_datas:
-                        sensor_data.lastPackageIndex = lastPackageIndex
-                        sensor_data.lastPackageCounter = 0
+        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
+        self.checkReadSamples(data, sensor_data, 0, -1)
+        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
+        lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
 
-                if packageIndex < lastPackageIndex:
-                    packageIndex += maxPackageIndex + 1
-                elif packageIndex == lastPackageIndex:
-                    return False
-
-                deltaPackageIndex = packageIndex - lastPackageIndex
-                if deltaPackageIndex > 1:
-                    lostSampleCount = sensor_data_ref.packageSampleCount * (deltaPackageIndex - 1)
-
-                    if lostSampleCount < 100:
-                        self._read_imu_frame_samples(data, sensor_datas, sensor_data_quat, 0, lostSampleCount)
-
-                    if newPackageIndex == 0:
-                        lastPackageIndex = maxPackageIndex
-                    else:
-                        lastPackageIndex = newPackageIndex - 1
-
-                    for sensor_data in sensor_datas:
-                        sensor_data.lastPackageIndex = lastPackageIndex
-                        sensor_data.lastPackageCounter += deltaPackageIndex - 1
-
-                    lostLog = (
-                            "MSG|LOST SAMPLE|MAC|"
-                            + str(sensor_data_ref.deviceMac)
-                            + "|TYPE|"
-                            + str(DataType.NTF_IMU)
-                            + "|COUNT|"
-                            + str(lostSampleCount)
-                    )
-                    if on_error_callback is not None:
-                        try:
-                            asyncio.get_event_loop().run_in_executor(None, on_error_callback, lostLog)
-                        except Exception as e:
-                            pass
-
-                for sensor_data in sensor_datas:
-                    sensor_data.lastPackageIndex = newPackageIndex
-
-            if not self._read_imu_frame_samples(data, sensor_datas, sensor_data_quat, sensor_data_euler, offset, 0):
-                return False
-
-            for sensor_data in sensor_datas:
-                sensor_data.lastPackageCounter += 1
-
-            return True
-        except Exception as e:
-            return False
+        sensor_data.channelSamples = []
+        for index in range(channelCount):
+            samples = []
+            sample = Sample()
+            sample.rawData = saturationData[index]
+            sample.data = impedanceData[index]
+            sample.impedance = impedanceData[index]
+            sample.saturation = saturationData[index]
+            sample.sampleIndex = lastSampleIndex
+            sample.timeStampInMs = lastSampleIndex * sampleInterval
+            sample.channelIndex = index
+            samples.append(sample)
+            sensor_data.channelSamples.append(samples)
+        
+        self.sendSensorData(sensor_data, buf)
 
     def _has_complete_imu_packet(
             self,
@@ -1127,163 +1153,99 @@ class SensorProfileDataCtx:
             frameSize += 12
 
         return len(data) >= dataOffset + sensor_data_ref.packageSampleCount * frameSize
+    
+    def _process_imu_samples(self, data: bytes, buf: Queue[SensorData], on_error_callback=None):
+        sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
+        sensor_data_gyro = self.sensorDatas[SensorDataType.DATA_TYPE_GYRO]
+        sensor_data_quat = None
+        sensor_data_euler = None
 
-    def _read_imu_frame_samples(
-            self,
-            data: bytes,
-            sensor_datas: List[SensorData],
-            sensor_data_quat: SensorData,
-            sensor_data_euler: SensorData,
-            dataOffset: int,
-            lostSampleCount: int,
-    ) -> bool:
-        sensor_data_acc = sensor_datas[0]
-        sensor_data_gyro = sensor_datas[1]
-        sampleCount = sensor_data_acc.packageSampleCount
-        if lostSampleCount > 0:
-            sampleCount = lostSampleCount
+        if self.isContainQAT6:
+            sensor_data_quat = self.sensorDatas[SensorDataType.DATA_TYPE_QUATERNION]
+            sensor_data_euler = self.sensorDatas[SensorDataType.DATA_TYPE_EULER]
 
-        frameSize = 12
-        if sensor_data_quat is not None:
-            frameSize += 12
+        if not self._has_complete_imu_packet(data, sensor_data_acc, sensor_data_quat, 3):
+            if on_error_callback:
+                on_error_callback("Incomplete IMU packet received")
+            return
 
-        if lostSampleCount <= 0 and len(data) < dataOffset + sampleCount * frameSize:
-            return False
+        if not self.isContainQAT6:
+            if self.checkReadSamples(data, sensor_data_acc, 3, 6, on_error_callback):
+                self.sendSensorData(sensor_data_acc, buf)
 
-        for sensor_data in sensor_datas:
-            if not sensor_data.channelSamples:
-                sensor_data.channelSamples = [[] for _ in range(sensor_data.channelCount)]
+            if self.checkReadSamples(data, sensor_data_gyro, 9, 6, on_error_callback):
+                self.sendSensorData(sensor_data_gyro, buf)
+        else:
+            if self.checkReadSamples(data, sensor_data_acc, 3, 18, on_error_callback):
+                self.sendSensorData(sensor_data_acc, buf)
 
-        lastSampleIndex = sensor_data_acc.lastPackageCounter * sensor_data_acc.packageSampleCount
-        offset = dataOffset
+            if self.checkReadSamples(data, sensor_data_gyro, 9, 18, on_error_callback):
+                self.sendSensorData(sensor_data_gyro, buf)
 
-        for sampleOffset in range(sampleCount):
-            sampleIndex = lastSampleIndex + sampleOffset
+            if sensor_data_euler.channelSamples is None or len(sensor_data_euler.channelSamples) == 0:
+                sensor_data_euler.channelSamples = [[], [], []]
+        
+            if self.checkReadSamples(data, sensor_data_quat, 15, 12, on_error_callback):
+                #add w
+                sampleCount = sensor_data_quat.packageSampleCount
+                for sampleIndex in range(sampleCount):
+                    try:
+                        x_sample = sensor_data_quat.channelSamples[1][sampleIndex]
+                        y_sample = sensor_data_quat.channelSamples[2][sampleIndex]
+                        z_sample = sensor_data_quat.channelSamples[3][sampleIndex]
+                        x = x_sample.data
+                        y = y_sample.data
+                        z = z_sample.data
+                        w = math.sqrt(max(0.0, 1.0 - x ** 2 - y ** 2 - z ** 2))
+                        dataItem = Sample()
+                        dataItem.channelIndex = 0
+                        dataItem.sampleIndex = x_sample.sampleIndex
+                        dataItem.timeStampInMs = x_sample.timeStampInMs
+                        dataItem.rawData = 0
+                        dataItem.data = w
+                        dataItem.isLost = x_sample.isLost
+                        sensor_data_quat.channelSamples[0].append(dataItem)
 
-            if lostSampleCount > 0:
-                self._append_imu_vector_sample(sensor_data_acc, sampleIndex, self.lastAccData, True)
-                self._append_imu_vector_sample(sensor_data_gyro, sampleIndex, self.lastGyroData, True)
-                if sensor_data_quat is not None:
-                    self._append_imu_quaternion_sample(sensor_data_quat, sensor_data_euler, sampleIndex, self.lastQuatData, True)
+                        #add euler
+                        R = math.atan2(2 * (w * x + y * z), 1 - 2 * (x ** 2 + y ** 2)) * 180 / math.pi
+                        R_sample = Sample()
+                        R_sample.channelIndex = 0
+                        R_sample.sampleIndex = x_sample.sampleIndex
+                        R_sample.timeStampInMs = x_sample.timeStampInMs
+                        R_sample.rawData = 0
+                        R_sample.data = R
+                        R_sample.isLost = x_sample.isLost
+                        sensor_data_euler.channelSamples[0].append(R_sample)
+                        P = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x)))) * 180 / math.pi
+                        P_sample = Sample()
+                        P_sample.channelIndex = 1
+                        P_sample.sampleIndex = x_sample.sampleIndex
+                        P_sample.timeStampInMs = x_sample.timeStampInMs
+                        P_sample.rawData = 0
+                        P_sample.data = P
+                        P_sample.isLost = x_sample.isLost
+                        sensor_data_euler.channelSamples[1].append(P_sample)
+                        Y = math.atan2(2 * (w * z + x * y), 1 - 2 * (y ** 2 + z ** 2)) * 180 / math.pi
+                        Y_sample = Sample()
+                        Y_sample.channelIndex = 2
+                        Y_sample.sampleIndex = x_sample.sampleIndex
+                        Y_sample.timeStampInMs = x_sample.timeStampInMs
+                        Y_sample.rawData = 0
+                        Y_sample.data = Y
+                        Y_sample.isLost = x_sample.isLost
+                        sensor_data_euler.channelSamples[2].append(Y_sample)
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
 
-                continue
-
-            accRaw = [
-                struct.unpack_from("<h", data, offset)[0],
-                struct.unpack_from("<h", data, offset + 2)[0],
-                struct.unpack_from("<h", data, offset + 4)[0],
-            ]
-            self.lastAccData = accRaw.copy()
-            gyroOffset = offset + 6
-            gyroRaw = [
-                struct.unpack_from("<h", data, gyroOffset)[0],
-                struct.unpack_from("<h", data, gyroOffset + 2)[0],
-                struct.unpack_from("<h", data, gyroOffset + 4)[0],
-            ]
-            self.lastGyroData = gyroRaw.copy()
-
-            self._append_imu_vector_sample(sensor_data_acc, sampleIndex, self.lastAccData, False)
-            self._append_imu_vector_sample(sensor_data_gyro, sampleIndex, self.lastGyroData, False)
-
-            if sensor_data_quat is not None:
-                quatOffset = offset + 12
-                quatRaw = [
-                    struct.unpack_from("<i", data, quatOffset)[0],
-                    struct.unpack_from("<i", data, quatOffset + 4)[0],
-                    struct.unpack_from("<i", data, quatOffset + 8)[0],
-                ]
-                self._append_imu_quaternion_sample(sensor_data_quat, sensor_data_euler, sampleIndex, quatRaw, False)
-
-            offset += frameSize
-
-        return True
-
-    def _append_imu_vector_sample(self, sensor_data: SensorData, sampleIndex: int, rawValues: List[int], isLost: bool):
-        sampleInterval = 1000 // sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
-
-        for channelIndex in range(sensor_data.channelCount):
-            if (sensor_data.channelMask & (1 << channelIndex)) == 0:
-                continue
-
-            rawData = 0 if isLost else rawValues[channelIndex]
-
-            sample = Sample()
-            sample.channelIndex = channelIndex
-            sample.sampleIndex = sampleIndex
-            sample.timeStampInMs = sampleIndex * sampleInterval
-            sample.rawData = rawData
-            sample.data = 0.0 if isLost else rawData * sensor_data.K
-            sample.impedance = 0.0
-            sample.saturation = 0.0
-            sample.isLost = isLost
-            sensor_data.channelSamples[channelIndex].append(sample)
-
-    def _append_imu_quaternion_sample(
-            self,
-            sensor_data_quat: SensorData,
-            sensor_data_euler: SensorData,
-            sampleIndex: int,
-            rawValues: List[int],
-            isLost: bool,
-    ):
-        scale = 1073741824.0  # 2^30
-        sampleInterval = 1000 // sensor_data_quat.sampleRate if sensor_data_quat.sampleRate > 0 else 0
-
-        raw = [0, 0, 0, 0]
-        value = [0.0, 0.0, 0.0, 0.0]
-        euler = [0.0, 0.0, 0.0]
-
-        if not isLost:
-            raw[1] = rawValues[0]
-            raw[2] = rawValues[1]
-            raw[3] = rawValues[2]
-            
-            value[1] = raw[1] / scale
-            value[2] = raw[2] / scale
-            value[3] = raw[3] / scale
-            value[0] = math.sqrt(max(0.0, 1.0 - value[1] ** 2 - value[2] ** 2 - value[3] ** 2))
-
-            euler[0] = math.atan2(2 * (value[0] * value[1] + value[2] * value[3]), 1 - 2 * (value[1] ** 2 + value[2] ** 2)) * 180 / math.pi
-            euler[1] = math.asin(max(-1.0, min(1.0, 2 * (value[0] * value[2] - value[3] * value[1])))) * 180 / math.pi
-            euler[2] = math.atan2(2 * (value[0] * value[3] + value[1] * value[2]), 1 - 2 * (value[2] ** 2 + value[3] ** 2)) * 180 / math.pi
-
-            self.lastQuatData = value.copy()
-            self.lastEulerData = euler.copy()
-
-        for channelIndex in range(sensor_data_quat.channelCount):
-            if (sensor_data_quat.channelMask & (1 << channelIndex)) == 0:
-                continue
-
-            sample = Sample()
-            sample.channelIndex = channelIndex
-            sample.sampleIndex = sampleIndex
-            sample.timeStampInMs = sampleIndex * sampleInterval
-            sample.rawData = raw[channelIndex]
-            sample.data = self.lastQuatData[channelIndex]
-            sample.impedance = 0.0
-            sample.saturation = 0.0
-            sample.isLost = isLost
-            sensor_data_quat.channelSamples[channelIndex].append(sample)
-
-        for channelIndex in range(sensor_data_euler.channelCount):
-            if (sensor_data_euler.channelMask & (1 << channelIndex)) == 0:
-                continue
-
-            sample = Sample()
-            sample.channelIndex = channelIndex
-            sample.sampleIndex = sampleIndex
-            sample.timeStampInMs = sampleIndex * sampleInterval
-            sample.rawData = raw[channelIndex]
-            sample.data = self.lastEulerData[channelIndex]
-            sample.impedance = 0.0
-            sample.saturation = 0.0
-            sample.isLost = isLost
-            sensor_data_euler.channelSamples[channelIndex].append(sample)
+            self.sendSensorData(sensor_data_quat, buf)
+            self.sendSensorData(sensor_data_euler, buf)
 
     def checkReadSamples(self, data: bytes, sensorData: SensorData, dataOffset: int, dataGap: int, on_error_callback=None):
         offset = 1
 
         if not self._is_data_transfering:
+            return False
+        if sensorData is None or sensorData.packageSampleCount <= 0 or sensorData.channelCount <= 0 or sensorData.minPackageSampleCount <= 0 or sensorData.K <= 0:
             return False
         try:
             packageIndex = 0
@@ -1345,7 +1307,7 @@ class SensorProfileDataCtx:
                         try:
                             asyncio.get_event_loop().run_in_executor(None, on_error_callback, lostLog)
                         except Exception as e:
-                            pass
+                            SdkLog.exception(_TAG, "Unexpected error")
 
                 sensorData.lastPackageIndex = newPackageIndex
 
@@ -1354,7 +1316,7 @@ class SensorProfileDataCtx:
 
             sensorData.lastPackageCounter += 1
         except Exception as e:
-            # print(e)
+            SdkLog.exception(_TAG, "Unexpected error")
             return False
         return True
 
@@ -1372,11 +1334,33 @@ class SensorProfileDataCtx:
             dataGap: int,
             lostSampleCount: int,
     ):
-        # 基本越界保护：offset 必须在 data 范围内
-        if data is None or offset < 0 or offset > len(data):
-            return
-
         sampleCount = sensorData.packageSampleCount
+        if lostSampleCount <= 0:
+            if data is None or offset < 0 or offset > len(data):
+                raise ValueError("Invalid data or offset")
+
+            if sensorData.resolutionBits in (7, 8):
+                bytesPerChannel = 1
+            elif sensorData.resolutionBits in (12, 16, 17, 0):
+                bytesPerChannel = 2
+            elif sensorData.resolutionBits == 24:
+                bytesPerChannel = 3
+            elif sensorData.resolutionBits in (31, 32, 33):
+                bytesPerChannel = 4
+            else:
+                bytesPerChannel = 2
+
+            dataLength = len(data)
+
+            realChannelCount = 0
+            for channelIndex, impedanceChannelIndex in enumerate(range(sensorData.channelCount)):
+                if (sensorData.channelMask & (1 << channelIndex)) != 0:
+                    realChannelCount += 1
+
+            if offset + ((bytesPerChannel  * realChannelCount * sampleCount) + (dataGap * (sampleCount - 1)))  > dataLength:
+                raise ValueError(f"Invalid dataLength:{dataLength}")
+        
+
         sampleInterval = (
             1000 // sensorData.sampleRate if sensorData.sampleRate > 0 else 0
         )
@@ -1394,18 +1378,7 @@ class SensorProfileDataCtx:
             for channelIndex in range(sensorData.channelCount):
                 channelSamples.append([])
 
-        # 根据分辨率计算每个通道占用的字节数，用于后续越界检查
-        if sensorData.resolutionBits in (7, 8):
-            bytesPerChannel = 1
-        elif sensorData.resolutionBits in (12, 16, 0):
-            bytesPerChannel = 2
-        elif sensorData.resolutionBits == 24:
-            bytesPerChannel = 3
-        else:
-            bytesPerChannel = 2
-
-        dataLength = len(data)
-
+        
         for sampleIndex in range(sampleCount):
             for channelIndex, impedanceChannelIndex in enumerate(range(sensorData.channelCount)):
                 if (sensorData.channelMask & (1 << channelIndex)) != 0:
@@ -1433,10 +1406,6 @@ class SensorProfileDataCtx:
                         dataItem.saturation = saturation
                         dataItem.isLost = True
                     else:
-                        # 在读取任何数据前先检查剩余字节是否足够
-                        if offset + bytesPerChannel > dataLength:
-                            return
-
                         rawData = 0
                         if sensorData.resolutionBits == 7:
                             rawData = data[offset]
@@ -1446,24 +1415,38 @@ class SensorProfileDataCtx:
                             rawData = data[offset] & 0xFF
                             offset += 1
                         elif sensorData.resolutionBits == 12:
-                            rawData = int.from_bytes(
-                                data[offset: offset + 2],
-                                byteorder="little",
-                                signed=True,
-                            )
+                            rawData = struct.unpack_from("<h", data, offset)[0]
+                            rawData -= 2000
                             offset += 2
                         elif sensorData.resolutionBits == 16:
-                            rawData = int.from_bytes(
-                                data[offset: offset + 2],
-                                byteorder="little",
-                                signed=True,
-                            )
+                            if (sensorData.resolutionSigned):
+                                rawData = struct.unpack_from("<h", data, offset)[0]
+                            else:
+                                rawData = struct.unpack_from("<H", data, offset)[0]
+                            offset += 2
+                        elif sensorData.resolutionBits == 17:
+                            rawData = struct.unpack_from(">h", data, offset)[0]
                             offset += 2
                         elif sensorData.resolutionBits == 24:
                             rawData = (data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]
-                            if sensorData.dataType != DataType.NTF_PPG:
+                            if (sensorData.resolutionSigned):
                                 rawData -= 8388608
                             offset += 3
+                        elif sensorData.resolutionBits == 31:
+                            if (sensorData.resolutionSigned):
+                                rawData = struct.unpack_from("<i", data, offset)[0]
+                            else:
+                                rawData = struct.unpack_from("<I", data, offset)[0]
+                            offset += 4
+                        elif sensorData.resolutionBits == 32:
+                            rawData = struct.unpack_from("f", data, offset)[0]
+                            offset += 4
+                        elif sensorData.resolutionBits == 33:
+                            if (sensorData.resolutionSigned):
+                                rawData = struct.unpack_from(">i", data, offset)[0]
+                            else:
+                                rawData = struct.unpack_from(">I", data, offset)[0]
+                            offset += 4
                         elif sensorData.resolutionBits == 0:
                             rawData = struct.unpack_from("<h", data, offset)[0]
                             offset += 2
@@ -1506,7 +1489,10 @@ class SensorProfileDataCtx:
                 oldSamples = oldChannelSamples[channelIndex]
                 newSamples = []
                 for sampleIndex in range(sensorData.minPackageSampleCount):
-                    newSamples.append(oldSamples[startIndex + sampleIndex])
+                    try:
+                        newSamples.append(oldSamples[startIndex + sampleIndex])
+                    except IndexError:
+                        pass
                 resultChannelSamples.append(newSamples)
 
             sensorDataResult = SensorData()
@@ -1529,7 +1515,7 @@ class SensorProfileDataCtx:
                     self.debugCSVWriter.writerow(channel_samples_header)
                 except Exception as e:
                     # print(e)
-                    pass
+                    SdkLog.exception(_TAG, "Unexpected error")
 
             if self.debugCSVWriter != None:
                 try:
@@ -1544,7 +1530,7 @@ class SensorProfileDataCtx:
                             self.debugCSVWriter.writerow(row_data)
                 except Exception as e:
                     # print(e)
-                    pass
+                    SdkLog.exception(_TAG, "Unexpected error")
 
             startIndex += sensorData.minPackageSampleCount
 
@@ -1560,6 +1546,7 @@ class SensorProfileDataCtx:
         sensorData.channelSamples = leftChannelSamples
 
         for sensorDataResult in sensorDataList:
+            self._write_data_log_parsed(sensorDataResult)
             buf.put(sensorDataResult)
 
     async def processUniversalData(self, buf: Queue[SensorData], on_data_callback, on_error_callback=None):
@@ -1587,10 +1574,11 @@ class SensorProfileDataCtx:
             try:
                 while self._is_running and not self._rawDataBuffer.empty():
                     data = self._rawDataBuffer.get_nowait()
+                    self._write_data_log_raw(data)
                     self._concatDataBuffer.extend(data)
                     self._rawDataBuffer.task_done()
             except Exception as e:
-                pass
+                SdkLog.exception(_TAG, "Error reading raw data buffer")
 
             index = 0
             last_cut = -1
