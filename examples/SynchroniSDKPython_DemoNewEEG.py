@@ -1,6 +1,7 @@
 import sys
 import signal
 import time
+import multiprocessing
 from typing import List
 
 import matplotlib
@@ -71,11 +72,13 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     data_received  = QtCore.pyqtSignal(object)
     add_device_sig = QtCore.pyqtSignal(str)
     lost_packet_signal = QtCore.pyqtSignal(str, int)
+    device_disconnected_sig = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.discovered_devices = []
         self.current_sensor: SensorProfile = None
+        self._pending_device = None
         self.sensor_controller = SensorController()
         self.thread_pool = QThreadPool.globalInstance()
         self._data_type_pools = {}
@@ -95,6 +98,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self._buffer_locks = {}
         self._eeg_buffer_lock = QtCore.QMutex()
         self._ecg_buffer_lock = QtCore.QMutex()
+        self._brth_buffer_lock = QtCore.QMutex()
         self.cube_vertices = None
         self.cube_faces = None
 
@@ -115,6 +119,14 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.ecg_line = None
         self.ecg_impedance = []
 
+        self.has_brth = False
+
+        self.brth_buffer = None
+        self._brth_sample_index_buffer = None
+        self.brth_sample_rate = 0
+        self.brth_line = None
+        self.brth_impedance = []
+
         self._updating_ntf_controls = False
         self._updating_filter_controls = False
         self._debug_log_checkbox = None
@@ -133,6 +145,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.add_device_sig.connect(self._add_device_item)
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
+        self.device_disconnected_sig.connect(self._on_device_disconnected)
 
         self.lost_packet_counts = {}
 
@@ -233,6 +246,9 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("Not Connected")
         controls_layout.addWidget(self.status_label)
 
+        self.power_label = QtWidgets.QLabel("Power: --%")
+        controls_layout.addWidget(self.power_label)
+
         debug_log_group = QtWidgets.QGroupBox("Debug Log")
         debug_log_layout = QtWidgets.QVBoxLayout()
         self._debug_log_checkbox = QtWidgets.QCheckBox("Enable SDK Debug Log")
@@ -247,8 +263,9 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         ntf_group = QtWidgets.QGroupBox("Data Notification")
         ntf_layout = QtWidgets.QHBoxLayout()
         self._ntf_checkboxes = {
-            "NTF_EEG": QtWidgets.QCheckBox("EEG"),
-            "NTF_ECG": QtWidgets.QCheckBox("ECG"),
+            "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
+            "NTF_ECG":  QtWidgets.QCheckBox("ECG"),
+            "NTF_BRTH": QtWidgets.QCheckBox("BRTH"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)
@@ -302,16 +319,16 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.figure_eeg, self.axes_eeg = plt.subplots(8, 1, sharex=True, figsize=(8, 12))
         self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4)
         self.canvas_eeg = FigureCanvas(self.figure_eeg)
-        eeg_layout.addWidget(QtWidgets.QLabel("EEG + ECG Waveform"))
+        eeg_layout.addWidget(QtWidgets.QLabel("EEG + ECG + BRTH Waveform"))
         eeg_layout.addWidget(self.canvas_eeg)
 
         right_layout.addLayout(controls_layout, stretch=1)
         right_layout.addLayout(eeg_layout, stretch=4)
 
-        main_layout.addLayout(left_layout, stretch=5)
-        main_layout.addLayout(right_layout, stretch=5)
+        main_layout.addLayout(left_layout, stretch=3)
+        main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle("SynchroniSDKPython IMU + Quaternion + EEG + ECG Demo")
+        self.setWindowTitle("SynchroniSDKPython IMU + Quaternion + EEG + ECG + BRTH Demo")
         self.resize(1600, 900)
         self.show()
 
@@ -333,7 +350,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
     def _on_device_found(self, device_list: List[BLEDevice]):
         self._stop_scan()
-        filtered = filter(lambda x: x.Name.startswith("OB") or x.Name.startswith("Sync"), device_list)
+        filtered = filter(lambda x: x.Name.startswith("OB") or x.Name.startswith("Sync") or x.Name.startswith("Orion"), device_list)
         for d in filtered:
             if d.Address not in [x.Address for x in self.discovered_devices]:
                 self.discovered_devices.append(d)
@@ -354,13 +371,24 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self.status_label.setText("Failed to create SensorProfile")
             return
 
-        # 只允许同时连接一个设备，选择新设备时断开旧设备
+        # 只允许同时连接一个设备，选择新设备时先断开旧设备
         if self.current_sensor is not None and self.current_sensor != sensor:
+            self._pending_device = device
             self._disconnect()
-
-        if self.current_sensor == sensor:
             return
-        
+
+        if self.current_sensor is not None and self.current_sensor == sensor:
+            return
+
+        self._do_connect_device(device)
+
+    def _do_connect_device(self, device: BLEDevice):
+        """实际执行连接、初始化、启动数据流（要求当前无已连接设备）。"""
+        sensor = self.sensor_controller.requireSensor(device)
+        if sensor is None:
+            self.status_label.setText("Failed to create SensorProfile")
+            return
+
         sensor.onDataCallback  = self._on_data
         sensor.onStateChanged  = self._on_state_changed
         sensor.onErrorCallback = self._on_error
@@ -384,7 +412,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 f"Euler {info.EulerChannelCount}ch @ {info.EulerSampleRate}Hz | "
                 f"Quat {info.QuatChannelCount}ch @ {info.QuatSampleRate}Hz | "
                 f"EEG {info.EegChannelCount}ch @ {info.EegSampleRate}Hz | "
-                f"ECG {info.EcgChannelCount}ch @ {info.EcgSampleRate}Hz"
+                f"ECG {info.EcgChannelCount}ch @ {info.EcgSampleRate}Hz | "
+                f"BRTH {info.BrthChannelCount}ch @ {info.BrthSampleRate}Hz"
             )
 
         if not sensor.isDataTransfering:
@@ -414,13 +443,13 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     def _disconnect(self):
         if self.current_sensor:
             self.current_sensor.disconnect()
-            self.current_sensor = None
             self.btn_disconnect.setEnabled(False)
             for cb in self._ntf_checkboxes.values():
                 cb.setEnabled(False)
             for cb in self._filter_checkboxes.values():
                 cb.setEnabled(False)
-            self.status_label.setText("Disconnected")
+            self.status_label.setText("Disconnecting...")
+            self.power_label.setText("Power: --%")
 
     # ── Data Buffers ──────────────────────────────────────────────────────────
 
@@ -455,13 +484,21 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self.ecg_buffer = np.zeros((info.EcgChannelCount, buf_len))
             self._ecg_sample_index_buffer = np.zeros((info.EcgChannelCount, buf_len), dtype=np.int64)
             self._ecg_buffer_index = 0
-            self.eeg_channels_per_page = len(self.axes_eeg) - 1
-        else:
-            self.eeg_channels_per_page = len(self.axes_eeg)
+
+        self.has_brth = info.BrthSampleRate > 0 and info.BrthChannelCount > 0
+        if self.has_brth:
+            self.brth_sample_rate = info.BrthSampleRate
+            buf_len = max(info.BrthSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.brth_buffer = np.zeros((info.BrthChannelCount, buf_len))
+            self._brth_sample_index_buffer = np.zeros((info.BrthChannelCount, buf_len), dtype=np.int64)
+            self._brth_buffer_index = 0
+
+        extra_axes = int(self.has_ecg) + int(self.has_brth)
+        self.eeg_channels_per_page = len(self.axes_eeg) - extra_axes
 
     def _on_data(self, sensor: SensorProfile, data: SensorData):
         if data and data.channelSamples:
-            if data.dataType in self.buffers or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG):
+            if data.dataType in self.buffers or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH):
                 self.data_received.emit(data)
             if data.dataType == DataType.NTF_QUATERNION:
                 self._update_quaternion(data)
@@ -489,6 +526,10 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         for pool in self._data_type_pools.values():
             pool.waitForDone()
+        try:
+            self.sensor_controller.terminate()
+        except Exception as e:
+            print(f"[closeEvent] terminate error: {e}")
         event.accept()
 
     def _append_to_buffer(self, data: SensorData):
@@ -568,6 +609,45 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 self._ecg_buffer_index = (self._ecg_buffer_index + n) % buf_len
             finally:
                 self._ecg_buffer_lock.unlock()
+            return
+
+        if data.dataType == DataType.NTF_BRTH:
+            self._brth_buffer_lock.lock()
+            try:
+                buf = self.brth_buffer
+                idx_buf = self._brth_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self._brth_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                    while len(self.brth_impedance) <= ch_idx:
+                        self.brth_impedance.append(0)
+                    if ch_samples:
+                        self.brth_impedance[ch_idx] = ch_samples[-1].impedance
+                self._brth_buffer_index = (self._brth_buffer_index + n) % buf_len
+            finally:
+                self._brth_buffer_lock.unlock()
             return
 
         lock = self._get_buffer_lock(data.dataType)
@@ -698,19 +778,23 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     def _rebuild_eeg_plot(self):
         self._eeg_buffer_lock.lock()
         self._ecg_buffer_lock.lock()
+        self._brth_buffer_lock.lock()
         try:
             eeg_available = self.eeg_buffer is not None and self._eeg_sample_index_buffer is not None
             ecg_available = self.has_ecg and self.ecg_buffer is not None and self._ecg_sample_index_buffer is not None
+            brth_available = self.has_brth and self.brth_buffer is not None and self._brth_sample_index_buffer is not None
             if not eeg_available:
                 for ax in self.axes_eeg:
                     ax.cla()
                     ax.set_visible(True)
-                self.axes_eeg[0].set_title("EEG + ECG (Device not supported or disabled)")
+                self.axes_eeg[0].set_title("EEG + ECG + BRTH (Device not supported or disabled)")
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
                 self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
+                self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
                 self.eeg_lines = []
                 self.ecg_line = None
+                self.brth_line = None
                 return
             eeg_buffer_copy = self.eeg_buffer.copy()
             eeg_idx_buf_copy = self._eeg_sample_index_buffer.copy()
@@ -718,7 +802,11 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             ecg_buffer_copy = self.ecg_buffer.copy() if ecg_available else None
             ecg_idx_buf_copy = self._ecg_sample_index_buffer.copy() if ecg_available else None
             ecg_buffer_index = self._ecg_buffer_index if ecg_available else 0
+            brth_buffer_copy = self.brth_buffer.copy() if brth_available else None
+            brth_idx_buf_copy = self._brth_sample_index_buffer.copy() if brth_available else None
+            brth_buffer_index = self._brth_buffer_index if brth_available else 0
         finally:
+            self._brth_buffer_lock.unlock()
             self._ecg_buffer_lock.unlock()
             self._eeg_buffer_lock.unlock()
 
@@ -727,16 +815,22 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self._last_plotted_sample_indices[DataType.NTF_ECG] = int(ecg_idx_buf_copy.max())
         else:
             self.ecg_line = None
+        if brth_available:
+            self._last_plotted_sample_indices[DataType.NTF_BRTH] = int(brth_idx_buf_copy.max())
+        else:
+            self.brth_line = None
 
         start_ch, end_ch = self._eeg_page_range()
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
-        ecg_axis_index = len(self.axes_eeg) - 1
+        brth_axis_index = len(self.axes_eeg) - 1 if self.has_brth else None
+        ecg_axis_index = len(self.axes_eeg) - 1 - int(self.has_brth) if self.has_ecg else None
 
         self.eeg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, eeg_buffer_copy.shape[1])
         t_ecg = np.linspace(-BIO_BUFFER_SECONDS, 0, ecg_buffer_copy.shape[1]) if ecg_available else None
+        t_brth = np.linspace(-BIO_BUFFER_SECONDS, 0, brth_buffer_copy.shape[1]) if brth_available else None
 
         for ch, ax in enumerate(self.axes_eeg):
             ax.cla()
@@ -763,6 +857,19 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
                 ax.set_ylabel("ECG", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.yaxis.set_label_position("right")
+                for spine in ax.spines.values():
+                    spine.set_color(color)
+                ax.set_visible(True)
+            elif ch == brth_axis_index and brth_available:
+                color = plt.cm.tab10(6)
+                y_data = np.roll(brth_buffer_copy[0], -brth_buffer_index)
+                (line,) = ax.plot(t_brth, y_data, color=color, linewidth=0.8)
+                self.brth_line = line
+                ax.tick_params(axis='both', labelsize=7)
+                ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+                ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
+                ax.set_ylabel("BRTH", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -929,8 +1036,13 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         ecg_idx_buf_copy = None
         ecg_impedance_copy = None
         ecg_buffer_index = 0
+        brth_buffer_copy = None
+        brth_idx_buf_copy = None
+        brth_impedance_copy = None
+        brth_buffer_index = 0
         self._eeg_buffer_lock.lock()
         self._ecg_buffer_lock.lock()
+        self._brth_buffer_lock.lock()
         try:
             if self.eeg_buffer is not None and self._eeg_sample_index_buffer is not None:
                 eeg_buffer_copy = self.eeg_buffer.copy()
@@ -942,11 +1054,18 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 ecg_idx_buf_copy = self._ecg_sample_index_buffer.copy()
                 ecg_impedance_copy = list(self.ecg_impedance)
                 ecg_buffer_index = self._ecg_buffer_index
+            if self.has_brth and self.brth_buffer is not None and self._brth_sample_index_buffer is not None:
+                brth_buffer_copy = self.brth_buffer.copy()
+                brth_idx_buf_copy = self._brth_sample_index_buffer.copy()
+                brth_impedance_copy = list(self.brth_impedance)
+                brth_buffer_index = self._brth_buffer_index
         finally:
+            self._brth_buffer_lock.unlock()
             self._ecg_buffer_lock.unlock()
             self._eeg_buffer_lock.unlock()
 
-        ecg_axis_index = len(self.axes_eeg) - 1
+        brth_axis_index = len(self.axes_eeg) - 1 if self.has_brth else None
+        ecg_axis_index = len(self.axes_eeg) - 1 - int(self.has_brth) if self.has_ecg else None
         start_ch, _ = self._eeg_page_range()
 
         if eeg_buffer_copy is not None and eeg_idx_buf_copy is not None and self.eeg_lines:
@@ -989,6 +1108,25 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EEG] = current_last_idx
+
+        if brth_buffer_copy is not None and brth_idx_buf_copy is not None and self.brth_line is not None:
+            current_last_idx = int(brth_idx_buf_copy.max())
+            last_plotted_idx = self._last_plotted_sample_indices.get(DataType.NTF_BRTH, -1)
+            if current_last_idx != last_plotted_idx:
+                y_data = np.roll(brth_buffer_copy[0], -brth_buffer_index)
+                self.brth_line.set_ydata(y_data)
+                ax = self.axes_eeg[brth_axis_index]
+                if not ax.get_visible():
+                    ax.set_visible(True)
+                ch_data = y_data
+                mn, mx = ch_data.min(), ch_data.max()
+                margin = max((mx - mn) * 0.1, 0.01)
+                if mn == mx:
+                    mn -= 1
+                    mx += 1
+                ax.set_ylim(mn - margin, mx + margin)
+                self.canvas_eeg.draw_idle()
+                self._last_plotted_sample_indices[DataType.NTF_BRTH] = current_last_idx
 
         if ecg_buffer_copy is not None and ecg_idx_buf_copy is not None and self.ecg_line is not None:
             current_last_idx = int(ecg_idx_buf_copy.max())
@@ -1048,6 +1186,28 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
+        if state == DeviceStateEx.Disconnected and self.current_sensor == sensor:
+            self.device_disconnected_sig.emit()
+
+    def _on_device_disconnected(self):
+        if self._pending_device is not None:
+            pending = self._pending_device
+            self._pending_device = None
+            self.current_sensor = None
+            self._clear_ui_data()
+            self._do_connect_device(pending)
+            return
+
+        if self.current_sensor is None:
+            return
+        self.current_sensor = None
+        self.btn_disconnect.setEnabled(False)
+        for cb in self._ntf_checkboxes.values():
+            cb.setEnabled(False)
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(False)
+        self.status_label.setText("Disconnected (device)")
+        self.power_label.setText("Power: --%")
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
@@ -1080,6 +1240,14 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
+        self.power_label.setText(f"Power: {power}%")
+
+    def _check_set_param_result(self, key: str, result: str) -> bool:
+        """检查 setParam 结果，若报错则弹出 QMessageBox。返回 True 表示成功。"""
+        if str(result).startswith("Error"):
+            QtWidgets.QMessageBox.warning(self, "Set Parameter Failed", f"Failed to set {key}:\n{result}")
+            return False
+        return True
 
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -1090,6 +1258,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
                 result = sensor.setParam("DEBUG_LOG_PATH", value)
                 print(f"[Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_LOG_PATH, {value}) -> {result}")
+                self._check_set_param_result("DEBUG_LOG_PATH", result)
 
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -1099,6 +1268,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
                 result = sensor.setParam("DEBUG_BLE_DATA_PATH", value)
                 print(f"[Data Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_BLE_DATA_PATH, {value}) -> {result}")
+                self._check_set_param_result("DEBUG_BLE_DATA_PATH", result)
 
     def _on_ntf_toggled(self, key: str):
         if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
@@ -1112,11 +1282,30 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         print(f"[NTF] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[NTF] setParam({key}, {value}) -> {result}")
-        if not str(result).startswith("Error"):
+        if self._check_set_param_result(key, result):
+            self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
     def _refresh_control_states(self, sensor: SensorProfile):
         """根据设备当前 NTF/FILTER 参数刷新 UI 开关状态。"""
+        info = sensor.getDeviceInfo()
+        channel_map = {
+            "NTF_EMG":   info.EmgChannelCount if info else 0,
+            "NTF_GEST":  info.EmgChannelCount if info else 0,
+            "NTF_EEG":   info.EegChannelCount if info else 0,
+            "NTF_ECG":   info.EcgChannelCount if info else 0,
+            "NTF_PPG":   info.PpgChannelCount if info else 0,
+            "NTF_SPO2":  info.Spo2ChannelCount if info else 0,
+            "NTF_IMU":   max(info.AccChannelCount, info.GyroChannelCount) if info else 0,
+            "NTF_BRTH":  info.BrthChannelCount if info else 0,
+            "NTF_IMPEDANCE": info.ImpeChannelCount if info else 0,
+            "NTF_MAG_ANGLE": info.MagAngleChannelCount if info else 0,
+            "NTF_GFORCE_EULER": info.EulerChannelCount if info else 0,
+            "NTF_GFORCE_QUAT": info.QuatChannelCount if info else 0,
+            "NTF_GFORCE_ACC": info.AccChannelCount if info else 0,
+            "NTF_GFORCE_GYRO": info.GyroChannelCount if info else 0,
+        }
+
         ntf_result = sensor.getParam("NTF")
         print(f"[Refresh] getParam(NTF) -> {ntf_result}")
         if not str(ntf_result).startswith("Error"):
@@ -1127,25 +1316,36 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                     key = items[i]
                     value = items[i + 1]
                     cb = self._ntf_checkboxes.get(key)
+                    count = channel_map.get(key, 0)
                     if cb is not None:
-                        cb.setChecked(value == "ON")
+                        cb.setEnabled(count > 0)
+                        if count > 0:
+                            cb.setChecked(value == "ON")
+                        else:
+                            cb.setChecked(False)
             finally:
                 self._updating_ntf_controls = False
 
         filter_result = sensor.getParam("FILTER")
         print(f"[Refresh] getParam(FILTER) -> {filter_result}")
-        if not str(filter_result).startswith("Error"):
-            items = str(filter_result).split("|")
-            self._updating_filter_controls = True
-            try:
+        has_filter = bool(filter_result) and not str(filter_result).startswith("Error")
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(has_filter)
+        self._updating_filter_controls = True
+        try:
+            if has_filter:
+                items = str(filter_result).split("|")
                 for i in range(0, len(items) - 1, 2):
                     key = items[i]
                     value = items[i + 1]
                     cb = self._filter_checkboxes.get(key)
                     if cb is not None:
                         cb.setChecked(value == "ON")
-            finally:
-                self._updating_filter_controls = False
+            else:
+                for cb in self._filter_checkboxes.values():
+                    cb.setChecked(False)
+        finally:
+            self._updating_filter_controls = False
 
     def _on_filter_toggled(self, key: str):
         if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
@@ -1159,7 +1359,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         print(f"[Filter] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[Filter] setParam({key}, {value}) -> {result}")
-        if not str(result).startswith("Error"):
+        if self._check_set_param_result(key, result):
+            self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
     def _clear_ui_data(self):
@@ -1178,6 +1379,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
         self._eeg_buffer_lock.lock()
         self._ecg_buffer_lock.lock()
+        self._brth_buffer_lock.lock()
         try:
             if self.eeg_buffer is not None:
                 self.eeg_buffer.fill(0)
@@ -1187,7 +1389,12 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 self.ecg_buffer.fill(0)
                 self._ecg_sample_index_buffer.fill(0)
                 self._ecg_buffer_index = 0
+            if self.brth_buffer is not None:
+                self.brth_buffer.fill(0)
+                self._brth_sample_index_buffer.fill(0)
+                self._brth_buffer_index = 0
         finally:
+            self._brth_buffer_lock.unlock()
             self._ecg_buffer_lock.unlock()
             self._eeg_buffer_lock.unlock()
 
@@ -1196,6 +1403,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
+    # PyInstaller 打包后，multiprocessing 子进程必须调用 freeze_support()
+    multiprocessing.freeze_support()
     app = QtWidgets.QApplication(sys.argv)
     window = IMUQuaternionEEGDemo()
 
@@ -1204,4 +1413,5 @@ if __name__ == "__main__":
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
+    app.aboutToQuit.connect(lambda: window.sensor_controller.terminate())
     sys.exit(app.exec_())

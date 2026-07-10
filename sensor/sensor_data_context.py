@@ -244,7 +244,7 @@ class SensorProfileDataCtx:
         data.channelCount = 8
         data.channelMask = config.channel_mask
         data.minPackageSampleCount = packageCount
-        data.packageSampleCount = 8
+        data.packageSampleCount = config.batch_len
 
         data.clear()
         isNewEMG = True
@@ -296,6 +296,10 @@ class SensorProfileDataCtx:
 
         self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
         self.isNewEMG = isNewEMG
+
+        # 老 EMG 设备不支持 FILTER
+        if not isNewEMG:
+            self.filter_map.clear()
 
         return data.channelCount
 
@@ -433,7 +437,7 @@ class SensorProfileDataCtx:
     async def initIMU(self, packageCount: int) -> int:
         SdkLog.d(_TAG, "initIMU(...)")
         IMU_TYPE_QAT6 = 0x0004
-        min_package_sample_count = 2
+        min_package_sample_count = 1
         self.isContainQAT6 = False
 
         if not self.hasIMU():
@@ -797,6 +801,8 @@ class SensorProfileDataCtx:
         return True
 
     async def setFilter(self, filter: str, value: str) -> str:
+        if not self.filter_map:
+            return "ERROR: Filter not supported on this device"
         self.filter_map[filter] = value
         switch = 0
         for filter in self.filter_map.keys():

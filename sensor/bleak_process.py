@@ -261,6 +261,17 @@ class BleakProcess(multiprocessing.Process):
 
     def _stop_device_loops(self, device_mac: str):
 
+        # Cancel battery task if still running in event_loop
+        if device_mac in self._battery_tasks:
+            task = self._battery_tasks.pop(device_mac, None)
+            if task:
+                try:
+                    loop = self._event_loops.get(device_mac)
+                    if loop and not loop.is_closed():
+                        loop.call_soon_threadsafe(task.cancel)
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error")
+
         # Cancel data task first if still running in data_event_loop
         if device_mac in self._data_tasks:
             task = self._data_tasks.pop(device_mac, None)
@@ -684,7 +695,12 @@ class BleakProcess(multiprocessing.Process):
 
             # Cancel battery task
             if device_mac in self._battery_tasks:
-                self._battery_tasks.pop(device_mac, None)
+                task = self._battery_tasks.pop(device_mac, None)
+                if task is not None:
+                    try:
+                        task.cancel()
+                    except Exception as e:
+                        SdkLog.exception(_TAG, "Unexpected error")
 
             # Stop streaming and optionally disconnect client
             if disconnect_client and device_mac in self._gforces:
@@ -1119,10 +1135,12 @@ class BleakProcess(multiprocessing.Process):
                 if key == "NTF_PPG_RAW":
                     map_key = "NTF_PPG"
 
-                # 老版本 EMG 设备上 Gesture 与 EMG 互斥，与 initGesture 逻辑保持一致
+                # 老版本 EMG 设备上 Gesture 与 EMG 互斥，自动切换
                 if not ctx.isNewEMG:
                     if map_key == "NTF_GEST" and value == "ON" and ctx.notify_map.get("NTF_EMG") == "ON":
-                        result = "Error: NTF_GEST conflicts with NTF_EMG on legacy EMG device"
+                        ctx.notify_map["NTF_EMG"] = "OFF"
+                        ctx.notify_map[map_key] = value
+                        result = "OK"
                     elif map_key == "NTF_EMG" and value == "ON" and ctx.notify_map.get("NTF_GEST") == "ON":
                         ctx.notify_map["NTF_GEST"] = "OFF"
                         ctx.notify_map[map_key] = value
@@ -1165,14 +1183,12 @@ class BleakProcess(multiprocessing.Process):
             try:
                 if value == "False" or value == "":
                     SdkLog.set_log_path("")
-                    result = "OK"
                 elif value == "True":
                     path = SdkLog.get_default_log_path()
                     SdkLog.set_log_path(path)
-                    result = path
                 else:
                     SdkLog.set_log_path(value)
-                    result = value
+                result = "OK"
             except Exception as e:
                 SdkLog.exception(_TAG, f"_do_set_param DEBUG_LOG_PATH failed: {e}")
                 result = "ERROR: " + str(e)
@@ -1182,16 +1198,14 @@ class BleakProcess(multiprocessing.Process):
                 if value == "False" or value == "":
                     SdkLog.set_data_log_enabled(False)
                     await ctx.setDebugCSV("")
-                    result = "OK"
                 elif value == "True":
                     SdkLog.set_data_log_enabled(True)
                     path = SdkLog.get_default_data_log_path()
-                    csv_result = await ctx.setDebugCSV(path)
-                    result = path if csv_result == "OK" else csv_result
+                    await ctx.setDebugCSV(path)
                 else:
                     SdkLog.set_data_log_enabled(True)
-                    csv_result = await ctx.setDebugCSV(value)
-                    result = value if csv_result == "OK" else csv_result
+                    await ctx.setDebugCSV(value)
+                result = "OK"
             except Exception as e:
                 SdkLog.exception(_TAG, f"_do_set_param setDebugCSV failed: {device_mac} path={value}")
                 result = "ERROR: " + str(e)

@@ -69,6 +69,9 @@ class SensorController:
         pass
 
     def terminate(self):
+        if getattr(self, '_terminated', False):
+            return
+        self._terminated = True
         SdkLog.controller(_TAG, "terminate called")
         sensor_utils._terminated = True
 

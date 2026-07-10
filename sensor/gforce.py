@@ -764,6 +764,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_motor")
 
     async def set_led(self, switchStatus):
         body = [switchStatus == True]
@@ -775,6 +776,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_led")
 
     async def set_package_id(self, switchStatus):
         body = [switchStatus == True]
@@ -786,6 +788,7 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_package_id")
 
     async def set_log_level(self, logLevel):
         body = [0xFF & logLevel]
@@ -797,8 +800,9 @@ class GForce:
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_log_level")
 
-    async def set_function_switch(self, funcSwitch)-> bool:
+    async def set_function_switch(self, funcSwitch):
         body = [0xFF & funcSwitch]
         body = bytes(body)
         ret = await self._send_request(
@@ -808,11 +812,9 @@ class GForce:
                 has_res=True,
             )
         )
-        if (len(ret) > 0 and ret[0] == 0):
-            return True
-        return False
+        return self._check_set_response(ret, "set_function_switch")
 
-    async def set_neucir_app_control(self, open, close, stop)-> bool:
+    async def set_neucir_app_control(self, open, close, stop):
         if stop:
             body = [4]
         elif open:
@@ -828,11 +830,9 @@ class GForce:
                 has_res=True,
             )
         )
-        if (len(ret) > 0 and ret[0] == 0):
-            return True
-        return False
+        return self._check_set_response(ret, "set_neucir_app_control")
 
-    async def set_neucir_mode(self, mode)-> bool:
+    async def set_neucir_mode(self, mode):
         body = [0x90]
 
         body = bytes(body)
@@ -843,14 +843,13 @@ class GForce:
                 has_res=True,
             )
         )
-        if (len(ret) > 0 and ret[0] == 0):
-            return True
-        return False
+        return self._check_set_response(ret, "set_neucir_mode")
     
     async def set_firmware_filter_switch(self, switchStatus: int):
         body = [0xFF & switchStatus]
         body = bytes(body)
-        await self._send_request(Request(cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH, body=body, has_res=True))
+        ret = await self._send_request(Request(cmd=Command.CMD_SET_FRIMWARE_FILTER_SWITCH, body=body, has_res=True))
+        return self._check_set_response(ret, "set_firmware_filter_switch")
 
     async def get_firmware_filter_switch(self):
         buf = await self._send_request(Request(cmd=Command.CMD_GET_FRIMWARE_FILTER_SWITCH, has_res=True))
@@ -867,6 +866,7 @@ class GForce:
         )
 
         # print('set_emg_raw_data_config returned:', ret)
+        return self._check_set_response(ret, "set_emg_raw_data_config")
 
         self.resolution = cfg.resolution
 
@@ -925,7 +925,7 @@ class GForce:
         )
         return PpgRawDataConfig.from_bytes(buf)
 
-    async def set_ppg_raw_data_config(self, cfg: PpgRawDataConfig) -> bool:
+    async def set_ppg_raw_data_config(self, cfg: PpgRawDataConfig):
         body = cfg.to_bytes()
         ret = await self._send_request(
             Request(
@@ -934,7 +934,7 @@ class GForce:
                 has_res=True,
             )
         )
-        return ret is not None and len(ret) > 0 and ret[0] == 0
+        return self._check_set_response(ret, "set_ppg_raw_data_config")
 
     async def get_imu_raw_data_config(self) -> ImuRawDataConfig:
         buf = await self._send_request(
@@ -945,7 +945,7 @@ class GForce:
         )
         return ImuRawDataConfig.from_bytes(buf)
 
-    async def set_imu_raw_data_config(self, cfg: ImuRawDataConfig) -> bool:
+    async def set_imu_raw_data_config(self, cfg: ImuRawDataConfig):
         body = cfg.to_bytes()
         ret = await self._send_request(
             Request(
@@ -954,7 +954,7 @@ class GForce:
                 has_res=True,
             )
         )
-        return ret is not None and len(ret) > 0 and ret[0] == 0
+        return self._check_set_response(ret, "set_imu_raw_data_config")
 
     async def get_imu_cap_data_config(self) -> Optional[tuple]:
         """
@@ -999,13 +999,24 @@ class GForce:
             0xFF & (subscription >> 24),
         ]
         body = bytes(body)
-        await self._send_request(
+        ret = await self._send_request(
             Request(
                 cmd=Command.SET_DATA_NOTIF_SWITCH,
                 body=body,
                 has_res=True,
             )
         )
+        return self._check_set_response(ret, "set_subscription")
+
+    def _check_set_response(self, ret: Optional[bytes], name: str) -> bytes:
+        # """检查 set_xxxx 命令的响应，失败时抛出 RuntimeError。"""
+        # if ret is None:
+        #     raise RuntimeError(f"{name} failed: no response")
+        # if len(ret) == 0:
+        #     raise RuntimeError(f"{name} failed: empty response")
+        # if ret[0] != 0:
+        #     raise RuntimeError(f"{name} failed: error code {ret[0]}")
+        return ret
 
     async def start_streaming(self, q: queue.Queue):
         return await self._run_in_gforce_loop(self._do_start_streaming(q))

@@ -51,6 +51,7 @@ class BleakHost:
     def stop(self):
         if not self._started:
             return
+        self._should_exit = True
         try:
             self._cmd_queue.put({"type": "terminate"})
         except Exception as e:
@@ -60,9 +61,22 @@ class BleakHost:
             self._bleak_process.join(timeout=5)
         if self._bleak_process.is_alive():
             self._bleak_process.terminate()
+            self._bleak_process.join(timeout=2)
 
         self._stop_result_loop()
         self._stop_cmd_loop()
+
+        try:
+            self._cmd_queue.close()
+            self._result_queue.close()
+        except Exception as e:
+            SdkLog.exception(_TAG, "Error closing queues")
+
+        try:
+            self._bleak_process.close()
+        except Exception as e:
+            SdkLog.exception(_TAG, "Error closing bleak process")
+
         self._started = False
 
     # ------------------------------------------------------------------
@@ -77,9 +91,23 @@ class BleakHost:
         result_thread.start()
         self._result_loop = result_loop
         self._result_thread = result_thread
-        asyncio.run_coroutine_threadsafe(self._consume_results(), result_loop)
+
+        def _create_consume_task():
+            self._consume_task = result_loop.create_task(self._consume_results())
+
+        result_loop.call_soon_threadsafe(_create_consume_task)
 
     def _stop_result_loop(self):
+        task = getattr(self, '_consume_task', None)
+        if task is not None:
+            try:
+                loop = task.get_loop()
+                if loop is not None and not loop.is_closed():
+                    loop.call_soon_threadsafe(task.cancel)
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error")
+        self._consume_task = None
+
         loop = getattr(self, '_result_loop', None)
         thread = getattr(self, '_result_thread', None)
         if loop is not None and not loop.is_closed():
@@ -97,10 +125,10 @@ class BleakHost:
 
     async def _consume_results(self):
 
-        while True:
+        while not getattr(self, '_should_exit', False):
             try:
                 msg = await asyncio.get_event_loop().run_in_executor(
-                    None, self._result_queue.get, True, 0.5
+                    None, self._result_queue.get, True, 0.1
                 )
             except queue.Empty:
                 continue

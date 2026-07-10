@@ -71,11 +71,13 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     add_device_sig = QtCore.pyqtSignal(str)
     lost_packet_signal = QtCore.pyqtSignal(str, int)
     gesture_signal = QtCore.pyqtSignal(int, int, int, int)
+    device_disconnected_sig = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.discovered_devices = []
         self.current_sensor: SensorProfile = None
+        self._pending_device = None
         self.sensor_controller = SensorController()
         self.thread_pool = QThreadPool.globalInstance()
         self._data_type_pools = {}
@@ -122,6 +124,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.gesture_signal.connect(self._update_gesture_display)
+        self.device_disconnected_sig.connect(self._on_device_disconnected)
 
         self.lost_packet_counts = {}
 
@@ -231,6 +234,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("Not Connected")
         controls_layout.addWidget(self.status_label)
 
+        self.power_label = QtWidgets.QLabel("Power: --%")
+        controls_layout.addWidget(self.power_label)
+
         debug_log_group = QtWidgets.QGroupBox("Debug Log")
         debug_log_layout = QtWidgets.QVBoxLayout()
         self._debug_log_checkbox = QtWidgets.QCheckBox("Enable SDK Debug Log")
@@ -288,8 +294,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         right_layout.addLayout(controls_layout, stretch=1)
         right_layout.addLayout(emg_layout, stretch=4)
 
-        main_layout.addLayout(left_layout, stretch=5)
-        main_layout.addLayout(right_layout, stretch=5)
+        main_layout.addLayout(left_layout, stretch=3)
+        main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
         self.setWindowTitle("SynchroniSDKPython IMU + Quaternion + EMG Demo")
         self.resize(1600, 900)
@@ -329,19 +335,29 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         if device is None:
             return
 
-
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
             self.status_label.setText("Failed to create SensorProfile")
             return
 
-        # 只允许同时连接一个设备，选择新设备时断开旧设备
+        # 只允许同时连接一个设备，选择新设备时先断开旧设备
         if self.current_sensor is not None and self.current_sensor != sensor:
+            self._pending_device = device
             self._disconnect()
-
-        if self.current_sensor == sensor:
             return
-        
+
+        if self.current_sensor is not None and self.current_sensor == sensor:
+            return
+
+        self._do_connect_device(device)
+
+    def _do_connect_device(self, device: BLEDevice):
+        """实际执行连接、初始化、启动数据流（要求当前无已连接设备）。"""
+        sensor = self.sensor_controller.requireSensor(device)
+        if sensor is None:
+            self.status_label.setText("Failed to create SensorProfile")
+            return
+
         sensor.onDataCallback  = self._on_data
         sensor.onStateChanged  = self._on_state_changed
         sensor.onErrorCallback = self._on_error
@@ -393,13 +409,13 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     def _disconnect(self):
         if self.current_sensor:
             self.current_sensor.disconnect()
-            self.current_sensor = None
             self.btn_disconnect.setEnabled(False)
             for cb in self._ntf_checkboxes.values():
                 cb.setEnabled(False)
             for cb in self._filter_checkboxes.values():
                 cb.setEnabled(False)
-            self.status_label.setText("Disconnected")
+            self.status_label.setText("Disconnecting...")
+            self.power_label.setText("Power: --%")
 
     # ── Data Buffers ──────────────────────────────────────────────────────────
 
@@ -460,6 +476,10 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         for pool in self._data_type_pools.values():
             pool.waitForDone()
+        try:
+            self.sensor_controller.terminate()
+        except Exception as e:
+            print(f"[closeEvent] terminate error: {e}")
         event.accept()
 
     def _append_to_buffer(self, data: SensorData):
@@ -870,6 +890,28 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
+        if state == DeviceStateEx.Disconnected and self.current_sensor == sensor:
+            self.device_disconnected_sig.emit()
+
+    def _on_device_disconnected(self):
+        if self._pending_device is not None:
+            pending = self._pending_device
+            self._pending_device = None
+            self.current_sensor = None
+            self._clear_ui_data()
+            self._do_connect_device(pending)
+            return
+
+        if self.current_sensor is None:
+            return
+        self.current_sensor = None
+        self.btn_disconnect.setEnabled(False)
+        for cb in self._ntf_checkboxes.values():
+            cb.setEnabled(False)
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(False)
+        self.status_label.setText("Disconnected (device)")
+        self.power_label.setText("Power: --%")
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
@@ -924,6 +966,14 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
+        self.power_label.setText(f"Power: {power}%")
+
+    def _check_set_param_result(self, key: str, result: str) -> bool:
+        """检查 setParam 结果，若报错则弹出 QMessageBox。返回 True 表示成功。"""
+        if str(result).startswith("Error"):
+            QtWidgets.QMessageBox.warning(self, "Set Parameter Failed", f"Failed to set {key}:\n{result}")
+            return False
+        return True
 
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -934,6 +984,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
                 result = sensor.setParam("DEBUG_LOG_PATH", value)
                 print(f"[Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_LOG_PATH, {value}) -> {result}")
+                self._check_set_param_result("DEBUG_LOG_PATH", result)
 
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -943,6 +994,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
                 result = sensor.setParam("DEBUG_BLE_DATA_PATH", value)
                 print(f"[Data Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_BLE_DATA_PATH, {value}) -> {result}")
+                self._check_set_param_result("DEBUG_BLE_DATA_PATH", result)
 
     def _on_ntf_toggled(self, key: str):
         if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
@@ -956,11 +1008,30 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         print(f"[NTF] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[NTF] setParam({key}, {value}) -> {result}")
-        if not str(result).startswith("Error"):
+        if self._check_set_param_result(key, result):
+            self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
     def _refresh_control_states(self, sensor: SensorProfile):
         """根据设备当前 NTF/FILTER 参数刷新 UI 开关状态。"""
+        info = sensor.getDeviceInfo()
+        channel_map = {
+            "NTF_EMG":   info.EmgChannelCount if info else 0,
+            "NTF_GEST":  info.EmgChannelCount if info else 0,
+            "NTF_EEG":   info.EegChannelCount if info else 0,
+            "NTF_ECG":   info.EcgChannelCount if info else 0,
+            "NTF_PPG":   info.PpgChannelCount if info else 0,
+            "NTF_SPO2":  info.Spo2ChannelCount if info else 0,
+            "NTF_IMU":   max(info.AccChannelCount, info.GyroChannelCount) if info else 0,
+            "NTF_BRTH":  info.BrthChannelCount if info else 0,
+            "NTF_IMPEDANCE": info.ImpeChannelCount if info else 0,
+            "NTF_MAG_ANGLE": info.MagAngleChannelCount if info else 0,
+            "NTF_GFORCE_EULER": info.EulerChannelCount if info else 0,
+            "NTF_GFORCE_QUAT": info.QuatChannelCount if info else 0,
+            "NTF_GFORCE_ACC": info.AccChannelCount if info else 0,
+            "NTF_GFORCE_GYRO": info.GyroChannelCount if info else 0,
+        }
+
         ntf_result = sensor.getParam("NTF")
         print(f"[Refresh] getParam(NTF) -> {ntf_result}")
         if not str(ntf_result).startswith("Error"):
@@ -971,25 +1042,36 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                     key = items[i]
                     value = items[i + 1]
                     cb = self._ntf_checkboxes.get(key)
+                    count = channel_map.get(key, 0)
                     if cb is not None:
-                        cb.setChecked(value == "ON")
+                        cb.setEnabled(count > 0)
+                        if count > 0:
+                            cb.setChecked(value == "ON")
+                        else:
+                            cb.setChecked(False)
             finally:
                 self._updating_ntf_controls = False
 
         filter_result = sensor.getParam("FILTER")
         print(f"[Refresh] getParam(FILTER) -> {filter_result}")
-        if not str(filter_result).startswith("Error"):
-            items = str(filter_result).split("|")
-            self._updating_filter_controls = True
-            try:
+        has_filter = bool(filter_result) and not str(filter_result).startswith("Error")
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(has_filter)
+        self._updating_filter_controls = True
+        try:
+            if has_filter:
+                items = str(filter_result).split("|")
                 for i in range(0, len(items) - 1, 2):
                     key = items[i]
                     value = items[i + 1]
                     cb = self._filter_checkboxes.get(key)
                     if cb is not None:
                         cb.setChecked(value == "ON")
-            finally:
-                self._updating_filter_controls = False
+            else:
+                for cb in self._filter_checkboxes.values():
+                    cb.setChecked(False)
+        finally:
+            self._updating_filter_controls = False
 
     def _on_filter_toggled(self, key: str):
         if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
@@ -1003,7 +1085,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         print(f"[Filter] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[Filter] setParam({key}, {value}) -> {result}")
-        if not str(result).startswith("Error"):
+        if self._check_set_param_result(key, result):
+            self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
     def _clear_ui_data(self):
@@ -1042,4 +1125,5 @@ if __name__ == "__main__":
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
+    app.aboutToQuit.connect(lambda: window.sensor_controller.terminate())
     sys.exit(app.exec_())
