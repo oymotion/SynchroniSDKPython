@@ -12,6 +12,7 @@ _TAG = "sensor_utils"
 _terminated = False
 _TIMEOUT = 10
 BLEAK_RESULT_QUEUE_MAXSIZE = 2000
+BLEAK_DATA_QUEUE_MAXSIZE = 2000
 running_tasks = set()
 _runloop: asyncio.AbstractEventLoop = None
 _event_thread: threading.Thread = None
@@ -36,16 +37,32 @@ def checkRunLoop():
 def Terminate():
     global _runloop, _needCloseRunloop, _event_thread, _terminated
     _terminated = True
-    try:
+
+    def _cancel_tasks():
         for task in asyncio.all_tasks():
             task.cancel()
+
+    try:
+        _cancel_tasks()
+    except RuntimeError:
+        # 当前线程没有运行的事件循环，尝试在管理的 runloop 上取消任务
+        if _runloop is not None and _runloop.is_running():
+            try:
+                _runloop.call_soon_threadsafe(_cancel_tasks)
+                time.sleep(0.1)
+            except Exception as e:
+                SdkLog.exception(_TAG, "Error cancelling tasks during terminate")
     except Exception as e:
         SdkLog.exception(_TAG, "Error cancelling tasks during terminate")
 
     if _needCloseRunloop:
         try:
-            _runloop.stop()
-            _runloop.close()
+            if _runloop is not None and _runloop.is_running():
+                _runloop.call_soon_threadsafe(_runloop.stop)
+            if _event_thread is not None and _event_thread.is_alive():
+                _event_thread.join(timeout=2.0)
+            if _runloop is not None and not _runloop.is_running():
+                _runloop.close()
         except Exception as e:
             SdkLog.exception(_TAG, "Error closing runloop during terminate")
 
