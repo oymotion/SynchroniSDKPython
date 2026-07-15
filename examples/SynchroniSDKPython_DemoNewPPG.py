@@ -966,6 +966,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
             self._pending_device = None
             self.current_sensor = None
             self._clear_ui_data()
+            self._clear_lost_packet_stats()
             self._do_connect_device(pending)
             return
 
@@ -982,6 +983,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         self.hw_version_label.setText("HW Version: --")
         self.fw_version_label.setText("FW Version: --")
         self.power_label.setText("Power: --%")
+        self._clear_lost_packet_stats()
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
@@ -990,6 +992,10 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         self.lost_packet_counts[lost_type] = count
         lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
         self.lost_packet_label.setText("Packet Loss Stats:\n" + "\n".join(lines))
+
+    def _clear_lost_packet_stats(self):
+        self.lost_packet_counts.clear()
+        self.lost_packet_label.setText("Packet Loss Stats: None")
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")

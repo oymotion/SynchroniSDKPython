@@ -38,33 +38,34 @@ def Terminate():
     global _runloop, _needCloseRunloop, _event_thread, _terminated
     _terminated = True
 
+    # 如果不是我们创建的 loop（例如用户自己的 qasync/Qt loop），不要动它
+    if not _needCloseRunloop or _runloop is None:
+        return
+
     def _cancel_tasks():
-        for task in asyncio.all_tasks():
-            task.cancel()
+        try:
+            # 在 loop 线程内部调用，有运行中的事件循环
+            for task in asyncio.all_tasks():
+                if not task.done():
+                    task.cancel()
+        except Exception:
+            # 取消任务失败时不阻塞终止流程
+            pass
 
     try:
-        _cancel_tasks()
-    except RuntimeError:
-        # 当前线程没有运行的事件循环，尝试在管理的 runloop 上取消任务
-        if _runloop is not None and _runloop.is_running():
-            try:
-                _runloop.call_soon_threadsafe(_cancel_tasks)
-                time.sleep(0.1)
-            except Exception as e:
-                SdkLog.exception(_TAG, "Error cancelling tasks during terminate")
-    except Exception as e:
-        SdkLog.exception(_TAG, "Error cancelling tasks during terminate")
+        # 取消 / stop 都必须在 loop 所在线程执行，避免跨线程调用 asyncio API 抛异常
+        if _runloop.is_running():
+            _runloop.call_soon_threadsafe(_cancel_tasks)
+            time.sleep(0.2)
+            _runloop.call_soon_threadsafe(_runloop.stop)
 
-    if _needCloseRunloop:
-        try:
-            if _runloop is not None and _runloop.is_running():
-                _runloop.call_soon_threadsafe(_runloop.stop)
-            if _event_thread is not None and _event_thread.is_alive():
-                _event_thread.join(timeout=2.0)
-            if _runloop is not None and not _runloop.is_running():
-                _runloop.close()
-        except Exception as e:
-            SdkLog.exception(_TAG, "Error closing runloop during terminate")
+        if _event_thread is not None and _event_thread.is_alive():
+            _event_thread.join(timeout=3.0)
+
+        # 不再主动 close loop：Windows 的 ProactorEventLoop 在 still-running 时 close()
+        # 会抛 RuntimeError。守护线程会在 loop stop 后自然退出，进程退出时回收资源。
+    except Exception as e:
+        SdkLog.exception(_TAG, "Error during terminate")
 
 
 def async_exec(function, runloop=None):

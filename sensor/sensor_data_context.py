@@ -544,7 +544,7 @@ class SensorProfileDataCtx:
     async def initIMU(self, packageCount: int) -> int:
         SdkLog.d(_TAG, "initIMU(...)")
         IMU_TYPE_QAT6 = 0x0004
-        min_package_sample_count = 2
+        min_package_sample_count = 2 if self._chip_type == BLEChipType.OYM else 1
         self.isContainQAT6 = False
 
         if not self.hasIMU():
@@ -1099,39 +1099,44 @@ class SensorProfileDataCtx:
                 SdkLog.exception(_TAG, "Unexpected error")
 
             if self.notifyDataFlag & DataSubscription.DNF_CONCAT_BLE != 0:
-                index = 0
-                last_cut = -1
-                data_size = len(self._concatDataBuffer)
-
-                while self._is_running:
-                    if index >= data_size:
-                        break
-
-                    if self._concatDataBuffer[index] == 0x55:
-                        if (index + 1) >= data_size:
-                            index = data_size
-                            continue
-                        n = self._concatDataBuffer[index + 1]
-                        if n < 2 or (index + 1 + n + 1) >= data_size:
-                            index += 1
-                            continue
-                        crc8 = (self._concatDataBuffer[index + 1 + n + 1])
-                        calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2: index + 2 + n])
-                        if crc8 != calc_crc:
-                            index += 1
-                            continue
-                        if self._is_data_transfering:
-                            data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                            if self._processDataPackage(data_package, buf, on_error_callback):
-                                last_cut = index = index + 2 + n
-                        index += 1
-                    else:
-                        index += 1
-
-                if last_cut > 0:
-                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
-                    last_cut = -1
+                try:
                     index = 0
+                    last_cut = -1
+                    data_size = len(self._concatDataBuffer)
+
+                    while self._is_running:
+                        if index >= data_size:
+                            break
+
+                        if self._concatDataBuffer[index] == 0x55:
+                            if (index + 1) >= data_size:
+                                index = data_size
+                                continue
+                            n = self._concatDataBuffer[index + 1]
+                            if n < 2 or (index + 1 + n + 1) >= data_size:
+                                index += 1
+                                continue
+                            crc8 = (self._concatDataBuffer[index + 1 + n + 1])
+                            calc_crc = sensor_utils.calc_crc8(self._concatDataBuffer[index + 2: index + 2 + n])
+                            if crc8 != calc_crc:
+                                index += 1
+                                continue
+                            if self._is_data_transfering:
+                                data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+                                if self._processDataPackage(data_package, buf, on_error_callback):
+                                    last_cut = index = index + 2 + n
+                            index += 1
+                        else:
+                            index += 1
+
+                    if last_cut > 0:
+                        self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
+                        last_cut = -1
+                        index = 0
+
+                    self._last_progress_time = time.time()
+                except Exception as e:
+                    SdkLog.exception(_TAG, "Unexpected error in concat data processing")
 
     def _processDataPackage(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         if not data:
@@ -1240,7 +1245,11 @@ class SensorProfileDataCtx:
             if on_error_callback:
                 on_error_callback("Incomplete Impedance packet received")
             return False
-        
+
+        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
+        self.checkReadSamples(data, sensor_data, 0, -1, on_error_callback)
+        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
+
         for index in range(channelCount):
             impedance = struct.unpack_from("<f", data, offset)[0]
             offset += 4
@@ -1257,20 +1266,24 @@ class SensorProfileDataCtx:
 
         self.impedanceData = impedanceData
         self.saturationData = saturationData
-
-        sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
-        self.checkReadSamples(data, sensor_data, 0, -1)
-        sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
         lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
 
         sensor_data.channelSamples = []
         for index in range(channelCount):
             samples = []
             sample = self._object_pool.acquire_sample()
-            sample.rawData = int(saturationData[index])
-            sample.data = impedanceData[index]
-            sample.impedance = impedanceData[index]
-            sample.saturation = saturationData[index]
+
+            impedanceValue = impedanceData[index]
+            saturationValue = saturationData[index]
+            if not math.isfinite(impedanceValue):
+                impedanceValue = 0.0
+            if not math.isfinite(saturationValue):
+                saturationValue = 0.0
+
+            sample.rawData = int(saturationValue)
+            sample.data = impedanceValue
+            sample.impedance = impedanceValue
+            sample.saturation = saturationValue
             sample.sampleIndex = lastSampleIndex
             sample.timeStampInMs = int(lastSampleIndex * sampleInterval)
             sample.channelIndex = index
@@ -1291,7 +1304,8 @@ class SensorProfileDataCtx:
         if sensor_data_quat is not None:
             frameSize += 12
 
-        return len(data) >= dataOffset + sensor_data_ref.packageSampleCount * frameSize
+        expected = dataOffset + sensor_data_ref.packageSampleCount * frameSize
+        return len(data) == expected
     
     def _process_imu_samples(self, data: bytes, buf: Queue[bytes], on_error_callback=None) -> bool:
         sensor_data_acc = self.sensorDatas[SensorDataType.DATA_TYPE_ACC]
@@ -1398,6 +1412,47 @@ class SensorProfileDataCtx:
             return ReadSamplesResult.Error
         if sensorData is None or sensorData.packageSampleCount <= 0 or sensorData.channelCount <= 0 or sensorData.minPackageSampleCount <= 0 or sensorData.K <= 0:
             return ReadSamplesResult.Error
+
+        def _type_name():
+            try:
+                return DataType(sensorData.dataType).name
+            except Exception:
+                return str(sensorData.dataType)
+
+        # 长度预检：在解析包序号/样本前就发现数据长度不足，并报告数据类型
+        if dataGap >= 0 and sensorData.packageSampleCount > 0:
+            if sensorData.resolutionBits in (7, 8):
+                bytesPerChannel = 1
+            elif sensorData.resolutionBits in (12, 16, 17, 0):
+                bytesPerChannel = 2
+            elif sensorData.resolutionBits == 24:
+                bytesPerChannel = 3
+            elif sensorData.resolutionBits in (31, 32, 33):
+                bytesPerChannel = 4
+            else:
+                bytesPerChannel = 2
+
+            realChannelCount = 0
+            for i in range(sensorData.channelCount):
+                if (sensorData.channelMask & (1 << i)) != 0:
+                    realChannelCount += 1
+
+            expected = (
+                dataOffset
+                + bytesPerChannel * realChannelCount * sensorData.packageSampleCount
+                + dataGap * (sensorData.packageSampleCount - 1)
+            )
+            if dataGap == 0:
+                # 单一流数据包：要求长度完全一致
+                if expected != len(data):
+                    SdkLog.i(_TAG, f"Invalid dataLength:{len(data)} (expected {expected}) for data type {_type_name()}")
+                    return ReadSamplesResult.Error
+            else:
+                # IMU 复合包：允许包含多个子流，只检查长度不足
+                if expected > len(data):
+                    SdkLog.i(_TAG, f"Invalid dataLength:{len(data)} (expected at least {expected}) for data type {_type_name()}")
+                    return ReadSamplesResult.Error
+
         try:
             packageIndex = 0
             maxPackageIndex = 0
@@ -1416,39 +1471,58 @@ class SensorProfileDataCtx:
                 offset += sensorData.packageIndexLength
                 newPackageIndex = packageIndex
                 lastPackageIndex = sensorData.lastPackageIndex
-                if sensorData.lastPackageCounter < 0 and newPackageIndex > 0:
-                    sensorData.lastPackageIndex = lastPackageIndex = newPackageIndex - 1
-                    sensorData.lastPackageCounter = 0
 
-                if packageIndex < lastPackageIndex:
-                    packageIndex += (maxPackageIndex + 1)
-                elif packageIndex == lastPackageIndex:
+                # 首包：把上一包序号设为合法的前一个值，便于后续统一判断
+                if sensorData.lastPackageCounter < 0:
+                    sensorData.lastPackageCounter = 0
+                    if newPackageIndex > 0:
+                        lastPackageIndex = newPackageIndex - 1
+                    else:
+                        lastPackageIndex = maxPackageIndex
+                    sensorData.lastPackageIndex = lastPackageIndex
+
+                # 合法翻卷区间：last 在 [max-2, max] 且 new 在 [0, 2]
+                if newPackageIndex <= 2 and lastPackageIndex >= maxPackageIndex - 2:
+                    packageIndex = maxPackageIndex + 1 + newPackageIndex
+                elif newPackageIndex == lastPackageIndex:
                     return ReadSamplesResult.Repeated
+                elif newPackageIndex < lastPackageIndex:
+                    SdkLog.i(_TAG, (
+                        "Illegal package index backward|MAC|" + str(sensorData.deviceMac)
+                        + "|TYPE|" + str(sensorData.dataType)
+                        + "|LAST_IDX|" + str(lastPackageIndex)
+                        + "|CURR_IDX|" + str(newPackageIndex)
+                        + "|DELTA|" + str(lastPackageIndex - newPackageIndex)
+                    ))
+                    return ReadSamplesResult.Error
 
                 deltaPackageIndex = packageIndex - lastPackageIndex
+                if deltaPackageIndex > 20:
+                    SdkLog.i(_TAG, (
+                        "Illegal package index jump|MAC|" + str(sensorData.deviceMac)
+                        + "|TYPE|" + str(sensorData.dataType)
+                        + "|LAST_IDX|" + str(lastPackageIndex)
+                        + "|CURR_IDX|" + str(newPackageIndex)
+                        + "|DELTA|" + str(deltaPackageIndex)
+                    ))
+                    return ReadSamplesResult.Error
+
                 lostPackageCounter = deltaPackageIndex - 1
-                if lostPackageCounter > 65534:
-                    lostPackageCounter = 1
-                elif lostPackageCounter > 50:
-                    lostPackageCounter = 50
                 sensorData.lostPackageCount = sensorData.lostPackageCount + lostPackageCounter
 
                 if deltaPackageIndex > 1:
-                    lostSampleCount = sensorData.packageSampleCount * (deltaPackageIndex - 1)
+                    lostSampleCount = sensorData.packageSampleCount * lostPackageCounter
                     SdkLog.i(_TAG, (
                         "MSG|LOST SAMPLE|MAC|" + str(sensorData.deviceMac)
                         + "|TYPE|" + str(sensorData.dataType)
                         + "|COUNT|" + str(lostSampleCount)
                     ))
 
-                    if lostSampleCount < 100:
+                    if lostPackageCounter < 20:
                         self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
 
-                    if newPackageIndex == 0:
-                        sensorData.lastPackageIndex = maxPackageIndex
-                    else:
-                        sensorData.lastPackageIndex = newPackageIndex - 1
-                    sensorData.lastPackageCounter += deltaPackageIndex - 1
+                    sensorData.lastPackageIndex = newPackageIndex - 1
+                    sensorData.lastPackageCounter += lostPackageCounter
 
                 sensorData.lastPackageIndex = newPackageIndex
 
@@ -1476,31 +1550,15 @@ class SensorProfileDataCtx:
             lostSampleCount: int,
     ):
         sampleCount = sensorData.packageSampleCount
+        def _type_name():
+            try:
+                return DataType(sensorData.dataType).name
+            except Exception:
+                return str(sensorData.dataType)
+
         if lostSampleCount <= 0:
             if data is None or offset < 0 or offset > len(data):
-                raise ValueError("Invalid data or offset")
-
-            if sensorData.resolutionBits in (7, 8):
-                bytesPerChannel = 1
-            elif sensorData.resolutionBits in (12, 16, 17, 0):
-                bytesPerChannel = 2
-            elif sensorData.resolutionBits == 24:
-                bytesPerChannel = 3
-            elif sensorData.resolutionBits in (31, 32, 33):
-                bytesPerChannel = 4
-            else:
-                bytesPerChannel = 2
-
-            dataLength = len(data)
-
-            realChannelCount = 0
-            for channelIndex, impedanceChannelIndex in enumerate(range(sensorData.channelCount)):
-                if (sensorData.channelMask & (1 << channelIndex)) != 0:
-                    realChannelCount += 1
-
-            if offset + ((bytesPerChannel  * realChannelCount * sampleCount) + (dataGap * (sampleCount - 1)))  > dataLength:
-                raise ValueError(f"Invalid dataLength:{dataLength}")
-        
+                raise ValueError(f"Invalid data or offset for data type {_type_name()}")
 
         sampleInterval = (
             int(1000.0 / sensorData.sampleRate) if sensorData.sampleRate > 0 else 0
@@ -1742,55 +1800,60 @@ class SensorProfileDataCtx:
             except Exception as e:
                 SdkLog.exception(_TAG, "Error reading raw data buffer")
 
-            index = 0
-            last_cut = -1
-            data_size = len(self._concatDataBuffer)
-
-            while self._is_running:
-                if index >= data_size:
-                    break
-
-                if self._concatDataBuffer[index] == 0x55:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    if self._is_data_transfering:
-                        data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-                        if self._processDataPackage(data_package, buf, on_error_callback):
-                            last_cut = index = index + 2 + n + 1
-                    index += 1
-                elif self._concatDataBuffer[index] == 0xAA:
-                    if (index + 1) >= data_size:
-                        index = data_size
-                        continue
-                    n = self._concatDataBuffer[index + 1]
-                    if n < 2 or (index + 1 + n + 2) >= data_size:
-                        index += 1
-                        continue
-                    crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
-                    calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
-                    if crc16 != calc_crc:
-                        index += 1
-                        continue
-                    data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
-
-                    if not sensor_utils._terminated:
-                        await self.gForce.async_on_cmd_response(data_package)
-                    last_cut = index = index + 2 + n + 1
-                    index += 1
-                else:
-                    index += 1
-
-            if last_cut > 0:
-                self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
-                last_cut = -1
+            try:
                 index = 0
+                last_cut = -1
+                data_size = len(self._concatDataBuffer)
+
+                while self._is_running:
+                    if index >= data_size:
+                        break
+
+                    if self._concatDataBuffer[index] == 0x55:
+                        if (index + 1) >= data_size:
+                            index = data_size
+                            continue
+                        n = self._concatDataBuffer[index + 1]
+                        if n < 2 or (index + 1 + n + 2) >= data_size:
+                            index += 1
+                            continue
+                        crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                        calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
+                        if crc16 != calc_crc:
+                            index += 1
+                            continue
+                        if self._is_data_transfering:
+                            data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+                            if self._processDataPackage(data_package, buf, on_error_callback):
+                                last_cut = index = index + 2 + n + 1
+                        index += 1
+                    elif self._concatDataBuffer[index] == 0xAA:
+                        if (index + 1) >= data_size:
+                            index = data_size
+                            continue
+                        n = self._concatDataBuffer[index + 1]
+                        if n < 2 or (index + 1 + n + 2) >= data_size:
+                            index += 1
+                            continue
+                        crc16 = (self._concatDataBuffer[index + 1 + n + 2] << 8) | self._concatDataBuffer[index + 1 + n + 1]
+                        calc_crc = sensor_utils.crc16_cal(self._concatDataBuffer[index + 2: index + 2 + n], n)
+                        if crc16 != calc_crc:
+                            index += 1
+                            continue
+                        data_package = bytes(self._concatDataBuffer[index + 2: index + 2 + n])
+
+                        if not sensor_utils._terminated:
+                            await self.gForce.async_on_cmd_response(data_package)
+                        last_cut = index = index + 2 + n + 1
+                        index += 1
+                    else:
+                        index += 1
+
+                if last_cut > 0:
+                    self._concatDataBuffer = self._concatDataBuffer[last_cut + 1:]
+                    last_cut = -1
+                    index = 0
+
+                self._last_progress_time = time.time()
+            except Exception as e:
+                SdkLog.exception(_TAG, "Unexpected error in universal concat data processing")
