@@ -714,7 +714,11 @@ class SensorProfileDataCtx:
             data.clear()
             self.sensorDatas[SensorDataType.DATA_TYPE_EULER] = data
 
-        self.notifyDataFlag |= DataSubscription.DNF_IMU
+        # EEG + OYM 设备默认不订阅 IMU；带 PPG 的设备保留
+        if not (self._chip_type == BLEChipType.OYM
+                and self.hasEEG()
+                and not self.hasPPG()):
+            self.notifyDataFlag |= DataSubscription.DNF_IMU
         if self._device_info is not None:
             self._device_info.AccChannelCount = 3
             self._device_info.GyroChannelCount = 3
@@ -869,6 +873,16 @@ class SensorProfileDataCtx:
             info = await self.fetchDeviceInfo()
             self._device_info = info
             await self.initDataTransfer(True)
+
+            # EEG + OYM 设备默认关闭 IMU；带 PPG 的设备保留 IMU 默认开启
+            if (self._chip_type == BLEChipType.OYM
+                    and self.hasEEG()
+                    and not self.hasPPG()):
+                self.notify_map["NTF_IMU"] = "OFF"
+                self.notify_map["NTF_GFORCE_ACC"] = "OFF"
+                self.notify_map["NTF_GFORCE_GYRO"] = "OFF"
+                self.notify_map["NTF_GFORCE_QUAT"] = "OFF"
+                self.notify_map["NTF_GFORCE_EULER"] = "OFF"
 
             if self.hasConcatBLE():
                 self.notifyDataFlag |= DataSubscription.DNF_CONCAT_BLE
