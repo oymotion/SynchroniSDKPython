@@ -9,7 +9,7 @@ import struct
 import math
 import threading
 import time
-from typing import Deque, List
+from typing import Deque, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from sensor import sensor_utils
@@ -30,6 +30,8 @@ QUAT_SCALE = 1 / 1073741824.0  # 2^30
 _MAX_CONCAT_BUFFER_SIZE = 64 * 1024  # 64KB
 # data 日志队列最大长度，写盘跟不上时丢弃日志而不是阻塞解析线程
 _DATA_LOG_QUEUE_MAXSIZE = 1000
+# 包序号最大允许跳变值，超过视为非法跳变/丢包
+_MAX_ALLOWED_PACKAGE_INDEX_DELTA = 100
 
 class SensorDataType(IntEnum):
     DATA_TYPE_EEG = 0
@@ -83,7 +85,13 @@ class ReadSamplesResult(IntEnum):
 
 
 class SensorProfileDataCtx:
-    def __init__(self, gForce: GForce, deviceMac: str, buf: Queue[bytes]):
+    def __init__(
+        self,
+        gForce: GForce,
+        deviceMac: str,
+        buf: Queue[bytes],
+        on_reconnect_request: Optional[callable] = None,
+    ):
         self.featureMap = 0
         self.notifyDataFlag: DataSubscription = 0
 
@@ -150,6 +158,15 @@ class SensorProfileDataCtx:
         self._watchdog_thread.daemon = True
         self._watchdog_thread.start()
 
+        # 非法跳变监控：持续超过阈值则重启数据通知
+        self._illegal_jump_start_time: Optional[float] = None
+        self._is_restarting_stream = False
+
+        # 命令失败导致异常断开后自动重连
+        self._on_reconnect_request = on_reconnect_request
+        self._disconnected_start_time: Optional[float] = None
+        self._reconnect_requested = False
+
     def close(self):
         self._is_running = False
         if self.debugCSVWriter != None:
@@ -188,10 +205,28 @@ class SensorProfileDataCtx:
                 pass
             self._watchdog_thread = None
 
+    async def _restart_streaming(self):
+        """非法跳变持续时重启数据通知。"""
+        if self._is_restarting_stream:
+            return
+        self._is_restarting_stream = True
+        try:
+            SdkLog.w(_TAG, f"Illegal package index jump persisted > 5s, restarting data notification for {self.deviceMac}")
+            await self.stop_streaming()
+            await self.start_streaming(self._rawDataBuffer)
+            self._illegal_jump_start_time = None
+        except Exception as e:
+            SdkLog.exception(_TAG, f"Restart streaming failed for {self.deviceMac}: {e}")
+        finally:
+            self._is_restarting_stream = False
+
     def _watchdog_loop(self):
         """守护线程：监控解析线程进度，防止卡死后内存无限增长。"""
         WATCHDOG_INTERVAL = 1.0  # 检查间隔
         WATCHDOG_TIMEOUT = 5.0   # 无进度报警阈值
+        ILLEGAL_JUMP_TIMEOUT = 5.0  # 非法跳变持续阈值
+        RECONNECT_AFTER_DISCONNECT = 3.0  # 断开后等待多久尝试重连
+        RECENT_CMD_FAILURE_WINDOW = 30.0  # 命令失败多久内视为相关
         RAW_BUF_CLEAR_THRESHOLD = 1500  # 超过此值且无进度时清空
 
         while not self._watchdog_stop_event.is_set():
@@ -229,6 +264,46 @@ class SensorProfileDataCtx:
                         self._concatDataBuffer.clear()
                         # 清空后更新时间戳，避免持续报警
                         self._last_progress_time = time.time()
+
+                # 非法跳变持续超过阈值则重启数据通知
+                if (self._illegal_jump_start_time is not None
+                        and not self._is_restarting_stream
+                        and self.isDataTransfering):
+                    jump_elapsed = time.time() - self._illegal_jump_start_time
+                    if jump_elapsed > ILLEGAL_JUMP_TIMEOUT:
+                        SdkLog.w(_TAG, f"Illegal jump persisted for {jump_elapsed:.1f}s, restarting stream for {self.deviceMac}")
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._restart_streaming(), self.gForce.gforce_event_loop
+                            )
+                        except Exception as e:
+                            SdkLog.exception(_TAG, f"Failed to schedule stream restart for {self.deviceMac}: {e}")
+
+                # 命令失败后设备异常断开，触发自动重连
+                if self._on_reconnect_request is not None:
+                    client = getattr(self.gForce, "client", None)
+                    is_connected = getattr(client, "is_connected", False) if client is not None else False
+                    if is_connected:
+                        self._disconnected_start_time = None
+                        self._reconnect_requested = False
+                    else:
+                        if self._disconnected_start_time is None:
+                            self._disconnected_start_time = time.time()
+                        disconnected_elapsed = time.time() - self._disconnected_start_time
+                        cmd_fail_time = getattr(self.gForce, "last_command_failure_time", None)
+                        recent_cmd_failure = (
+                            cmd_fail_time is not None
+                            and (time.time() - cmd_fail_time) < RECENT_CMD_FAILURE_WINDOW
+                        )
+                        if (disconnected_elapsed > RECONNECT_AFTER_DISCONNECT
+                                and recent_cmd_failure
+                                and not self._reconnect_requested):
+                            SdkLog.w(_TAG, f"Device disconnected after command failure, scheduling reconnect for {self.deviceMac}")
+                            self._reconnect_requested = True
+                            try:
+                                self._on_reconnect_request()
+                            except Exception as e:
+                                SdkLog.exception(_TAG, f"Reconnect request failed for {self.deviceMac}: {e}")
             except Exception as e:
                 SdkLog.exception(_TAG, f"Watchdog error: {e}")
 
@@ -407,6 +482,15 @@ class SensorProfileDataCtx:
 
         self.sensorDatas[SensorDataType.DATA_TYPE_EMG] = data
         self.isNewEMG = isNewEMG
+
+        # 新 EMG + OYM 芯片：默认只开 EMG，关闭 Gesture 和 IMU
+        if isNewEMG and self._chip_type == BLEChipType.OYM:
+            self.notify_map["NTF_GEST"] = "OFF"
+            self.notify_map["NTF_IMU"] = "OFF"
+            self.notify_map["NTF_GFORCE_ACC"] = "OFF"
+            self.notify_map["NTF_GFORCE_GYRO"] = "OFF"
+            self.notify_map["NTF_GFORCE_QUAT"] = "OFF"
+            self.notify_map["NTF_GFORCE_EULER"] = "OFF"
 
         # 老 EMG 设备不支持 FILTER
         if not isNewEMG:
@@ -1489,6 +1573,7 @@ class SensorProfileDataCtx:
                 if newPackageIndex <= 2 and lastPackageIndex >= maxPackageIndex - 2:
                     packageIndex = maxPackageIndex + 1 + newPackageIndex
                 elif newPackageIndex == lastPackageIndex:
+                    self._illegal_jump_start_time = None
                     return ReadSamplesResult.Repeated
                 elif newPackageIndex < lastPackageIndex:
                     SdkLog.i(_TAG, (
@@ -1498,10 +1583,12 @@ class SensorProfileDataCtx:
                         + "|CURR_IDX|" + str(newPackageIndex)
                         + "|DELTA|" + str(lastPackageIndex - newPackageIndex)
                     ))
+                    if self._illegal_jump_start_time is None:
+                        self._illegal_jump_start_time = time.time()
                     return ReadSamplesResult.Error
 
                 deltaPackageIndex = packageIndex - lastPackageIndex
-                if deltaPackageIndex > 20:
+                if deltaPackageIndex > _MAX_ALLOWED_PACKAGE_INDEX_DELTA:
                     SdkLog.i(_TAG, (
                         "Illegal package index jump|MAC|" + str(sensorData.deviceMac)
                         + "|TYPE|" + str(sensorData.dataType)
@@ -1509,6 +1596,8 @@ class SensorProfileDataCtx:
                         + "|CURR_IDX|" + str(newPackageIndex)
                         + "|DELTA|" + str(deltaPackageIndex)
                     ))
+                    if self._illegal_jump_start_time is None:
+                        self._illegal_jump_start_time = time.time()
                     return ReadSamplesResult.Error
 
                 lostPackageCounter = deltaPackageIndex - 1
@@ -1522,7 +1611,7 @@ class SensorProfileDataCtx:
                         + "|COUNT|" + str(lostSampleCount)
                     ))
 
-                    if lostPackageCounter < 20:
+                    if lostPackageCounter < _MAX_ALLOWED_PACKAGE_INDEX_DELTA:
                         self.readSamples(data, sensorData, 0, dataGap, lostSampleCount)
 
                     sensorData.lastPackageIndex = newPackageIndex - 1
@@ -1534,6 +1623,7 @@ class SensorProfileDataCtx:
                 self.readSamples(data, sensorData, dataOffset, dataGap, 0)
 
             sensorData.lastPackageCounter += 1
+            self._illegal_jump_start_time = None
         except Exception as e:
             SdkLog.exception(_TAG, "Unexpected error")
             return ReadSamplesResult.Error
