@@ -1296,7 +1296,11 @@ class SensorProfileDataCtx:
         if sensor_data is None or sensor_data.sampleRate <= 0:
             return True
 
-        self.checkReadSamples(data, sensor_data, 0, -1)
+        res = self.checkReadSamples(data, sensor_data, 0, -1, on_error_callback)
+        if res == ReadSamplesResult.Error:
+            return False
+        if res == ReadSamplesResult.Repeated:
+            return True
         sampleInterval = 1000.0 / sensor_data.sampleRate
         lastSampleIndex = sensor_data.lastPackageCounter * sensor_data.packageSampleCount
         sensor_data.channelSamples = []
@@ -1349,7 +1353,11 @@ class SensorProfileDataCtx:
             return False
 
         sensor_data = self.sensorDatas[SensorDataType.DATA_TYPE_IMPEDANCE]
-        self.checkReadSamples(data, sensor_data, 0, -1, on_error_callback)
+        res = self.checkReadSamples(data, sensor_data, 0, -1, on_error_callback)
+        if res == ReadSamplesResult.Error:
+            return False
+        if res == ReadSamplesResult.Repeated:
+            return True
         sampleInterval = 1000.0 / sensor_data.sampleRate if sensor_data.sampleRate > 0 else 0
 
         for index in range(channelCount):
