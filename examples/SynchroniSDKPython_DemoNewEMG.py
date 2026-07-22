@@ -1,7 +1,12 @@
 import sys
 import signal
+import time
+import subprocess
 import multiprocessing
-from typing import List
+import os
+import threading
+from pathlib import Path
+from typing import List, Optional
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -54,6 +59,14 @@ FIXED_Y_RANGES = {
     DataType.NTF_QUATERNION: (-1, 1),
 }
 
+GESTURE_DEFAULT_TEXT = (
+    "Gesture:\n"
+    "  gesture: -- (0-8)\n"
+    "  raw gesture: -- (0-8)\n"
+    "  possiblity: -- (0-100)\n"
+    "  strength: -- (0-100)"
+)
+
 
 class DataTask(QRunnable):
     def __init__(self, callback, data):
@@ -68,44 +81,193 @@ class DataTask(QRunnable):
             print(f"[DataTask] Exception: {e}")
 
 
+class DeviceDataState:
+    """单个已连接设备的数据缓冲与显示状态。多设备连接时每个设备各持有一份。"""
+
+    def __init__(self, sensor: SensorProfile):
+        self.sensor = sensor
+        self.info: Optional[DeviceInfo] = None
+        self.last_power: Optional[int] = None
+        self.status_text = ""
+        self.lost_counts: dict = {}
+        self.ntf_states: dict = {}     # key -> (enabled, checked)
+        self.filter_states: dict = {}  # key -> (enabled, checked)
+        self.gesture = None            # (gesture, raw_gesture, possiblity, strength)
+
+        self.buffers: dict = {}
+        self.sample_rates: dict = {}
+        self.sample_index_buffers: dict = {}
+        self.buffer_indices: dict = {}
+        self.buffer_locks: dict = {}
+
+        self.emg_buffer = None
+        self.emg_sample_index_buffer = None
+        self.emg_buffer_index = 0
+        self.emg_sample_rate = 0
+        self.emg_display_channels = 0
+        self.emg_impedance: list = []
+        self.emg_buffer_lock = QtCore.QMutex()
+
+        self.quaternion = [1.0, 0.0, 0.0, 0.0]
+        self.quaternion_lock = QtCore.QMutex()
+
+    def get_buffer_lock(self, data_type):
+        lock = self.buffer_locks.get(data_type)
+        if lock is None:
+            lock = QtCore.QMutex()
+            self.buffer_locks[data_type] = lock
+        return lock
+
+    def init_buffers(self, info: DeviceInfo, emg_axis_count: int):
+        configs = [
+            (DataType.NTF_ACC,        info.AccSampleRate,   info.AccChannelCount),
+            (DataType.NTF_GYRO,       info.GyroSampleRate,  info.GyroChannelCount),
+            (DataType.NTF_EULER_DATA, info.EulerSampleRate, info.EulerChannelCount),
+            (DataType.NTF_QUATERNION, info.QuatSampleRate,  info.QuatChannelCount),
+        ]
+        for dt, sr, ch in configs:
+            if sr > 0 and ch > 0:
+                buf_len = max(sr * BUFFER_SECONDS, 1)
+                self.buffers[dt]               = np.zeros((ch, buf_len))
+                self.sample_index_buffers[dt]  = np.zeros((ch, buf_len), dtype=np.int64)
+                self.sample_rates[dt]          = sr
+                self.buffer_indices[dt]        = 0
+
+        if info.EmgSampleRate > 0 and info.EmgChannelCount > 0:
+            self.emg_sample_rate = info.EmgSampleRate
+            display_channels = min(info.EmgChannelCount, emg_axis_count)
+            self.emg_display_channels = display_channels
+            self.emg_buffer_index = 0
+            self.emg_impedance = [None] * display_channels
+            buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.emg_buffer = np.zeros((display_channels, buf_len))
+            self.emg_sample_index_buffer = np.zeros((display_channels, buf_len), dtype=np.int64)
+
+    def append_data(self, data: SensorData):
+        if data.dataType == DataType.NTF_EMG:
+            self.emg_buffer_lock.lock()
+            try:
+                buf = self.emg_buffer
+                idx_buf = self.emg_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self.emg_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                    while len(self.emg_impedance) <= ch_idx:
+                        self.emg_impedance.append(None)
+                    if ch_samples:
+                        self.emg_impedance[ch_idx] = ch_samples[-1].impedance
+                self.emg_buffer_index = (self.emg_buffer_index + n) % buf_len
+            finally:
+                self.emg_buffer_lock.unlock()
+            return
+
+        lock = self.get_buffer_lock(data.dataType)
+        lock.lock()
+        try:
+            buf = self.buffers.get(data.dataType)
+            idx_buf = self.sample_index_buffers.get(data.dataType)
+            if buf is None or idx_buf is None:
+                return
+            buf_len = buf.shape[1]
+            n = 0
+            buffer_index = self.buffer_indices.get(data.dataType, 0)
+            for ch_idx, ch_samples in enumerate(data.channelSamples):
+                if ch_idx >= buf.shape[0]:
+                    break
+                new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                n = min(len(new_vals), buf_len)
+                if n == 0:
+                    continue
+                write_start = buffer_index
+                write_end = write_start + n
+                new_vals = new_vals[-n:]
+                new_indices = new_indices[-n:]
+                if write_end <= buf_len:
+                    buf[ch_idx, write_start:write_end] = new_vals
+                    idx_buf[ch_idx, write_start:write_end] = new_indices
+                else:
+                    first_part = buf_len - write_start
+                    buf[ch_idx, write_start:] = new_vals[:first_part]
+                    buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                    idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                    idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+            self.buffer_indices[data.dataType] = (buffer_index + n) % buf_len
+        finally:
+            lock.unlock()
+
+    def clear_buffers(self):
+        """清空本设备所有数据缓冲区，等待新数据。"""
+        for dt in list(self.buffers.keys()):
+            lock = self.get_buffer_lock(dt)
+            lock.lock()
+            try:
+                self.buffers[dt].fill(0)
+                self.sample_index_buffers[dt].fill(0)
+                self.buffer_indices[dt] = 0
+            finally:
+                lock.unlock()
+
+        self.emg_buffer_lock.lock()
+        try:
+            if self.emg_buffer is not None:
+                self.emg_buffer.fill(0)
+                self.emg_sample_index_buffer.fill(0)
+                self.emg_buffer_index = 0
+        finally:
+            self.emg_buffer_lock.unlock()
+
+
 class IMUQuaternionEMGDemo(QtWidgets.QWidget):
-    data_received  = QtCore.pyqtSignal(object)
+    data_received  = QtCore.pyqtSignal(object, object)            # (address, SensorData)
     add_device_sig = QtCore.pyqtSignal(str)
-    lost_packet_signal = QtCore.pyqtSignal(str, int)
-    gesture_signal = QtCore.pyqtSignal(int, int, int, int)
-    device_disconnected_sig = QtCore.pyqtSignal()
+    lost_packet_signal = QtCore.pyqtSignal(str, str, int)         # (address, type_name, count)
+    gesture_signal = QtCore.pyqtSignal(str, int, int, int, int)   # (address, gesture, raw, possiblity, strength)
+    device_disconnected_sig = QtCore.pyqtSignal(str)              # address
+    replay_done_sig = QtCore.pyqtSignal(str)
+    analyze_done_sig = QtCore.pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
         self.discovered_devices = []
-        self.current_sensor: SensorProfile = None
-        self._pending_device = None
+        self.current_sensor: SensorProfile = None   # 当前在列表中选中、正在显示的设备
+        self.device_states: dict = {}               # Address -> DeviceDataState（已连接设备）
         self.sensor_controller = SensorController()
         self.thread_pool = QThreadPool.globalInstance()
-        self._data_type_pools = {}
+        self._data_type_pools = {}                  # (Address, DataType) -> QThreadPool
 
         self.active_data_type = DataType.NTF_ACC
-        self.buffers = {}
-        self.sample_rates = {}
-        self._sample_index_buffers = {}
-        self._buffer_indices = {}
         self._last_plotted_sample_indices = {}
         self.lines_2d = []
 
-        self.current_quaternion = [1.0, 0.0, 0.0, 0.0]
-        self.quaternion_lock = QtCore.QMutex()
-        self._buffer_locks = {}
-        self._emg_buffer_lock = QtCore.QMutex()
+        self._last_drawn_quaternion = None
+        self._last_3d_update_time = 0.0
         self.cube_vertices = None
         self.cube_faces = None
 
-        self.emg_buffer = None
-        self._emg_sample_index_buffer = None
-        self.emg_sample_rate = 0
         self.emg_lines = []
-        self.emg_impedance = []
-        self._emg_buffer_index = 0
-        self._emg_display_channels = 0
 
         self._updating_ntf_controls = False
         self._updating_filter_controls = False
@@ -114,7 +276,11 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._ntf_checkboxes: dict = {}
         self._filter_checkboxes: dict = {}
         self._debug_log_enabled = True
-        self._data_debug_log_enabled = False
+        self._data_debug_log_enabled = True
+        self._replay_thread = None
+        self._replay_sensor = None
+        self._replay_paused = False
+        self._replay_stop_requested = False
 
         self._init_ui()
 
@@ -127,8 +293,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.gesture_signal.connect(self._update_gesture_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
-
-        self.lost_packet_counts = {}
+        self.replay_done_sig.connect(self._on_replay_done)
+        self.analyze_done_sig.connect(self._on_analyze_done)
 
         if not self.sensor_controller.hasDeviceFoundCallback:
             self.sensor_controller.onDeviceFoundCallback = self._on_device_found
@@ -171,19 +337,46 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.btn_stop_scan.clicked.connect(self._stop_scan)
         self.btn_stop_scan.setEnabled(False)
 
+        self.btn_connect = QtWidgets.QPushButton("Connect")
+        self.btn_connect.clicked.connect(self._connect_selected_device)
+        self.btn_connect.setEnabled(False)
+
         self.btn_disconnect = QtWidgets.QPushButton("Disconnect")
-        self.btn_disconnect.clicked.connect(self._disconnect)
+        self.btn_disconnect.clicked.connect(self._disconnect_selected_device)
         self.btn_disconnect.setEnabled(False)
+
+        self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
+        self.btn_replay.clicked.connect(self._replay_bin_file)
+
+        self.btn_analyze = QtWidgets.QPushButton("Analyze Bin")
+        self.btn_analyze.clicked.connect(self._analyze_bin_file)
+
+        self.btn_replay_pause = QtWidgets.QPushButton("Pause Replay")
+        self.btn_replay_pause.clicked.connect(self._toggle_replay_pause)
+        self.btn_replay_pause.setEnabled(False)
+
+        self.btn_replay_stop = QtWidgets.QPushButton("Stop Replay")
+        self.btn_replay_stop.clicked.connect(self._stop_replay)
+        self.btn_replay_stop.setEnabled(False)
 
         button_layout = QtWidgets.QVBoxLayout()
         button_layout.addWidget(self.btn_scan)
         button_layout.addWidget(self.btn_stop_scan)
+        button_layout.addWidget(self.btn_connect)
         button_layout.addWidget(self.btn_disconnect)
         button_layout.addStretch()
 
+        # 回放按钮放在控制行最右边
+        replay_button_layout = QtWidgets.QVBoxLayout()
+        replay_button_layout.addWidget(self.btn_replay)
+        replay_button_layout.addWidget(self.btn_analyze)
+        replay_button_layout.addWidget(self.btn_replay_pause)
+        replay_button_layout.addWidget(self.btn_replay_stop)
+        replay_button_layout.addStretch()
+
         self.device_list = QtWidgets.QListWidget()
         self.device_list.setMaximumHeight(80)
-        self.device_list.itemClicked.connect(self._connect_device)
+        self.device_list.itemClicked.connect(self._on_device_selected)
 
         device_layout = QtWidgets.QVBoxLayout()
         device_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
@@ -192,7 +385,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         scan_layout = QtWidgets.QHBoxLayout()
         scan_layout.addLayout(button_layout)
         scan_layout.addLayout(device_layout, stretch=1)
-
+        scan_layout.addLayout(replay_button_layout)
         controls_layout.addLayout(scan_layout)
 
         type_layout = QtWidgets.QVBoxLayout()
@@ -216,7 +409,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         lost_packet_layout.addWidget(self.lost_packet_label)
         self.lost_packet_box.setLayout(lost_packet_layout)
 
-        self.gesture_label = QtWidgets.QLabel("Gesture:\n  gesture: -- (0-8)\n  raw gesture: -- (0-8)\n  possiblity: -- (0-100)\n  strength: -- (0-100)")
+        self.gesture_label = QtWidgets.QLabel(GESTURE_DEFAULT_TEXT)
         self.gesture_label.setWordWrap(True)
         self.gesture_box = QtWidgets.QGroupBox("Gesture")
         gesture_layout = QtWidgets.QVBoxLayout()
@@ -255,6 +448,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._debug_log_checkbox.stateChanged.connect(self._on_debug_log_toggled)
         debug_log_layout.addWidget(self._debug_log_checkbox)
         self._data_debug_log_checkbox = QtWidgets.QCheckBox("Enable Data Debug Log")
+        self._data_debug_log_checkbox.setChecked(True)
         self._data_debug_log_checkbox.stateChanged.connect(self._on_data_debug_log_toggled)
         debug_log_layout.addWidget(self._data_debug_log_checkbox)
         debug_log_group.setLayout(debug_log_layout)
@@ -331,7 +525,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
     def _on_device_found(self, device_list: List[BLEDevice]):
         self._stop_scan()
-        filtered = filter(lambda x: x.Name.startswith("OY") or x.Name.startswith("Sync") or x.Name.startswith("gForce"), device_list)
+        filtered = filter(lambda x: x.Name.startswith("OY") or x.Name.startswith("gForce"), device_list)
         for d in filtered:
             if d.Address not in [x.Address for x in self.discovered_devices]:
                 self.discovered_devices.append(d)
@@ -340,31 +534,61 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     def _add_device_item(self, text: str):
         self.device_list.addItem(text)
 
-    def _connect_device(self, item):
-        text = item.text()
-        addr = text.split("Address: ")[1].strip()
-        device = next((d for d in self.discovered_devices if d.Address == addr), None)
+    def _selected_address(self) -> Optional[str]:
+        item = self.device_list.currentItem()
+        if item is None or "Address: " not in item.text():
+            return None
+        return item.text().split("Address: ")[1].strip()
+
+    def _selected_list_device(self) -> Optional[BLEDevice]:
+        addr = self._selected_address()
+        if addr is None:
+            return None
+        return next((d for d in self.discovered_devices if d.Address == addr), None)
+
+    def _current_state(self) -> Optional[DeviceDataState]:
+        """当前显示设备对应的 DeviceDataState，未连接时返回 None。"""
+        if self.current_sensor is None:
+            return None
+        return self.device_states.get(self.current_sensor.BLEDevice.Address)
+
+    def _on_device_selected(self, item):
+        """单击设备列表只切换当前显示的设备，不触发连接。"""
+        addr = item.text().split("Address: ")[1].strip() if "Address: " in item.text() else None
+        state = self.device_states.get(addr) if addr else None
+        self.current_sensor = state.sensor if state is not None else None
+        self._refresh_display_for_state(state)
+        self._update_button_states()
+
+    def _update_button_states(self):
+        addr = self._selected_address()
+        connected = addr is not None and addr in self.device_states
+        self.btn_connect.setEnabled(addr is not None and not connected)
+        self.btn_disconnect.setEnabled(connected)
+
+    def _update_device_item_text(self, addr: str, connected: bool):
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            text = item.text()
+            if f"Address: {addr}" not in text:
+                continue
+            if text.startswith("[Connected] "):
+                text = text[len("[Connected] "):]
+            if connected:
+                text = "[Connected] " + text
+            item.setText(text)
+            break
+
+    def _connect_selected_device(self):
+        """连接列表中选中的设备，支持同时连接多台设备。"""
+        device = self._selected_list_device()
         if device is None:
+            self.status_label.setText("Please select a device in the list first")
+            return
+        addr = device.Address
+        if addr in self.device_states:
             return
 
-        sensor = self.sensor_controller.requireSensor(device)
-        if sensor is None:
-            self.status_label.setText("Failed to create SensorProfile")
-            return
-
-        # 只允许同时连接一个设备，选择新设备时先断开旧设备
-        if self.current_sensor is not None and self.current_sensor != sensor:
-            self._pending_device = device
-            self._disconnect()
-            return
-
-        if self.current_sensor is not None and self.current_sensor == sensor:
-            return
-
-        self._do_connect_device(device)
-
-    def _do_connect_device(self, device: BLEDevice):
-        """实际执行连接、初始化、启动数据流（要求当前无已连接设备）。"""
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
             self.status_label.setText("Failed to create SensorProfile")
@@ -375,22 +599,27 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         sensor.onErrorCallback = self._on_error
         sensor.onPowerChanged  = self._on_power_changed
 
+        self.status_label.setText(f"Connecting: {device.Name} ...")
+        self.btn_connect.setEnabled(False)
+
         if sensor.deviceState != DeviceStateEx.Ready:
             if not sensor.connect():
                 self.status_label.setText(f"Failed to connect to {device.Name}")
+                self._update_button_states()
                 return
+
+        state = DeviceDataState(sensor)
 
         if not sensor.hasInited:
             if not sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
                 self.status_label.setText(f"Failed to initialize {device.Name}")
+                self._update_button_states()
                 return
 
             info = sensor.getDeviceInfo()
-            self._init_buffers(sensor, info)
-            self.model_label.setText(f"Model: {info.ModelName}")
-            self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
-            self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
-            self.status_label.setText(
+            state.info = info
+            state.init_buffers(info, len(self.axes_emg))
+            state.status_text = (
                 f"Connected: {device.Name} | "
                 f"ACC {info.AccChannelCount}ch @ {info.AccSampleRate}Hz | "
                 f"Euler {info.EulerChannelCount}ch @ {info.EulerSampleRate}Hz | "
@@ -398,101 +627,291 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                 f"EMG {info.EmgChannelCount}ch @ {info.EmgSampleRate}Hz"
             )
 
-        if not sensor.startDataNotification():
-            self.status_label.setText("Failed to start data stream")
-            return
+        if not sensor.isDataTransfering:
+            if not sensor.startDataNotification():
+                self.status_label.setText("Failed to start data stream")
+                self._update_button_states()
+                return
 
-        self.current_sensor = sensor
-        self.btn_disconnect.setEnabled(True)
-        for cb in self._ntf_checkboxes.values():
-            cb.setEnabled(True)
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(True)
+        self.device_states[addr] = state
+        self._update_device_item_text(addr, connected=True)
 
-        # 根据设备实际参数刷新 UI 开关状态
-        self._refresh_control_states(sensor)
+        # 初始电量发布发生在 state 注册之前（子进程 init 成功后立即发布），
+        # 这里显式补取一次，避免切换显示时电量显示 "--"
+        try:
+            power = sensor.getBatteryLevel()
+            if power is not None and power >= 0:
+                state.last_power = power
+        except Exception:
+            pass
 
-        # 根据全局 Debug Log 开关状态初始化当前设备的日志设置
+        # 若连接的是当前选中的设备，将其设为当前显示设备
+        if self._selected_address() == addr:
+            self.current_sensor = sensor
+
+        # 根据全局 Debug Log 开关状态初始化新设备的日志设置
         if self._debug_log_enabled:
             sensor.setParam("DEBUG_LOG_PATH", "True")
         if self._data_debug_log_enabled:
             sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
 
-        self._rebuild_2d_plot()
-        self._rebuild_emg_plot()
+        # 查询并缓存设备 NTF/FILTER 状态
+        self._refresh_control_states(sensor)
 
-    def _disconnect(self):
-        if self.current_sensor:
-            self.current_sensor.disconnect()
+        if self.current_sensor == sensor:
+            self._refresh_display_for_state(state)
+
+        self._update_button_states()
+
+    def _disconnect_selected_device(self):
+        """断开当前选中（显示）的设备，其余已连接设备不受影响。"""
+        sensor = self.current_sensor
+        if sensor is None:
+            return
+        self.btn_disconnect.setEnabled(False)
+        self.btn_connect.setEnabled(False)
+        for cb in self._ntf_checkboxes.values():
+            cb.setEnabled(False)
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(False)
+        self.status_label.setText("Disconnecting...")
+        sensor.disconnect()
+        # 后续清理由 onStateChanged -> _on_device_disconnected 完成
+
+    # ── Bin 文件回放 ────────────────────────────────────────────────────────────
+
+    def _set_replay_mode_ui(self, replaying: bool):
+        """回放期间禁用扫描 / 连接设备 / 调试日志等实时设备控件，回放结束后恢复。
+        已连接的设备不受影响（回放开始前会拒绝在有设备连接时进入回放）。"""
+        if replaying:
+            # 回放不经过实时链路：停掉进行中的扫描
+            if self.sensor_controller.isScanning:
+                self.sensor_controller.stopScan()
+            self.btn_stop_scan.setEnabled(False)
+            self.btn_connect.setEnabled(False)
             self.btn_disconnect.setEnabled(False)
-            for cb in self._ntf_checkboxes.values():
-                cb.setEnabled(False)
-            for cb in self._filter_checkboxes.values():
-                cb.setEnabled(False)
-            self.status_label.setText("Disconnecting...")
-            self.model_label.setText("Model: --")
-            self.hw_version_label.setText("HW Version: --")
-            self.fw_version_label.setText("FW Version: --")
-            self.power_label.setText("Power: --%")
+        else:
+            self._update_button_states()
+        self.btn_scan.setEnabled(not replaying)
+        self.device_list.setEnabled(not replaying)
+        self._debug_log_checkbox.setEnabled(not replaying)
+        self._data_debug_log_checkbox.setEnabled(not replaying)
 
-    # ── Data Buffers ──────────────────────────────────────────────────────────
+    def _replay_bin_file(self):
+        """选择一个 bin 文件并按原始时间节奏回放，数据显示流程与实时数据一致。"""
+        if self.device_states:
+            self.status_label.setText("Please disconnect all devices before replaying a bin file")
+            return
+        if self._replay_thread is not None and self._replay_thread.is_alive():
+            return
 
-    def _init_buffers(self, sensor: SensorProfile, info: DeviceInfo):
-        configs = [
-            (DataType.NTF_ACC,        info.AccSampleRate,   info.AccChannelCount),
-            (DataType.NTF_GYRO,       info.GyroSampleRate,  info.GyroChannelCount),
-            (DataType.NTF_EULER_DATA, info.EulerSampleRate, info.EulerChannelCount),
-            (DataType.NTF_QUATERNION, info.QuatSampleRate,  info.QuatChannelCount),
-        ]
-        for dt, sr, ch in configs:
-            if sr > 0 and ch > 0:
-                buf_len = max(sr * BUFFER_SECONDS, 1)
-                self.buffers[dt]      = np.zeros((ch, buf_len))
-                self._sample_index_buffers[dt] = np.zeros((ch, buf_len), dtype=np.int64)
-                self._buffer_indices[dt] = 0
-                self.sample_rates[dt] = sr
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Bin File", start_dir, "Bin Files (*.bin)"
+        )
+        if not path:
+            return
 
-        if info.EmgSampleRate > 0 and info.EmgChannelCount > 0:
-            self.emg_sample_rate = info.EmgSampleRate
-            display_channels = min(info.EmgChannelCount, len(self.axes_emg))
-            self._emg_display_channels = display_channels
-            self._emg_buffer_index = 0
-            self.emg_impedance = [None] * display_channels
-            buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.emg_buffer = np.zeros((display_channels, buf_len))
-            self._emg_sample_index_buffer = np.zeros((display_channels, buf_len), dtype=np.int64)
+        config = self.sensor_controller.getBinFileInfo(path)
+        if config is None:
+            self.status_label.setText("Invalid bin file: no config record found")
+            return
+
+        mac = config.get("device_mac")
+        if not mac:
+            self.status_label.setText("Invalid bin file: config missing device_mac")
+            return
+        name = config.get("device_name") or ""
+
+        # 用 bin 配置记录中的设备信息初始化显示缓冲区
+        info = DeviceInfo()
+        for key, value in (config.get("device_info") or {}).items():
+            if hasattr(info, key):
+                try:
+                    setattr(info, key, value)
+                except Exception:
+                    pass
+
+        sensor = self.sensor_controller.requireSensor(BLEDevice(name, mac, 0))
+        if sensor is None:
+            self.status_label.setText("Failed to create SensorProfile for replay")
+            return
+        sensor.onDataCallback = self._on_data
+        sensor.onErrorCallback = self._on_error
+
+        self._replay_sensor = sensor
+
+        # 回放传感器作为一台虚拟设备进入 device_states：
+        # _on_data 按地址路由到它的 DeviceDataState，显示流程与实时设备一致
+        state = DeviceDataState(sensor)
+        state.info = info
+        state.init_buffers(info, len(self.axes_emg))
+        duration = config.get("replay_duration", 0.0)
+        version = config.get("version", "?")
+        state.status_text = (
+            f"Replaying: {Path(path).name} (config v{version}, duration {duration:.1f}s, realtime) ...")
+        self.device_states[mac] = state
+        self.current_sensor = sensor
+        self._refresh_display_for_state(state)
+
+        self._replay_paused = False
+        self._replay_stop_requested = False
+        self.btn_replay.setEnabled(False)
+        self.btn_replay_pause.setEnabled(True)
+        self.btn_replay_pause.setText("Pause Replay")
+        self.btn_replay_stop.setEnabled(True)
+        self._set_replay_mode_ui(True)
+
+        def _do_replay():
+            try:
+                result = self.sensor_controller.replayBinFile(
+                    path, sensor, realtime=True)
+                if result is None:
+                    self.replay_done_sig.emit("Replay failed to start")
+                elif self._replay_stop_requested:
+                    self.replay_done_sig.emit("Replay stopped")
+                else:
+                    self.replay_done_sig.emit(f"Replay finished: {Path(path).name}")
+            except Exception as e:
+                self.replay_done_sig.emit(f"Replay error: {e}")
+
+        self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinReplay")
+        self._replay_thread.start()
+
+    def _toggle_replay_pause(self):
+        """暂停/恢复当前回放。"""
+        sensor = self._replay_sensor
+        if sensor is None:
+            return
+        if self._replay_paused:
+            result = self.sensor_controller.resumeBinReplay(sensor)
+        else:
+            result = self.sensor_controller.pauseBinReplay(sensor)
+        if result != "OK":
+            self.status_label.setText(f"Replay pause/resume failed: {result}")
+            return
+        self._replay_paused = not self._replay_paused
+        if self._replay_paused:
+            self.btn_replay_pause.setText("Resume Replay")
+            self.status_label.setText("Replay paused")
+        else:
+            self.btn_replay_pause.setText("Pause Replay")
+            self.status_label.setText("Replaying ...")
+
+    def _stop_replay(self):
+        """停止当前回放。"""
+        sensor = self._replay_sensor
+        if sensor is None:
+            return
+        self._replay_stop_requested = True
+        self.btn_replay_stop.setEnabled(False)
+        self.btn_replay_pause.setEnabled(False)
+        result = self.sensor_controller.stopBinReplay(sensor)
+        if result != "OK":
+            self.status_label.setText(f"Stop replay failed: {result}")
+            return
+        self.status_label.setText("Stopping replay ...")
+
+    def _on_replay_done(self, message: str):
+        # 回放结束：移除回放用的虚拟设备状态，恢复实时设备控件
+        sensor = self._replay_sensor
+        if sensor is not None:
+            self.device_states.pop(sensor.BLEDevice.Address, None)
+            if self.current_sensor is sensor:
+                self.current_sensor = None
+        self._refresh_display_for_state(None)
+        self.status_label.setText(message)
+        self.btn_replay.setEnabled(True)
+        self.btn_replay_pause.setEnabled(False)
+        self.btn_replay_pause.setText("Pause Replay")
+        self.btn_replay_stop.setEnabled(False)
+        self._set_replay_mode_ui(False)
+        self._replay_paused = False
+        self._replay_stop_requested = False
+
+    # ── Bin 文件离线解析 ──────────────────────────────────────────────────────
+
+    def _analyze_bin_file(self):
+        """选择 bin 文件并在同目录解析为 CSV，完成后用系统默认编辑器打开。"""
+        if getattr(self, "_analyze_thread", None) is not None and self._analyze_thread.is_alive():
+            return
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Bin File to Analyze", start_dir, "Bin Files (*.bin)"
+        )
+        if not path:
+            return
+
+        self.btn_analyze.setEnabled(False)
+        self.status_label.setText(f"Analyzing: {Path(path).name} ...")
+
+        def _do_analyze():
+            try:
+                csv_path = self.sensor_controller.parseBinToCsv(path)
+                self.analyze_done_sig.emit(csv_path, "")
+            except Exception as e:
+                self.analyze_done_sig.emit("", str(e))
+
+        self._analyze_thread = threading.Thread(target=_do_analyze, daemon=True, name="BinAnalyze")
+        self._analyze_thread.start()
+
+    def _on_analyze_done(self, csv_path: str, error: str):
+        self.btn_analyze.setEnabled(True)
+        if error:
+            self.status_label.setText(f"Analyze failed: {error}")
+            return
+        self.status_label.setText(f"CSV saved: {csv_path}")
+        self._open_in_system_editor(csv_path)
+
+    @staticmethod
+    def _open_in_system_editor(path: str):
+        """用系统默认应用打开文件（macOS open / Windows startfile / Linux xdg-open）。"""
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    # ── Data Routing ──────────────────────────────────────────────────────────
 
     def _on_data(self, sensor: SensorProfile, data: SensorData):
-        if data and data.channelSamples:
-            if data.dataType in self.buffers or data.dataType == DataType.NTF_EMG:
-                self.data_received.emit(data)
-            if data.dataType == DataType.NTF_QUATERNION:
-                self._update_quaternion(data)
-            if data.dataType == DataType.NTF_GEST:
-                self._handle_gesture_data(data)
+        if not (data and data.channelSamples):
+            return
+        addr = sensor.BLEDevice.Address
+        state = self.device_states.get(addr)
+        if state is None:
+            return
+        if data.dataType in state.buffers or data.dataType == DataType.NTF_EMG:
+            self.data_received.emit(addr, data)
+        if data.dataType == DataType.NTF_QUATERNION:
+            self._update_quaternion(state, data)
+        if data.dataType == DataType.NTF_GEST:
+            self._handle_gesture_data(addr, data)
 
-    def _get_data_type_pool(self, data_type):
-        pool = self._data_type_pools.get(data_type)
+    def _get_data_type_pool(self, key):
+        pool = self._data_type_pools.get(key)
         if pool is None:
             pool = QThreadPool()
             pool.setMaxThreadCount(1)
-            self._data_type_pools[data_type] = pool
+            self._data_type_pools[key] = pool
         return pool
 
-    def _get_buffer_lock(self, data_type):
-        lock = self._buffer_locks.get(data_type)
-        if lock is None:
-            lock = QtCore.QMutex()
-            self._buffer_locks[data_type] = lock
-        return lock
-
-    def _dispatch_data(self, data: SensorData):
+    def _dispatch_data(self, addr: str, data: SensorData):
+        state = self.device_states.get(addr)
+        if state is None:
+            return
         if data.lostPackageCount > 0:
             type_name = DataType(data.dataType).name if data.dataType is not None else "Unknown"
-            self.lost_packet_signal.emit(type_name, data.lostPackageCount)
+            self.lost_packet_signal.emit(addr, type_name, data.lostPackageCount)
 
-        task = DataTask(self._append_to_buffer, data)
-        pool = self._get_data_type_pool(data.dataType)
+        task = DataTask(state.append_data, data)
+        pool = self._get_data_type_pool((addr, data.dataType))
         pool.start(task)
 
     def closeEvent(self, event):
@@ -503,77 +922,6 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         except Exception as e:
             print(f"[closeEvent] terminate error: {e}")
         event.accept()
-
-    def _append_to_buffer(self, data: SensorData):
-        if data.dataType == DataType.NTF_EMG:
-            self._emg_buffer_lock.lock()
-            try:
-                buf = self.emg_buffer
-                idx_buf = self._emg_sample_index_buffer
-                if buf is None or idx_buf is None:
-                    return
-                buffer_size = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buffer_size)
-                    if n == 0:
-                        continue
-                    write_start = self._emg_buffer_index
-                    write_end = write_start + n
-                    if write_end <= buffer_size:
-                        buf[ch_idx, write_start:write_end] = new_vals[-n:]
-                        idx_buf[ch_idx, write_start:write_end] = new_indices[-n:]
-                    else:
-                        first_part = buffer_size - write_start
-                        buf[ch_idx, write_start:] = new_vals[-n:-n + first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[-n + first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[-n:-n + first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[-n + first_part:]
-                    while len(self.emg_impedance) <= ch_idx:
-                        self.emg_impedance.append(None)
-                    if ch_samples:
-                        self.emg_impedance[ch_idx] = ch_samples[-1].impedance
-                self._emg_buffer_index = (self._emg_buffer_index + n) % buffer_size
-            finally:
-                self._emg_buffer_lock.unlock()
-            return
-
-        lock = self._get_buffer_lock(data.dataType)
-        lock.lock()
-        try:
-            buf = self.buffers.get(data.dataType)
-            idx_buf = self._sample_index_buffers.get(data.dataType)
-            buffer_index = self._buffer_indices.get(data.dataType, 0)
-            if buf is None or idx_buf is None:
-                return
-            buffer_size = buf.shape[1]
-            n = 0
-            for ch_idx, ch_samples in enumerate(data.channelSamples):
-                if ch_idx >= buf.shape[0]:
-                    break
-                new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                n = min(len(new_vals), buffer_size)
-                if n == 0:
-                    continue
-                write_start = buffer_index
-                write_end = write_start + n
-                if write_end <= buffer_size:
-                    buf[ch_idx, write_start:write_end] = new_vals[-n:]
-                    idx_buf[ch_idx, write_start:write_end] = new_indices[-n:]
-                else:
-                    first_part = buffer_size - write_start
-                    buf[ch_idx, write_start:] = new_vals[-n:-n + first_part]
-                    buf[ch_idx, :n - first_part] = new_vals[-n + first_part:]
-                    idx_buf[ch_idx, write_start:] = new_indices[-n:-n + first_part]
-                    idx_buf[ch_idx, :n - first_part] = new_indices[-n + first_part:]
-            self._buffer_indices[data.dataType] = (buffer_index + n) % buffer_size
-        finally:
-            lock.unlock()
 
     # ── Bottom-left 2D Waveform ───────────────────────────────────────────────
 
@@ -591,31 +939,37 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             lbl.setParent(None)
         self.value_labels.clear()
 
-        lock = self._get_buffer_lock(dt)
-        lock.lock()
-        try:
-            buf = self.buffers.get(dt)
-            idx_buf = self._sample_index_buffers.get(dt)
-            if buf is None or idx_buf is None:
-                self.ax_2d.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} (Device not supported or disabled)")
-                self.canvas_2d.draw_idle()
-                self._last_plotted_sample_indices.pop(dt, None)
-                return
-            buf_copy = buf.copy()
-            idx_buf_copy = idx_buf.copy()
-            buffer_index = self._buffer_indices.get(dt, 0)
-        finally:
-            lock.unlock()
+        buf_copy = None
+        idx_buf_copy = None
+        buffer_index = 0
+        state = self._current_state()
+        if state is not None:
+            lock = state.get_buffer_lock(dt)
+            lock.lock()
+            try:
+                buf = state.buffers.get(dt)
+                idx_buf = state.sample_index_buffers.get(dt)
+                if buf is not None and idx_buf is not None:
+                    buf_copy = buf.copy()
+                    idx_buf_copy = idx_buf.copy()
+                    buffer_index = state.buffer_indices.get(dt, 0)
+            finally:
+                lock.unlock()
 
-        # Reassemble the circular buffer into chronological order for plotting.
-        buf_copy = np.roll(buf_copy, -buffer_index, axis=1)
-        idx_buf_copy = np.roll(idx_buf_copy, -buffer_index, axis=1)
+        if buf_copy is None or idx_buf_copy is None:
+            suffix = "(Not connected)" if state is None else "(Device not supported or disabled)"
+            self.ax_2d.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} {suffix}")
+            self.canvas_2d.draw_idle()
+            self._last_plotted_sample_indices.pop(dt, None)
+            return
+
         self._last_plotted_sample_indices[dt] = int(idx_buf_copy.max())
 
         t = np.linspace(-BUFFER_SECONDS, 0, buf_copy.shape[1])
         for ch in range(buf_copy.shape[0]):
             label = labels[ch] if ch < len(labels) else f"ch{ch}"
-            (line,) = self.ax_2d.plot(t, buf_copy[ch], label=label)
+            y_data = np.roll(buf_copy[ch], -buffer_index)
+            (line,) = self.ax_2d.plot(t, y_data, label=label)
             self.lines_2d.append(line)
 
             row = QtWidgets.QLabel(f"{label}: --")
@@ -632,30 +986,40 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     # ── Right-side EMG 8-Channel Waveform ─────────────────────────────────────
 
     def _rebuild_emg_plot(self):
-        self._emg_buffer_lock.lock()
-        try:
-            if self.emg_buffer is None or self._emg_sample_index_buffer is None:
-                for ax in self.axes_emg:
-                    ax.cla()
-                self.axes_emg[0].set_title("EMG (Device not supported or disabled)")
-                self.canvas_emg.draw_idle()
-                self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
-                return
-            emg_buffer_copy = self.emg_buffer.copy()
-            emg_idx_buf_copy = self._emg_sample_index_buffer.copy()
-            emg_buffer_index = self._emg_buffer_index
-        finally:
-            self._emg_buffer_lock.unlock()
+        state = self._current_state()
+        emg_available = False
+        emg_buffer_copy = None
+        emg_idx_buf_copy = None
+        emg_buffer_index = 0
+        display_channels = 0
 
-        # Reassemble the circular buffer into chronological order for plotting.
-        emg_buffer_copy = np.roll(emg_buffer_copy, -emg_buffer_index, axis=1)
-        emg_idx_buf_copy = np.roll(emg_idx_buf_copy, -emg_buffer_index, axis=1)
+        if state is not None:
+            state.emg_buffer_lock.lock()
+            try:
+                emg_available = state.emg_buffer is not None and state.emg_sample_index_buffer is not None
+                if emg_available:
+                    emg_buffer_copy = state.emg_buffer.copy()
+                    emg_idx_buf_copy = state.emg_sample_index_buffer.copy()
+                    emg_buffer_index = state.emg_buffer_index
+                    display_channels = state.emg_display_channels
+            finally:
+                state.emg_buffer_lock.unlock()
+
+        if not emg_available:
+            for ax in self.axes_emg:
+                ax.cla()
+                ax.set_visible(True)
+            suffix = "(Not connected)" if state is None else "(Device not supported or disabled)"
+            self.axes_emg[0].set_title(f"EMG {suffix}")
+            self.canvas_emg.draw_idle()
+            self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
+            self.emg_lines = []
+            return
+
         self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
 
-        display_channels = self._emg_display_channels
         if display_channels == 0:
             display_channels = min(emg_buffer_copy.shape[0], len(self.axes_emg))
-            self._emg_display_channels = display_channels
 
         self.emg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, emg_buffer_copy.shape[1])
@@ -663,7 +1027,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             ax.cla()
             if ch < display_channels:
                 color = EMG_CHANNEL_COLORS[ch % len(EMG_CHANNEL_COLORS)]
-                (line,) = ax.plot(t, emg_buffer_copy[ch], color=color, linewidth=0.8)
+                y_data = np.roll(emg_buffer_copy[ch], -emg_buffer_index)
+                (line,) = ax.plot(t, y_data, color=color, linewidth=0.8)
                 self.emg_lines.append(line)
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
@@ -672,6 +1037,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
+                ax.set_visible(True)
             else:
                 ax.set_visible(False)
 
@@ -691,20 +1057,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.ax_3d.set_title('IMU Quaternion Visualization (3D Cube)')
         self._create_cube()
 
-        R = self._quaternion_to_rotation_matrix(self.current_quaternion)
-        rotated_vertices = np.dot(self.cube_vertices, R.T)
-        rotated_faces = [
-            [rotated_vertices[0], rotated_vertices[1], rotated_vertices[2], rotated_vertices[3]],
-            [rotated_vertices[4], rotated_vertices[5], rotated_vertices[6], rotated_vertices[7]],
-            [rotated_vertices[0], rotated_vertices[1], rotated_vertices[5], rotated_vertices[4]],
-            [rotated_vertices[2], rotated_vertices[3], rotated_vertices[7], rotated_vertices[6]],
-            [rotated_vertices[0], rotated_vertices[3], rotated_vertices[7], rotated_vertices[4]],
-            [rotated_vertices[1], rotated_vertices[2], rotated_vertices[6], rotated_vertices[5]]
-        ]
-
         face_colors = ['cyan', 'magenta', 'yellow', 'red', 'green', 'blue']
-        self._cube_collection = Poly3DCollection(rotated_faces, facecolors=face_colors,
-                                                 linewidths=1, edgecolors='black', alpha=1.0)
+        self._cube_collection = Poly3DCollection(self.cube_faces, facecolors=face_colors,
+                                                linewidths=1, edgecolors='black', alpha=1.0)
         self.ax_3d.add_collection3d(self._cube_collection)
 
         axis_length = 1.5
@@ -716,20 +1071,18 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self.ax_3d.quiver(0, 0, 0, 0, 0, axis_length,
                               color='b', arrow_length_ratio=0.1, linewidth=2),
         )
-
-        self._last_3d_update_time = 0
-        self._last_drawn_quaternion = None
+        self._draw_cube([1.0, 0.0, 0.0, 0.0])
 
     def _create_cube(self):
         vertices = np.array([
             [-1, -1, -1],
             [ 1, -1, -1],
             [ 1,  1, -1],
-            [-1,  1, -1],
+            [-1,  1,  1],
             [-1, -1,  1],
             [ 1, -1,  1],
             [ 1,  1,  1],
-            [-1,  1,  1]
+            [ 1,  1,  1]
         ])
         faces = [
             [vertices[0], vertices[1], vertices[2], vertices[3]],
@@ -753,8 +1106,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
         ])
 
-    def _draw_cube(self):
-        R = self._quaternion_to_rotation_matrix(self.current_quaternion)
+    def _draw_cube(self, quaternion):
+        R = self._quaternion_to_rotation_matrix(quaternion)
         rotated_vertices = np.dot(self.cube_vertices, R.T)
         rotated_faces = [
             [rotated_vertices[0], rotated_vertices[1], rotated_vertices[2], rotated_vertices[3]],
@@ -764,10 +1117,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             [rotated_vertices[0], rotated_vertices[3], rotated_vertices[7], rotated_vertices[4]],
             [rotated_vertices[1], rotated_vertices[2], rotated_vertices[6], rotated_vertices[5]]
         ]
-
         self._cube_collection.set_verts(rotated_faces)
 
-    def _update_quaternion(self, data: SensorData):
+    def _update_quaternion(self, state: DeviceDataState, data: SensorData):
         try:
             if data.dataType == DataType.NTF_QUATERNION:
                 if len(data.channelSamples) == 4 and len(data.channelSamples[0]) > 0:
@@ -777,9 +1129,9 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                         data.channelSamples[2][0].data,
                         data.channelSamples[3][0].data,
                     ]
-                    self.quaternion_lock.lock()
-                    self.current_quaternion = quaternion
-                    self.quaternion_lock.unlock()
+                    state.quaternion_lock.lock()
+                    state.quaternion = quaternion
+                    state.quaternion_lock.unlock()
         except Exception as e:
             print(f"Quaternion update exception: {e}")
 
@@ -790,28 +1142,32 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         if self.windowState() & QtCore.Qt.WindowMinimized:
             return
 
+        state = self._current_state()
+        if state is None:
+            return
+
         dt  = self.active_data_type
         buf_copy = None
         idx_buf_copy = None
         buffer_index = 0
-        lock = self._get_buffer_lock(dt)
+        lock = state.get_buffer_lock(dt)
         lock.lock()
         try:
-            buf = self.buffers.get(dt)
-            idx_buf = self._sample_index_buffers.get(dt)
+            buf = state.buffers.get(dt)
+            idx_buf = state.sample_index_buffers.get(dt)
             if buf is not None and idx_buf is not None:
                 buf_copy = buf.copy()
                 idx_buf_copy = idx_buf.copy()
-                buffer_index = self._buffer_indices.get(dt, 0)
+                buffer_index = state.buffer_indices.get(dt, 0)
         finally:
             lock.unlock()
 
         if buf_copy is not None and idx_buf_copy is not None and self.lines_2d:
-            # Reassemble the circular buffer into chronological order for plotting.
-            buf_copy = np.roll(buf_copy, -buffer_index, axis=1)
             current_last_idx = int(idx_buf_copy.max())
             last_plotted_idx = self._last_plotted_sample_indices.get(dt, -1)
             if current_last_idx != last_plotted_idx:
+                # Reassemble the circular buffer once for all channels.
+                buf_copy = np.roll(buf_copy, -buffer_index, axis=1)
                 labels = CHANNEL_LABELS.get(dt, [])
                 for ch, line in enumerate(self.lines_2d):
                     if ch < buf_copy.shape[0]:
@@ -843,31 +1199,29 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         emg_idx_buf_copy = None
         emg_impedance_copy = None
         emg_buffer_index = 0
-        self._emg_buffer_lock.lock()
+        state.emg_buffer_lock.lock()
         try:
-            if self.emg_buffer is not None and self._emg_sample_index_buffer is not None:
-                emg_buffer_copy = self.emg_buffer.copy()
-                emg_idx_buf_copy = self._emg_sample_index_buffer.copy()
-                emg_impedance_copy = list(self.emg_impedance)
-                emg_buffer_index = self._emg_buffer_index
+            if state.emg_buffer is not None and state.emg_sample_index_buffer is not None:
+                emg_buffer_copy = state.emg_buffer.copy()
+                emg_idx_buf_copy = state.emg_sample_index_buffer.copy()
+                emg_impedance_copy = list(state.emg_impedance)
+                emg_buffer_index = state.emg_buffer_index
         finally:
-            self._emg_buffer_lock.unlock()
+            state.emg_buffer_lock.unlock()
 
         if emg_buffer_copy is not None and emg_idx_buf_copy is not None and self.emg_lines:
-            # Reassemble the circular buffer into chronological order for plotting.
-            emg_buffer_copy = np.roll(emg_buffer_copy, -emg_buffer_index, axis=1)
-            emg_idx_buf_copy = np.roll(emg_idx_buf_copy, -emg_buffer_index, axis=1)
             current_last_idx = int(emg_idx_buf_copy.max())
             last_plotted_idx = self._last_plotted_sample_indices.get(DataType.NTF_EMG, -1)
             if current_last_idx != last_plotted_idx:
                 for ch, line in enumerate(self.emg_lines):
-                    if ch >= emg_buffer_copy.shape[0] or ch >= self._emg_display_channels:
+                    if ch >= emg_buffer_copy.shape[0]:
                         continue
-                    line.set_ydata(emg_buffer_copy[ch])
+                    y_data = np.roll(emg_buffer_copy[ch], -emg_buffer_index)
+                    line.set_ydata(y_data)
                     ax = self.axes_emg[ch]
                     if not ax.get_visible():
                         ax.set_visible(True)
-                    ch_data = emg_buffer_copy[ch]
+                    ch_data = y_data
                     mn, mx = ch_data.min(), ch_data.max()
                     margin = max((mx - mn) * 0.1, 0.01)
                     if mn == mx:
@@ -894,16 +1248,19 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                 self._last_plotted_sample_indices[DataType.NTF_EMG] = current_last_idx
 
         try:
-            self.quaternion_lock.lock()
-            w, x, y, z = self.current_quaternion
-            self.quaternion_lock.unlock()
+            state.quaternion_lock.lock()
+            current_quaternion = state.quaternion[:]
+            state.quaternion_lock.unlock()
 
-            now = QtCore.QDateTime.currentMSecsSinceEpoch()
-            quaternion_changed = self._last_drawn_quaternion != [w, x, y, z]
-            if now - self._last_3d_update_time >= PLOT_UPDATE_INTERVAL and quaternion_changed:
-                self._draw_cube()
+            now = time.time()
+            elapsed_ms = (now - self._last_3d_update_time) * 1000
+            quaternion_changed = current_quaternion != self._last_drawn_quaternion
+
+            if elapsed_ms >= PLOT_UPDATE_INTERVAL and quaternion_changed:
+                self._draw_cube(current_quaternion)
+                self._last_drawn_quaternion = current_quaternion[:]
                 self._last_3d_update_time = now
-                self._last_drawn_quaternion = [w, x, y, z]
+
             self.canvas_3d.draw_idle()
         except Exception as e:
             print(f"3D update exception: {e}")
@@ -912,47 +1269,31 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
-        if state == DeviceStateEx.Disconnected and self.current_sensor == sensor:
-            self.device_disconnected_sig.emit()
+        if state == DeviceStateEx.Disconnected:
+            self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
-    def _on_device_disconnected(self):
-        if self._pending_device is not None:
-            pending = self._pending_device
-            self._pending_device = None
+    def _on_device_disconnected(self, addr: str):
+        state = self.device_states.pop(addr, None)
+        self._update_device_item_text(addr, connected=False)
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
             self.current_sensor = None
-            self._clear_ui_data()
-            self._clear_lost_packet_stats()
-            self._do_connect_device(pending)
-            return
-
-        if self.current_sensor is None:
-            return
-        self.current_sensor = None
-        self.btn_disconnect.setEnabled(False)
-        for cb in self._ntf_checkboxes.values():
-            cb.setEnabled(False)
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(False)
-        self.status_label.setText("Disconnected (device)")
-        self.model_label.setText("Model: --")
-        self.hw_version_label.setText("HW Version: --")
-        self.fw_version_label.setText("FW Version: --")
-        self.power_label.setText("Power: --%")
-        self._clear_lost_packet_stats()
+            self._refresh_display_for_state(None)
+            self.status_label.setText("Disconnected (device)")
+        self._update_button_states()
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
 
-    def _update_lost_packet_display(self, lost_type: str, count: int):
-        self.lost_packet_counts[lost_type] = count
-        lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
-        self.lost_packet_label.setText("Packet Loss Stats:\n" + "\n".join(lines))
+    def _update_lost_packet_display(self, addr: str, lost_type: str, count: int):
+        state = self.device_states.get(addr)
+        if state is None:
+            return
+        state.lost_counts[lost_type] = count
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
+            text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))
+            self.lost_packet_label.setText("Packet Loss Stats: " + text)
 
-    def _clear_lost_packet_stats(self):
-        self.lost_packet_counts.clear()
-        self.lost_packet_label.setText("Packet Loss Stats: None")
-
-    def _handle_gesture_data(self, data: SensorData):
+    def _handle_gesture_data(self, addr: str, data: SensorData):
         if not data.channelSamples:
             return
         samples = data.channelSamples[0]
@@ -963,10 +1304,14 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         raw_gesture = int(sample.rawData)
         possiblity = int(sample.impedance)
         strength = int(sample.saturation)
-        self.gesture_signal.emit(gesture, raw_gesture, possiblity, strength)
+        self.gesture_signal.emit(addr, gesture, raw_gesture, possiblity, strength)
 
-    def _update_gesture_display(self, gesture: int, raw_gesture: int, possiblity: int, strength: int):
-        self.gesture_label.setText(
+    @staticmethod
+    def _gesture_text(gesture_tuple) -> str:
+        if gesture_tuple is None:
+            return GESTURE_DEFAULT_TEXT
+        gesture, raw_gesture, possiblity, strength = gesture_tuple
+        return (
             "Gesture:\n"
             f"  gesture: {gesture} (0-8)\n"
             f"  raw gesture: {raw_gesture} (0-8)\n"
@@ -974,9 +1319,20 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             f"  strength: {strength} (0-100)"
         )
 
+    def _update_gesture_display(self, addr: str, gesture: int, raw_gesture: int, possiblity: int, strength: int):
+        state = self.device_states.get(addr)
+        if state is not None:
+            state.gesture = (gesture, raw_gesture, possiblity, strength)
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
+            self.gesture_label.setText(self._gesture_text((gesture, raw_gesture, possiblity, strength)))
+
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
-        self.power_label.setText(f"Power: {power}%")
+        state = self.device_states.get(sensor.BLEDevice.Address)
+        if state is not None:
+            state.last_power = power
+        if self.current_sensor == sensor:
+            self.power_label.setText(f"Power: {power}%")
 
     def _check_set_param_result(self, key: str, result: str) -> bool:
         """检查 setParam 结果，若报错则弹出 QMessageBox。返回 True 表示成功。"""
@@ -1023,7 +1379,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self._clear_ui_data()
 
     def _refresh_control_states(self, sensor: SensorProfile):
-        """根据设备当前 NTF/FILTER 参数刷新 UI 开关状态。"""
+        """查询设备当前 NTF/FILTER 参数并缓存到对应设备状态；若为当前显示设备则同步刷新 UI。"""
         info = sensor.getDeviceInfo()
         channel_map = {
             "NTF_EMG":   info.EmgChannelCount if info else 0,
@@ -1042,44 +1398,54 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             "NTF_GFORCE_GYRO": info.GyroChannelCount if info else 0,
         }
 
+        ntf_states = {}
         ntf_result = sensor.getParam("NTF")
         print(f"[Refresh] getParam(NTF) -> {ntf_result}")
         if not str(ntf_result).startswith("Error"):
             items = str(ntf_result).split("|")
-            self._updating_ntf_controls = True
-            try:
-                for i in range(0, len(items) - 1, 2):
-                    key = items[i]
-                    value = items[i + 1]
-                    cb = self._ntf_checkboxes.get(key)
-                    count = channel_map.get(key, 0)
-                    if cb is not None:
-                        cb.setEnabled(count > 0)
-                        if count > 0:
-                            cb.setChecked(value == "ON")
-                        else:
-                            cb.setChecked(False)
-            finally:
-                self._updating_ntf_controls = False
+            for i in range(0, len(items) - 1, 2):
+                key = items[i]
+                value = items[i + 1]
+                count = channel_map.get(key, 0)
+                ntf_states[key] = (count > 0, value == "ON" if count > 0 else False)
 
+        filter_states = {}
         filter_result = sensor.getParam("FILTER")
         print(f"[Refresh] getParam(FILTER) -> {filter_result}")
         has_filter = bool(filter_result) and not str(filter_result).startswith("Error")
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(has_filter)
+        if has_filter:
+            items = str(filter_result).split("|")
+            parsed = {items[i]: items[i + 1] for i in range(0, len(items) - 1, 2)}
+            for key in self._filter_checkboxes:
+                filter_states[key] = (True, parsed.get(key) == "ON")
+        else:
+            for key in self._filter_checkboxes:
+                filter_states[key] = (False, False)
+
+        state = self.device_states.get(sensor.BLEDevice.Address)
+        if state is not None:
+            state.ntf_states = ntf_states
+            state.filter_states = filter_states
+
+        if self.current_sensor == sensor:
+            self._apply_control_states(ntf_states, filter_states)
+
+    def _apply_control_states(self, ntf_states: dict, filter_states: dict):
+        """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）。"""
+        self._updating_ntf_controls = True
+        try:
+            for key, cb in self._ntf_checkboxes.items():
+                enabled, checked = ntf_states.get(key, (False, False))
+                cb.setEnabled(enabled)
+                cb.setChecked(checked)
+        finally:
+            self._updating_ntf_controls = False
         self._updating_filter_controls = True
         try:
-            if has_filter:
-                items = str(filter_result).split("|")
-                for i in range(0, len(items) - 1, 2):
-                    key = items[i]
-                    value = items[i + 1]
-                    cb = self._filter_checkboxes.get(key)
-                    if cb is not None:
-                        cb.setChecked(value == "ON")
-            else:
-                for cb in self._filter_checkboxes.values():
-                    cb.setChecked(False)
+            for key, cb in self._filter_checkboxes.items():
+                enabled, checked = filter_states.get(key, (False, False))
+                cb.setEnabled(enabled)
+                cb.setChecked(checked)
         finally:
             self._updating_filter_controls = False
 
@@ -1099,28 +1465,53 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
+    def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
+        """切换显示设备时，刷新设备信息、丢包统计、手势、开关状态与图表。"""
+        self._last_plotted_sample_indices.clear()
+        self._last_drawn_quaternion = None
+
+        if state is not None and state.info is not None:
+            info = state.info
+            self.model_label.setText(f"Model: {info.ModelName}")
+            self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
+            self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
+        else:
+            self.model_label.setText("Model: --")
+            self.hw_version_label.setText("HW Version: --")
+            self.fw_version_label.setText("FW Version: --")
+
+        if state is not None and state.last_power is not None:
+            self.power_label.setText(f"Power: {state.last_power}%")
+        else:
+            self.power_label.setText("Power: --%")
+
+        if state is not None and state.status_text:
+            self.status_label.setText(state.status_text)
+        else:
+            self.status_label.setText("Not Connected")
+
+        if state is not None and state.lost_counts:
+            text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))
+            self.lost_packet_label.setText("Packet Loss Stats: " + text)
+        else:
+            self.lost_packet_label.setText("Packet Loss Stats: None")
+
+        self.gesture_label.setText(self._gesture_text(state.gesture if state is not None else None))
+
+        ntf_states = state.ntf_states if state is not None else {}
+        filter_states = state.filter_states if state is not None else {}
+        self._apply_control_states(ntf_states, filter_states)
+
+        self._rebuild_2d_plot()
+        self._rebuild_emg_plot()
+
     def _clear_ui_data(self):
-        """清除 UI 数据缓冲区并重建图表，等待新数据。"""
+        """清除当前显示设备的数据缓冲区并重建图表，等待新数据。"""
         self._last_plotted_sample_indices.clear()
 
-        for dt in list(self.buffers.keys()):
-            lock = self._get_buffer_lock(dt)
-            lock.lock()
-            try:
-                self.buffers[dt].fill(0)
-                self._sample_index_buffers[dt].fill(0)
-                self._buffer_indices[dt] = 0
-            finally:
-                lock.unlock()
-
-        self._emg_buffer_lock.lock()
-        try:
-            if self.emg_buffer is not None:
-                self.emg_buffer.fill(0)
-                self._emg_sample_index_buffer.fill(0)
-                self._emg_buffer_index = 0
-        finally:
-            self._emg_buffer_lock.unlock()
+        state = self._current_state()
+        if state is not None:
+            state.clear_buffers()
 
         self._rebuild_2d_plot()
         self._rebuild_emg_plot()

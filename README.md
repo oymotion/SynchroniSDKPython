@@ -22,6 +22,17 @@ MIT
 pip install sensor-sdk 
 ```
 
+### USB Bluetooth dongle (bumble backend)
+
+On macOS, when a USB Bluetooth HCI dongle is plugged in (e.g. Actions `10d7:b012` or `33fa:0012`; several dongles can be used at once, each serving one connection), the SDK automatically drives it directly with a [bumble](https://github.com/google/bumble) host-mode backend instead of CoreBluetooth — no Bluetooth permission prompt, works even when the internal Bluetooth is off, and allows larger ATT MTU. The [bleak-bumble](https://github.com/ekspla/bleak-bumble_dev_host_mode) backend is vendored into the SDK (`sensor/bleak_bumble/`, MIT license), and the bumble stack + libusb are declared as regular dependencies — a plain `pip install sensor-sdk` is all that is needed.
+
+Behavior and controls:
+
+- With the dependencies installed and a dongle present, the backend is selected automatically on macOS when the SDK starts (native `bleak` is used otherwise). Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
+- `SENSOR_SDK_BLE_BACKEND=bleak` forces the native backend; `SENSOR_SDK_BLE_BACKEND=bumble` forces the dongle backend on any platform; `SENSOR_SDK_BUMBLE_TRANSPORT` overrides the bumble transport spec (e.g. `usb:0`).
+- USB access needs no sudo on macOS as long as the OS has not claimed the dongle (it normally doesn't when the internal Bluetooth works).
+- With the bumble backend, each dongle serves one connection at a time: scanning uses a free dongle and is skipped while all dongles are connected; connections fail fast when no dongle is free. Connection timeout is raised to 25s automatically.
+
 ## 1. Permission
 
 Application will obtain bluetooth permission by itself.
@@ -99,12 +110,12 @@ sensorProfile = SensorControllerInstance.requireSensor(bleDevice)
 
 ### 7. Get SensorProfile
 
-Use `def getSensor(device: BLEDevice) -> SensorProfile | None` to get SensorProfile.
+Use `def getSensor(deviceMac: str) -> SensorProfile | None` to get SensorProfile.
 
 If SensorProfile didn't created, result is None.
 
 ```python
-sensorProfile = SensorControllerInstance.getSensor(bleDevice)
+sensorProfile = SensorControllerInstance.getSensor(bleDevice.Address)
 ```
 
 ### 8. Get Connected SensorProfiles
@@ -220,27 +231,18 @@ bleDevice = sensorProfile.BLEDevice
 
 ### 16. Get device info of SensorProfile
 
-Use `def getDeviceInfo() -> dict | None` to get device info of SensorProfile.
+Use `def getDeviceInfo() -> DeviceInfo | None` to get device info of SensorProfile.
 
-Please call after device in 'Ready' state, return None if it's not connected.
+Please call after device in 'Ready' state and `init()` has succeeded, returns None otherwise.
 
 ```python
     deviceInfo = sensorProfile.getDeviceInfo()
 
-# deviceInfo has defines:
-# deviceInfo = {
-#     "deviceName": str,
-#     "modelName": str,
-#     "hardwareVersion": str,
-#     "firmwareVersion": str,
-#     "emgChannelCount": int,
-#     "eegChannelCount": int,
-#     "ecgChannelCount": int,
-#     "accChannelCount": int,
-#     "gyroChannelCount": int,
-#     "brthChannelCount": int,
-#     "mtuSize": int
-# }
+# deviceInfo is a DeviceInfo object with attributes:
+#   DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
+#   plus a ChannelCount / SampleRate attribute pair for each modality:
+#   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
+# e.g. deviceInfo.EmgChannelCount, deviceInfo.EegSampleRate
 ```
 
 ### 17. Init data transfer
@@ -385,9 +387,17 @@ result = sensorProfile.setParam("FILTER_HPF", "ON")
 result = sensorProfile.setParam("FILTER_LPF", "ON")
 # set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
 
-result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
-# set debug ble data path, result is "OK" if succeed
+result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.bin")
+# set the bin export path: the session's raw BLE capture is recorded in the system
+# temp directory and copied to this location on stopDataNotification / disconnect;
+# "True" exports to {DeviceName}_data_YYYYMMDD_HHMMSS.bin in the SDK log directory,
+# "False" or "" disables export (the temp bin is just deleted).
 # please give an absolute path and make sure it is valid and writeable by yourself
+
+result = sensorProfile.setParam("DEBUG_LOG_PATH", "True")
+# enable SDK file logging to a default file ({DeviceName}_log_YYYYMMDD_HHMMSS.txt),
+# or pass an absolute custom path instead of "True"; "False" or "" disables it.
+# getParam("DEBUG_LOG_PATH") returns the current log file path ("" when disabled).
 ```
 
 
@@ -410,3 +420,84 @@ result = sensorProfile.getParam("NTF")
 ```
 
 If the key is not supported, the result starts with `"Error"`.
+
+## Bin file recording and replay
+
+On every successful connect, the SDK records all raw BLE packets of the session into a `.bin` file in the SDK log directory (`~/Documents/sensorsdklog` by default, or the directory of the configured log file), named `{DeviceName}_{MAC}_{YYYYMMDD_HHMMSS}.bin`. Recording is always on; it is skipped or stopped with a warning when free disk space is below 100MB or a disk error occurs, without affecting live streaming. Bin files can be replayed offline for debugging and packet-loss analysis.
+
+### Get bin file info
+
+Use `def getBinFileInfo(self, file_path: str) -> Optional[dict]` to read the config record of a bin file:
+
+```python
+info = SensorControllerInstance.getBinFileInfo("path/to/session.bin")
+# Returns a dict:
+#   device_mac, device_name, chip_type, is_universal_stream, feature_map,
+#   device_info, sensor_datas (per data-type parse config),
+#   replay_duration (recording seconds, written into the header record at close;
+#                    older bins without a header fall back to a full-file estimate)
+# Returns None if the file does not exist or has no config record.
+```
+
+### Replay a bin file
+
+Use `def replayBinFile(self, file_path: str, sensor: Optional[SensorProfile] = None, realtime: bool = True, timeout: Optional[float] = None) -> Optional[SensorProfile]` to replay a bin file through the normal parsing pipeline. Parsed results arrive via `onDataCallback` on the returned SensorProfile, same as live data.
+
+```python
+# Simplest form: controller creates the profile from the bin config record
+sensor = SensorControllerInstance.replayBinFile("path/to/session.bin")
+
+# Recommended: reuse an existing profile with callbacks registered
+sensor = SensorControllerInstance.requireSensor(device)
+sensor.onDataCallback = on_data
+SensorControllerInstance.replayBinFile("path/to/session.bin", sensor, realtime=True)
+```
+
+- `sensor`: an existing SensorProfile to replay through. When `None`, the controller creates (or reuses) a profile from the bin config record; in that mode the profile is returned only after replay finishes, so register callbacks on an existing profile to receive data.
+- `realtime`: `True` replays at the recorded pace; `False` replays as fast as possible.
+- `timeout`: seconds to wait for completion. `None` auto-estimates from the bin duration in realtime mode (duration + 30s, min 60s), or 600s otherwise. On timeout the call returns while replay may still be running in the background.
+- Replay is rejected while the target sensor is streaming live data.
+
+### Pause / resume / stop replay
+
+```python
+result = SensorControllerInstance.pauseBinReplay(sensor)   # pause feeding
+result = SensorControllerInstance.resumeBinReplay(sensor)  # resume feeding
+result = SensorControllerInstance.stopBinReplay(sensor)    # abort; the blocking replayBinFile call returns
+# Each returns "OK" on success or an error string otherwise.
+```
+
+### Parse a bin file to CSV
+
+Use `def parseBinToCsv(self, bin_path: str, csv_path: Optional[str] = None) -> str` to convert a recorded bin file to CSV offline (parsing runs through the real pipeline; row timestamps come from the bin records):
+
+```python
+csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin")
+# or with an explicit output path:
+csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin", "d:/temp/test.csv")
+# Returns the CSV file path. Columns:
+# timestamp, mac, type, raw_hex, data_type, sample_rate, channel_count, lost_count, samples_info, first_sample
+```
+
+## Logging controls
+
+File logging is disabled by default. Records emitted before file logging is first enabled are held in a bounded memory buffer and replayed into the file on first enable, so early (scan/connect) logs are not lost. The log path is automatically shared with the BLE subprocess, so both sides write to the same file.
+
+```python
+SensorControllerInstance.setDebugEnabled(True)
+# enable/disable SDK debug logs
+
+SensorControllerInstance.setLogPath("d:/temp/sdk.log")
+# enable file logging to a custom path; pass "" to disable
+
+SensorControllerInstance.enableFileLog(True)
+# enable file logging with the default path
+# (~/Documents/sensorsdklog/log_YYYYMMDD_HHMMSS.txt)
+
+SensorControllerInstance.setControllerLogPath("d:/temp/controller.log")
+# SensorController-dedicated log file; pass "" to disable
+
+SensorControllerInstance.enableControllerLog(True)
+# enable the controller-dedicated log with the default path
+# (~/Documents/sensorsdklog/sensor_controller_log_YYYYMMDD_HHMMSS.txt)
+```

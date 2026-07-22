@@ -1,8 +1,12 @@
 import sys
 import signal
 import time
+import subprocess
 import multiprocessing
-from typing import List
+import os
+import threading
+from pathlib import Path
+from typing import List, Optional
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -16,6 +20,7 @@ from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import QRunnable, QThreadPool
 
 from sensor import *
+import sensor
 
 
 SCAN_DEVICE_PERIOD_IN_MS   = 3000
@@ -68,64 +73,320 @@ class DataTask(QRunnable):
             print(f"[DataTask] Exception: {e}")
 
 
+class DeviceDataState:
+    """单个已连接设备的数据缓冲与显示状态。多设备连接时每个设备各持有一份。"""
+
+    def __init__(self, sensor: SensorProfile):
+        self.sensor = sensor
+        self.info: Optional[DeviceInfo] = None
+        self.last_power: Optional[int] = None
+        self.status_text = ""
+        self.lost_counts: dict = {}
+        self.ntf_states: dict = {}     # key -> (enabled, checked)
+        self.filter_states: dict = {}  # key -> (enabled, checked)
+
+        self.buffers: dict = {}
+        self.sample_rates: dict = {}
+        self.sample_index_buffers: dict = {}
+        self.buffer_indices: dict = {}
+        self.buffer_locks: dict = {}
+
+        self.eeg_buffer = None
+        self.eeg_sample_index_buffer = None
+        self.eeg_buffer_index = 0
+        self.eeg_sample_rate = 0
+        self.eeg_total_channels = 0
+        self.eeg_page_index = 0
+        self.eeg_channels_per_page = 8
+        self.eeg_impedance: list = []
+        self.eeg_buffer_lock = QtCore.QMutex()
+
+        self.has_ecg = False
+        self.ecg_buffer = None
+        self.ecg_sample_index_buffer = None
+        self.ecg_buffer_index = 0
+        self.ecg_sample_rate = 0
+        self.ecg_impedance: list = []
+        self.ecg_buffer_lock = QtCore.QMutex()
+
+        self.has_brth = False
+        self.brth_buffer = None
+        self.brth_sample_index_buffer = None
+        self.brth_buffer_index = 0
+        self.brth_sample_rate = 0
+        self.brth_impedance: list = []
+        self.brth_buffer_lock = QtCore.QMutex()
+
+        self.quaternion = [1.0, 0.0, 0.0, 0.0]
+        self.quaternion_lock = QtCore.QMutex()
+
+    def get_buffer_lock(self, data_type):
+        lock = self.buffer_locks.get(data_type)
+        if lock is None:
+            lock = QtCore.QMutex()
+            self.buffer_locks[data_type] = lock
+        return lock
+
+    def init_buffers(self, info: DeviceInfo, eeg_axis_count: int):
+        configs = [
+            (DataType.NTF_ACC,        info.AccSampleRate,   info.AccChannelCount),
+            (DataType.NTF_GYRO,       info.GyroSampleRate,  info.GyroChannelCount),
+            (DataType.NTF_EULER_DATA, info.EulerSampleRate, info.EulerChannelCount),
+            (DataType.NTF_QUATERNION, info.QuatSampleRate,  info.QuatChannelCount),
+        ]
+        for dt, sr, ch in configs:
+            if sr > 0 and ch > 0:
+                buf_len = max(sr * BUFFER_SECONDS, 1)
+                self.buffers[dt]               = np.zeros((ch, buf_len))
+                self.sample_index_buffers[dt]  = np.zeros((ch, buf_len), dtype=np.int64)
+                self.sample_rates[dt]          = sr
+                self.buffer_indices[dt]        = 0
+
+        if info.EegSampleRate > 0 and info.EegChannelCount > 0:
+            self.eeg_sample_rate = info.EegSampleRate
+            self.eeg_total_channels = info.EegChannelCount
+            self.eeg_page_index = 0
+            buf_len = max(info.EegSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.eeg_buffer = np.zeros((info.EegChannelCount, buf_len))
+            self.eeg_sample_index_buffer = np.zeros((info.EegChannelCount, buf_len), dtype=np.int64)
+            self.eeg_buffer_index = 0
+
+        self.has_ecg = info.EcgSampleRate > 0 and info.EcgChannelCount > 0
+        if self.has_ecg:
+            self.ecg_sample_rate = info.EcgSampleRate
+            buf_len = max(info.EcgSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.ecg_buffer = np.zeros((info.EcgChannelCount, buf_len))
+            self.ecg_sample_index_buffer = np.zeros((info.EcgChannelCount, buf_len), dtype=np.int64)
+            self.ecg_buffer_index = 0
+
+        self.has_brth = info.BrthSampleRate > 0 and info.BrthChannelCount > 0
+        if self.has_brth:
+            self.brth_sample_rate = info.BrthSampleRate
+            buf_len = max(info.BrthSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.brth_buffer = np.zeros((info.BrthChannelCount, buf_len))
+            self.brth_sample_index_buffer = np.zeros((info.BrthChannelCount, buf_len), dtype=np.int64)
+            self.brth_buffer_index = 0
+
+        extra_axes = int(self.has_ecg) + int(self.has_brth)
+        self.eeg_channels_per_page = eeg_axis_count - extra_axes
+
+    def append_data(self, data: SensorData):
+        if data.dataType == DataType.NTF_EEG:
+            self.eeg_buffer_lock.lock()
+            try:
+                buf = self.eeg_buffer
+                idx_buf = self.eeg_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self.eeg_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                    while len(self.eeg_impedance) <= ch_idx:
+                        self.eeg_impedance.append(0)
+                    if ch_samples:
+                        self.eeg_impedance[ch_idx] = ch_samples[-1].impedance
+                self.eeg_buffer_index = (self.eeg_buffer_index + n) % buf_len
+            finally:
+                self.eeg_buffer_lock.unlock()
+            return
+
+        if data.dataType == DataType.NTF_ECG:
+            self.ecg_buffer_lock.lock()
+            try:
+                buf = self.ecg_buffer
+                idx_buf = self.ecg_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self.ecg_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                    while len(self.ecg_impedance) <= ch_idx:
+                        self.ecg_impedance.append(0)
+                    if ch_samples:
+                        self.ecg_impedance[ch_idx] = ch_samples[-1].impedance
+                self.ecg_buffer_index = (self.ecg_buffer_index + n) % buf_len
+            finally:
+                self.ecg_buffer_lock.unlock()
+            return
+
+        if data.dataType == DataType.NTF_BRTH:
+            self.brth_buffer_lock.lock()
+            try:
+                buf = self.brth_buffer
+                idx_buf = self.brth_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self.brth_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                    while len(self.brth_impedance) <= ch_idx:
+                        self.brth_impedance.append(0)
+                    if ch_samples:
+                        self.brth_impedance[ch_idx] = ch_samples[-1].impedance
+                self.brth_buffer_index = (self.brth_buffer_index + n) % buf_len
+            finally:
+                self.brth_buffer_lock.unlock()
+            return
+
+        lock = self.get_buffer_lock(data.dataType)
+        lock.lock()
+        try:
+            buf = self.buffers.get(data.dataType)
+            idx_buf = self.sample_index_buffers.get(data.dataType)
+            if buf is None or idx_buf is None:
+                return
+            buf_len = buf.shape[1]
+            n = 0
+            buffer_index = self.buffer_indices.get(data.dataType, 0)
+            for ch_idx, ch_samples in enumerate(data.channelSamples):
+                if ch_idx >= buf.shape[0]:
+                    break
+                new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                n = min(len(new_vals), buf_len)
+                if n == 0:
+                    continue
+                write_start = buffer_index
+                write_end = write_start + n
+                new_vals = new_vals[-n:]
+                new_indices = new_indices[-n:]
+                if write_end <= buf_len:
+                    buf[ch_idx, write_start:write_end] = new_vals
+                    idx_buf[ch_idx, write_start:write_end] = new_indices
+                else:
+                    first_part = buf_len - write_start
+                    buf[ch_idx, write_start:] = new_vals[:first_part]
+                    buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                    idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                    idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+            self.buffer_indices[data.dataType] = (buffer_index + n) % buf_len
+        finally:
+            lock.unlock()
+
+    def clear_buffers(self):
+        """清空本设备所有数据缓冲区，等待新数据。"""
+        for dt in list(self.buffers.keys()):
+            lock = self.get_buffer_lock(dt)
+            lock.lock()
+            try:
+                self.buffers[dt].fill(0)
+                self.sample_index_buffers[dt].fill(0)
+                self.buffer_indices[dt] = 0
+            finally:
+                lock.unlock()
+
+        self.eeg_buffer_lock.lock()
+        self.ecg_buffer_lock.lock()
+        self.brth_buffer_lock.lock()
+        try:
+            if self.eeg_buffer is not None:
+                self.eeg_buffer.fill(0)
+                self.eeg_sample_index_buffer.fill(0)
+                self.eeg_buffer_index = 0
+            if self.ecg_buffer is not None:
+                self.ecg_buffer.fill(0)
+                self.ecg_sample_index_buffer.fill(0)
+                self.ecg_buffer_index = 0
+            if self.brth_buffer is not None:
+                self.brth_buffer.fill(0)
+                self.brth_sample_index_buffer.fill(0)
+                self.brth_buffer_index = 0
+        finally:
+            self.brth_buffer_lock.unlock()
+            self.ecg_buffer_lock.unlock()
+            self.eeg_buffer_lock.unlock()
+
+
 class IMUQuaternionEEGDemo(QtWidgets.QWidget):
-    data_received  = QtCore.pyqtSignal(object)
+    data_received  = QtCore.pyqtSignal(object, object)       # (address, SensorData)
     add_device_sig = QtCore.pyqtSignal(str)
-    lost_packet_signal = QtCore.pyqtSignal(str, int)
-    device_disconnected_sig = QtCore.pyqtSignal()
+    lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
+    device_disconnected_sig = QtCore.pyqtSignal(str)         # address
+    replay_done_sig = QtCore.pyqtSignal(str)
+    analyze_done_sig = QtCore.pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
         self.discovered_devices = []
-        self.current_sensor: SensorProfile = None
-        self._pending_device = None
+        self.current_sensor: SensorProfile = None   # 当前在列表中选中、正在显示的设备
+        self.device_states: dict = {}               # Address -> DeviceDataState（已连接设备）
         self.sensor_controller = SensorController()
         self.thread_pool = QThreadPool.globalInstance()
-        self._data_type_pools = {}
+        self._data_type_pools = {}                  # (Address, DataType) -> QThreadPool
 
         self.active_data_type = DataType.NTF_ACC
-        self.buffers = {}
-        self.sample_rates = {}
-        self._sample_index_buffers = {}
         self._last_plotted_sample_indices = {}
-        self._buffer_indices = {}
         self.lines_2d = []
 
-        self.current_quaternion = [1.0, 0.0, 0.0, 0.0]
-        self._last_drawn_quaternion = [1.0, 0.0, 0.0, 0.0]
+        self._last_drawn_quaternion = None
         self._last_3d_update_time = 0.0
-        self.quaternion_lock = QtCore.QMutex()
-        self._buffer_locks = {}
-        self._eeg_buffer_lock = QtCore.QMutex()
-        self._ecg_buffer_lock = QtCore.QMutex()
-        self._brth_buffer_lock = QtCore.QMutex()
         self.cube_vertices = None
         self.cube_faces = None
 
-        self.eeg_buffer = None
-        self._eeg_sample_index_buffer = None
-        self.eeg_sample_rate = 0
         self.eeg_lines = []
-        self.eeg_impedance = []
-        self._eeg_display_channels = 0
-        self.eeg_total_channels = 0
-        self.eeg_page_index = 0
-        self.eeg_channels_per_page = 8
-        self.has_ecg = False
-
-        self.ecg_buffer = None
-        self._ecg_sample_index_buffer = None
-        self.ecg_sample_rate = 0
         self.ecg_line = None
-        self.ecg_impedance = []
-
-        self.has_brth = False
-
-        self.brth_buffer = None
-        self._brth_sample_index_buffer = None
-        self.brth_sample_rate = 0
         self.brth_line = None
-        self.brth_impedance = []
+        self._eeg_display_channels = 0
 
         self._updating_ntf_controls = False
         self._updating_filter_controls = False
@@ -134,7 +395,11 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self._ntf_checkboxes: dict = {}
         self._filter_checkboxes: dict = {}
         self._debug_log_enabled = True
-        self._data_debug_log_enabled = False
+        self._data_debug_log_enabled = True
+        self._replay_thread = None
+        self._replay_sensor = None
+        self._replay_paused = False
+        self._replay_stop_requested = False
 
         self._init_ui()
 
@@ -146,8 +411,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
-
-        self.lost_packet_counts = {}
+        self.replay_done_sig.connect(self._on_replay_done)
+        self.analyze_done_sig.connect(self._on_analyze_done)
 
         if not self.sensor_controller.hasDeviceFoundCallback:
             self.sensor_controller.onDeviceFoundCallback = self._on_device_found
@@ -190,19 +455,46 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self.btn_stop_scan.clicked.connect(self._stop_scan)
         self.btn_stop_scan.setEnabled(False)
 
+        self.btn_connect = QtWidgets.QPushButton("Connect")
+        self.btn_connect.clicked.connect(self._connect_selected_device)
+        self.btn_connect.setEnabled(False)
+
         self.btn_disconnect = QtWidgets.QPushButton("Disconnect")
-        self.btn_disconnect.clicked.connect(self._disconnect)
+        self.btn_disconnect.clicked.connect(self._disconnect_selected_device)
         self.btn_disconnect.setEnabled(False)
+
+        self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
+        self.btn_replay.clicked.connect(self._replay_bin_file)
+
+        self.btn_analyze = QtWidgets.QPushButton("Analyze Bin")
+        self.btn_analyze.clicked.connect(self._analyze_bin_file)
+
+        self.btn_replay_pause = QtWidgets.QPushButton("Pause Replay")
+        self.btn_replay_pause.clicked.connect(self._toggle_replay_pause)
+        self.btn_replay_pause.setEnabled(False)
+
+        self.btn_replay_stop = QtWidgets.QPushButton("Stop Replay")
+        self.btn_replay_stop.clicked.connect(self._stop_replay)
+        self.btn_replay_stop.setEnabled(False)
 
         button_layout = QtWidgets.QVBoxLayout()
         button_layout.addWidget(self.btn_scan)
         button_layout.addWidget(self.btn_stop_scan)
+        button_layout.addWidget(self.btn_connect)
         button_layout.addWidget(self.btn_disconnect)
         button_layout.addStretch()
 
+        # 回放按钮放在控制行最右边
+        replay_button_layout = QtWidgets.QVBoxLayout()
+        replay_button_layout.addWidget(self.btn_replay)
+        replay_button_layout.addWidget(self.btn_analyze)
+        replay_button_layout.addWidget(self.btn_replay_pause)
+        replay_button_layout.addWidget(self.btn_replay_stop)
+        replay_button_layout.addStretch()
+
         self.device_list = QtWidgets.QListWidget()
         self.device_list.setMaximumHeight(80)
-        self.device_list.itemClicked.connect(self._connect_device)
+        self.device_list.itemClicked.connect(self._on_device_selected)
 
         device_layout = QtWidgets.QVBoxLayout()
         device_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
@@ -211,6 +503,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         scan_layout = QtWidgets.QHBoxLayout()
         scan_layout.addLayout(button_layout)
         scan_layout.addLayout(device_layout, stretch=1)
+        scan_layout.addLayout(replay_button_layout)
         controls_layout.addLayout(scan_layout)
 
         type_layout = QtWidgets.QVBoxLayout()
@@ -224,7 +517,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
         self.value_labels: dict = {}
         self.value_box = QtWidgets.QGroupBox("Real-time Values")
-        self.value_layout = QtWidgets.QVBoxLayout()
+        self.value_layout = QtWidgets.QHBoxLayout()
         self.value_box.setLayout(self.value_layout)
 
         self.lost_packet_label = QtWidgets.QLabel("Packet Loss Stats: None")
@@ -265,6 +558,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         self._debug_log_checkbox.stateChanged.connect(self._on_debug_log_toggled)
         debug_log_layout.addWidget(self._debug_log_checkbox)
         self._data_debug_log_checkbox = QtWidgets.QCheckBox("Enable Data Debug Log")
+        self._data_debug_log_checkbox.setChecked(True)
         self._data_debug_log_checkbox.stateChanged.connect(self._on_data_debug_log_toggled)
         debug_log_layout.addWidget(self._data_debug_log_checkbox)
         debug_log_group.setLayout(debug_log_layout)
@@ -338,7 +632,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle("SynchroniSDKPython IMU + Quaternion + EEG + ECG + BRTH Demo")
+        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EEG + ECG + BRTH Demo (sensor-sdk v{sensor.__version__})")
         self.resize(1600, 900)
         self.show()
 
@@ -369,31 +663,61 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     def _add_device_item(self, text: str):
         self.device_list.addItem(text)
 
-    def _connect_device(self, item):
-        text = item.text()
-        addr = text.split("Address: ")[1].strip()
-        device = next((d for d in self.discovered_devices if d.Address == addr), None)
+    def _selected_address(self) -> Optional[str]:
+        item = self.device_list.currentItem()
+        if item is None or "Address: " not in item.text():
+            return None
+        return item.text().split("Address: ")[1].strip()
+
+    def _selected_list_device(self) -> Optional[BLEDevice]:
+        addr = self._selected_address()
+        if addr is None:
+            return None
+        return next((d for d in self.discovered_devices if d.Address == addr), None)
+
+    def _current_state(self) -> Optional[DeviceDataState]:
+        """当前显示设备对应的 DeviceDataState，未连接时返回 None。"""
+        if self.current_sensor is None:
+            return None
+        return self.device_states.get(self.current_sensor.BLEDevice.Address)
+
+    def _on_device_selected(self, item):
+        """单击设备列表只切换当前显示的设备，不触发连接。"""
+        addr = item.text().split("Address: ")[1].strip() if "Address: " in item.text() else None
+        state = self.device_states.get(addr) if addr else None
+        self.current_sensor = state.sensor if state is not None else None
+        self._refresh_display_for_state(state)
+        self._update_button_states()
+
+    def _update_button_states(self):
+        addr = self._selected_address()
+        connected = addr is not None and addr in self.device_states
+        self.btn_connect.setEnabled(addr is not None and not connected)
+        self.btn_disconnect.setEnabled(connected)
+
+    def _update_device_item_text(self, addr: str, connected: bool):
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            text = item.text()
+            if f"Address: {addr}" not in text:
+                continue
+            if text.startswith("[Connected] "):
+                text = text[len("[Connected] "):]
+            if connected:
+                text = "[Connected] " + text
+            item.setText(text)
+            break
+
+    def _connect_selected_device(self):
+        """连接列表中选中的设备，支持同时连接多台设备。"""
+        device = self._selected_list_device()
         if device is None:
+            self.status_label.setText("Please select a device in the list first")
+            return
+        addr = device.Address
+        if addr in self.device_states:
             return
 
-        sensor = self.sensor_controller.requireSensor(device)
-        if sensor is None:
-            self.status_label.setText("Failed to create SensorProfile")
-            return
-
-        # 只允许同时连接一个设备，选择新设备时先断开旧设备
-        if self.current_sensor is not None and self.current_sensor != sensor:
-            self._pending_device = device
-            self._disconnect()
-            return
-
-        if self.current_sensor is not None and self.current_sensor == sensor:
-            return
-
-        self._do_connect_device(device)
-
-    def _do_connect_device(self, device: BLEDevice):
-        """实际执行连接、初始化、启动数据流（要求当前无已连接设备）。"""
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
             self.status_label.setText("Failed to create SensorProfile")
@@ -404,22 +728,27 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         sensor.onErrorCallback = self._on_error
         sensor.onPowerChanged  = self._on_power_changed
 
+        self.status_label.setText(f"Connecting: {device.Name} ...")
+        self.btn_connect.setEnabled(False)
+
         if sensor.deviceState != DeviceStateEx.Ready:
             if not sensor.connect():
                 self.status_label.setText(f"Failed to connect to {device.Name}")
+                self._update_button_states()
                 return
+
+        state = DeviceDataState(sensor)
 
         if not sensor.hasInited:
             if not sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
                 self.status_label.setText(f"Failed to initialize {device.Name}")
+                self._update_button_states()
                 return
 
             info = sensor.getDeviceInfo()
-            self._init_buffers(sensor, info)
-            self.model_label.setText(f"Model: {info.ModelName}")
-            self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
-            self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
-            self.status_label.setText(
+            state.info = info
+            state.init_buffers(info, len(self.axes_eeg))
+            state.status_text = (
                 f"Connected: {device.Name} | "
                 f"ACC {info.AccChannelCount}ch @ {info.AccSampleRate}Hz | "
                 f"Euler {info.EulerChannelCount}ch @ {info.EulerSampleRate}Hz | "
@@ -432,115 +761,286 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         if not sensor.isDataTransfering:
             if not sensor.startDataNotification():
                 self.status_label.setText("Failed to start data stream")
+                self._update_button_states()
                 return
 
-        self.current_sensor = sensor
-        self.btn_disconnect.setEnabled(True)
-        for cb in self._ntf_checkboxes.values():
-            cb.setEnabled(True)
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(True)
+        self.device_states[addr] = state
+        self._update_device_item_text(addr, connected=True)
 
-        # 根据设备实际参数刷新 UI 开关状态
-        self._refresh_control_states(sensor)
+        # 初始电量发布发生在 state 注册之前（子进程 init 成功后立即发布），
+        # 这里显式补取一次，避免切换显示时电量显示 "--"
+        try:
+            power = sensor.getBatteryLevel()
+            if power is not None and power >= 0:
+                state.last_power = power
+        except Exception:
+            pass
 
-        # 根据全局 Debug Log 开关状态初始化当前设备的日志设置
+        # 若连接的是当前选中的设备，将其设为当前显示设备
+        if self._selected_address() == addr:
+            self.current_sensor = sensor
+
+        # 根据全局 Debug Log 开关状态初始化新设备的日志设置
         if self._debug_log_enabled:
             sensor.setParam("DEBUG_LOG_PATH", "True")
         if self._data_debug_log_enabled:
             sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
 
-        self._rebuild_2d_plot()
-        self._rebuild_eeg_plot()
+        # 查询并缓存设备 NTF/FILTER 状态
+        self._refresh_control_states(sensor)
 
-    def _disconnect(self):
-        if self.current_sensor:
-            self.current_sensor.disconnect()
+        if self.current_sensor == sensor:
+            self._refresh_display_for_state(state)
+
+        self._update_button_states()
+
+    def _disconnect_selected_device(self):
+        """断开当前选中（显示）的设备，其余已连接设备不受影响。"""
+        sensor = self.current_sensor
+        if sensor is None:
+            return
+        self.btn_disconnect.setEnabled(False)
+        self.btn_connect.setEnabled(False)
+        for cb in self._ntf_checkboxes.values():
+            cb.setEnabled(False)
+        for cb in self._filter_checkboxes.values():
+            cb.setEnabled(False)
+        self.status_label.setText("Disconnecting...")
+        sensor.disconnect()
+        # 后续清理由 onStateChanged -> _on_device_disconnected 完成
+
+    # ── Bin 文件回放 ────────────────────────────────────────────────────────────
+
+    def _set_replay_mode_ui(self, replaying: bool):
+        """回放期间禁用扫描 / 连接设备 / 调试日志等实时设备控件，回放结束后恢复。
+        已连接的设备不受影响（回放开始前会拒绝在有设备连接时进入回放）。"""
+        if replaying:
+            # 回放不经过实时链路：停掉进行中的扫描
+            if self.sensor_controller.isScanning:
+                self.sensor_controller.stopScan()
+            self.btn_stop_scan.setEnabled(False)
+            self.btn_connect.setEnabled(False)
             self.btn_disconnect.setEnabled(False)
-            for cb in self._ntf_checkboxes.values():
-                cb.setEnabled(False)
-            for cb in self._filter_checkboxes.values():
-                cb.setEnabled(False)
-            self.status_label.setText("Disconnecting...")
-            self.model_label.setText("Model: --")
-            self.hw_version_label.setText("HW Version: --")
-            self.fw_version_label.setText("FW Version: --")
-            self.power_label.setText("Power: --%")
+        else:
+            self._update_button_states()
+        self.btn_scan.setEnabled(not replaying)
+        self.device_list.setEnabled(not replaying)
+        self._debug_log_checkbox.setEnabled(not replaying)
+        self._data_debug_log_checkbox.setEnabled(not replaying)
 
-    # ── Data Buffers ──────────────────────────────────────────────────────────
+    def _replay_bin_file(self):
+        """选择一个 bin 文件并按原始时间节奏回放，数据显示流程与实时数据一致。"""
+        if self.device_states:
+            self.status_label.setText("Please disconnect all devices before replaying a bin file")
+            return
+        if self._replay_thread is not None and self._replay_thread.is_alive():
+            return
 
-    def _init_buffers(self, sensor: SensorProfile, info: DeviceInfo):
-        configs = [
-            (DataType.NTF_ACC,        info.AccSampleRate,   info.AccChannelCount),
-            (DataType.NTF_GYRO,       info.GyroSampleRate,  info.GyroChannelCount),
-            (DataType.NTF_EULER_DATA, info.EulerSampleRate, info.EulerChannelCount),
-            (DataType.NTF_QUATERNION, info.QuatSampleRate,  info.QuatChannelCount),
-        ]
-        for dt, sr, ch in configs:
-            if sr > 0 and ch > 0:
-                buf_len = max(sr * BUFFER_SECONDS, 1)
-                self.buffers[dt]      = np.zeros((ch, buf_len))
-                self._sample_index_buffers[dt] = np.zeros((ch, buf_len), dtype=np.int64)
-                self.sample_rates[dt] = sr
-                self._buffer_indices[dt] = 0
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Bin File", start_dir, "Bin Files (*.bin)"
+        )
+        if not path:
+            return
 
-        if info.EegSampleRate > 0 and info.EegChannelCount > 0:
-            self.eeg_sample_rate = info.EegSampleRate
-            self.eeg_total_channels = info.EegChannelCount
-            self.eeg_page_index = 0
-            buf_len = max(info.EegSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.eeg_buffer = np.zeros((info.EegChannelCount, buf_len))
-            self._eeg_sample_index_buffer = np.zeros((info.EegChannelCount, buf_len), dtype=np.int64)
-            self._eeg_buffer_index = 0
+        config = self.sensor_controller.getBinFileInfo(path)
+        if config is None:
+            self.status_label.setText("Invalid bin file: no config record found")
+            return
 
-        self.has_ecg = info.EcgSampleRate > 0 and info.EcgChannelCount > 0
-        if self.has_ecg:
-            self.ecg_sample_rate = info.EcgSampleRate
-            buf_len = max(info.EcgSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.ecg_buffer = np.zeros((info.EcgChannelCount, buf_len))
-            self._ecg_sample_index_buffer = np.zeros((info.EcgChannelCount, buf_len), dtype=np.int64)
-            self._ecg_buffer_index = 0
+        mac = config.get("device_mac")
+        if not mac:
+            self.status_label.setText("Invalid bin file: config missing device_mac")
+            return
+        name = config.get("device_name") or ""
 
-        self.has_brth = info.BrthSampleRate > 0 and info.BrthChannelCount > 0
-        if self.has_brth:
-            self.brth_sample_rate = info.BrthSampleRate
-            buf_len = max(info.BrthSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.brth_buffer = np.zeros((info.BrthChannelCount, buf_len))
-            self._brth_sample_index_buffer = np.zeros((info.BrthChannelCount, buf_len), dtype=np.int64)
-            self._brth_buffer_index = 0
+        # 用 bin 配置记录中的设备信息初始化显示缓冲区
+        info = DeviceInfo()
+        for key, value in (config.get("device_info") or {}).items():
+            if hasattr(info, key):
+                try:
+                    setattr(info, key, value)
+                except Exception:
+                    pass
 
-        extra_axes = int(self.has_ecg) + int(self.has_brth)
-        self.eeg_channels_per_page = len(self.axes_eeg) - extra_axes
+        sensor = self.sensor_controller.requireSensor(BLEDevice(name, mac, 0))
+        if sensor is None:
+            self.status_label.setText("Failed to create SensorProfile for replay")
+            return
+        sensor.onDataCallback = self._on_data
+        sensor.onErrorCallback = self._on_error
+
+        self._replay_sensor = sensor
+
+        # 回放传感器作为一台虚拟设备进入 device_states：
+        # _on_data 按地址路由到它的 DeviceDataState，显示流程与实时设备一致
+        state = DeviceDataState(sensor)
+        state.info = info
+        state.init_buffers(info, len(self.axes_eeg))
+        duration = config.get("replay_duration", 0.0)
+        version = config.get("version", "?")
+        state.status_text = (
+            f"Replaying: {Path(path).name} (config v{version}, duration {duration:.1f}s, realtime) ...")
+        self.device_states[mac] = state
+        self.current_sensor = sensor
+        self._refresh_display_for_state(state)
+
+        self._replay_paused = False
+        self._replay_stop_requested = False
+        self.btn_replay.setEnabled(False)
+        self.btn_replay_pause.setEnabled(True)
+        self.btn_replay_pause.setText("Pause Replay")
+        self.btn_replay_stop.setEnabled(True)
+        self._set_replay_mode_ui(True)
+
+        def _do_replay():
+            try:
+                result = self.sensor_controller.replayBinFile(
+                    path, sensor, realtime=True)
+                if result is None:
+                    self.replay_done_sig.emit("Replay failed to start")
+                elif self._replay_stop_requested:
+                    self.replay_done_sig.emit("Replay stopped")
+                else:
+                    self.replay_done_sig.emit(f"Replay finished: {Path(path).name}")
+            except Exception as e:
+                self.replay_done_sig.emit(f"Replay error: {e}")
+
+        self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinReplay")
+        self._replay_thread.start()
+
+    def _toggle_replay_pause(self):
+        """暂停/恢复当前回放。"""
+        sensor = self._replay_sensor
+        if sensor is None:
+            return
+        if self._replay_paused:
+            result = self.sensor_controller.resumeBinReplay(sensor)
+        else:
+            result = self.sensor_controller.pauseBinReplay(sensor)
+        if result != "OK":
+            self.status_label.setText(f"Replay pause/resume failed: {result}")
+            return
+        self._replay_paused = not self._replay_paused
+        if self._replay_paused:
+            self.btn_replay_pause.setText("Resume Replay")
+            self.status_label.setText("Replay paused")
+        else:
+            self.btn_replay_pause.setText("Pause Replay")
+            self.status_label.setText("Replaying ...")
+
+    def _stop_replay(self):
+        """停止当前回放。"""
+        sensor = self._replay_sensor
+        if sensor is None:
+            return
+        self._replay_stop_requested = True
+        self.btn_replay_stop.setEnabled(False)
+        self.btn_replay_pause.setEnabled(False)
+        result = self.sensor_controller.stopBinReplay(sensor)
+        if result != "OK":
+            self.status_label.setText(f"Stop replay failed: {result}")
+            return
+        self.status_label.setText("Stopping replay ...")
+
+    def _on_replay_done(self, message: str):
+        # 回放结束：移除回放用的虚拟设备状态，恢复实时设备控件
+        sensor = self._replay_sensor
+        if sensor is not None:
+            self.device_states.pop(sensor.BLEDevice.Address, None)
+            if self.current_sensor is sensor:
+                self.current_sensor = None
+        self._refresh_display_for_state(None)
+        self.status_label.setText(message)
+        self.btn_replay.setEnabled(True)
+        self.btn_replay_pause.setEnabled(False)
+        self.btn_replay_pause.setText("Pause Replay")
+        self.btn_replay_stop.setEnabled(False)
+        self._set_replay_mode_ui(False)
+        self._replay_paused = False
+        self._replay_stop_requested = False
+
+    # ── Bin 文件离线解析 ──────────────────────────────────────────────────────
+
+    def _analyze_bin_file(self):
+        """选择 bin 文件并在同目录解析为 CSV，完成后用系统默认编辑器打开。"""
+        if getattr(self, "_analyze_thread", None) is not None and self._analyze_thread.is_alive():
+            return
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Bin File to Analyze", start_dir, "Bin Files (*.bin)"
+        )
+        if not path:
+            return
+
+        self.btn_analyze.setEnabled(False)
+        self.status_label.setText(f"Analyzing: {Path(path).name} ...")
+
+        def _do_analyze():
+            try:
+                csv_path = self.sensor_controller.parseBinToCsv(path)
+                self.analyze_done_sig.emit(csv_path, "")
+            except Exception as e:
+                self.analyze_done_sig.emit("", str(e))
+
+        self._analyze_thread = threading.Thread(target=_do_analyze, daemon=True, name="BinAnalyze")
+        self._analyze_thread.start()
+
+    def _on_analyze_done(self, csv_path: str, error: str):
+        self.btn_analyze.setEnabled(True)
+        if error:
+            self.status_label.setText(f"Analyze failed: {error}")
+            return
+        self.status_label.setText(f"CSV saved: {csv_path}")
+        self._open_in_system_editor(csv_path)
+
+    @staticmethod
+    def _open_in_system_editor(path: str):
+        """用系统默认应用打开文件（macOS open / Windows startfile / Linux xdg-open）。"""
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            elif sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    # ── Data Routing ──────────────────────────────────────────────────────────
 
     def _on_data(self, sensor: SensorProfile, data: SensorData):
-        if data and data.channelSamples:
-            if data.dataType in self.buffers or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH):
-                self.data_received.emit(data)
-            if data.dataType == DataType.NTF_QUATERNION:
-                self._update_quaternion(data)
+        if not (data and data.channelSamples):
+            return
+        addr = sensor.BLEDevice.Address
+        state = self.device_states.get(addr)
+        if state is None:
+            return
+        if data.dataType in state.buffers or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH):
+            self.data_received.emit(addr, data)
+        if data.dataType == DataType.NTF_QUATERNION:
+            self._update_quaternion(state, data)
 
-    def _get_data_type_pool(self, data_type):
-        pool = self._data_type_pools.get(data_type)
+    def _get_data_type_pool(self, key):
+        pool = self._data_type_pools.get(key)
         if pool is None:
             pool = QThreadPool()
             pool.setMaxThreadCount(1)
-            self._data_type_pools[data_type] = pool
+            self._data_type_pools[key] = pool
         return pool
 
-    def _get_buffer_lock(self, data_type):
-        lock = self._buffer_locks.get(data_type)
-        if lock is None:
-            lock = QtCore.QMutex()
-            self._buffer_locks[data_type] = lock
-        return lock
-
-    def _dispatch_data(self, data: SensorData):
+    def _dispatch_data(self, addr: str, data: SensorData):
+        state = self.device_states.get(addr)
+        if state is None:
+            return
         if data.lostPackageCount > 0:
             type_name = DataType(data.dataType).name if data.dataType is not None else "Unknown"
-            self.lost_packet_signal.emit(type_name, data.lostPackageCount)
+            self.lost_packet_signal.emit(addr, type_name, data.lostPackageCount)
 
-        task = DataTask(self._append_to_buffer, data)
-        pool = self._get_data_type_pool(data.dataType)
+        task = DataTask(state.append_data, data)
+        pool = self._get_data_type_pool((addr, data.dataType))
         pool.start(task)
 
     def closeEvent(self, event):
@@ -551,159 +1051,6 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         except Exception as e:
             print(f"[closeEvent] terminate error: {e}")
         event.accept()
-
-    def _append_to_buffer(self, data: SensorData):
-        if data.dataType == DataType.NTF_EEG:
-            self._eeg_buffer_lock.lock()
-            try:
-                buf = self.eeg_buffer
-                idx_buf = self._eeg_sample_index_buffer
-                if buf is None or idx_buf is None:
-                    return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self._eeg_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-                    while len(self.eeg_impedance) <= ch_idx:
-                        self.eeg_impedance.append(0)
-                    if ch_samples:
-                        self.eeg_impedance[ch_idx] = ch_samples[-1].impedance
-                self._eeg_buffer_index = (self._eeg_buffer_index + n) % buf_len
-            finally:
-                self._eeg_buffer_lock.unlock()
-            return
-
-        if data.dataType == DataType.NTF_ECG:
-            self._ecg_buffer_lock.lock()
-            try:
-                buf = self.ecg_buffer
-                idx_buf = self._ecg_sample_index_buffer
-                if buf is None or idx_buf is None:
-                    return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self._ecg_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-                    while len(self.ecg_impedance) <= ch_idx:
-                        self.ecg_impedance.append(0)
-                    if ch_samples:
-                        self.ecg_impedance[ch_idx] = ch_samples[-1].impedance
-                self._ecg_buffer_index = (self._ecg_buffer_index + n) % buf_len
-            finally:
-                self._ecg_buffer_lock.unlock()
-            return
-
-        if data.dataType == DataType.NTF_BRTH:
-            self._brth_buffer_lock.lock()
-            try:
-                buf = self.brth_buffer
-                idx_buf = self._brth_sample_index_buffer
-                if buf is None or idx_buf is None:
-                    return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self._brth_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-                    while len(self.brth_impedance) <= ch_idx:
-                        self.brth_impedance.append(0)
-                    if ch_samples:
-                        self.brth_impedance[ch_idx] = ch_samples[-1].impedance
-                self._brth_buffer_index = (self._brth_buffer_index + n) % buf_len
-            finally:
-                self._brth_buffer_lock.unlock()
-            return
-
-        lock = self._get_buffer_lock(data.dataType)
-        lock.lock()
-        try:
-            buf = self.buffers.get(data.dataType)
-            idx_buf = self._sample_index_buffers.get(data.dataType)
-            if buf is None or idx_buf is None:
-                return
-            buf_len = buf.shape[1]
-            n = 0
-            buffer_index = self._buffer_indices.get(data.dataType, 0)
-            for ch_idx, ch_samples in enumerate(data.channelSamples):
-                if ch_idx >= buf.shape[0]:
-                    break
-                new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                n = min(len(new_vals), buf_len)
-                if n == 0:
-                    continue
-                write_start = buffer_index
-                write_end = write_start + n
-                new_vals = new_vals[-n:]
-                new_indices = new_indices[-n:]
-                if write_end <= buf_len:
-                    buf[ch_idx, write_start:write_end] = new_vals
-                    idx_buf[ch_idx, write_start:write_end] = new_indices
-                else:
-                    first_part = buf_len - write_start
-                    buf[ch_idx, write_start:] = new_vals[:first_part]
-                    buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                    idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                    idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-            self._buffer_indices[data.dataType] = (buffer_index + n) % buf_len
-        finally:
-            lock.unlock()
 
     # ── Bottom-left 2D Waveform ───────────────────────────────────────────────
 
@@ -721,21 +1068,29 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             lbl.setParent(None)
         self.value_labels.clear()
 
-        lock = self._get_buffer_lock(dt)
-        lock.lock()
-        try:
-            buf = self.buffers.get(dt)
-            idx_buf = self._sample_index_buffers.get(dt)
-            if buf is None or idx_buf is None:
-                self.ax_2d.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} (Device not supported or disabled)")
-                self.canvas_2d.draw_idle()
-                self._last_plotted_sample_indices.pop(dt, None)
-                return
-            buf_copy = buf.copy()
-            idx_buf_copy = idx_buf.copy()
-            buffer_index = self._buffer_indices.get(dt, 0)
-        finally:
-            lock.unlock()
+        buf_copy = None
+        idx_buf_copy = None
+        buffer_index = 0
+        state = self._current_state()
+        if state is not None:
+            lock = state.get_buffer_lock(dt)
+            lock.lock()
+            try:
+                buf = state.buffers.get(dt)
+                idx_buf = state.sample_index_buffers.get(dt)
+                if buf is not None and idx_buf is not None:
+                    buf_copy = buf.copy()
+                    idx_buf_copy = idx_buf.copy()
+                    buffer_index = state.buffer_indices.get(dt, 0)
+            finally:
+                lock.unlock()
+
+        if buf_copy is None or idx_buf_copy is None:
+            suffix = "(Not connected)" if state is None else "(Device not supported or disabled)"
+            self.ax_2d.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} {suffix}")
+            self.canvas_2d.draw_idle()
+            self._last_plotted_sample_indices.pop(dt, None)
+            return
 
         self._last_plotted_sample_indices[dt] = int(idx_buf_copy.max())
 
@@ -760,75 +1115,110 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
     # ── Right-side EEG + ECG Waveform ─────────────────────────────────────────
 
     def _eeg_page_count(self) -> int:
-        if self.eeg_total_channels <= 0:
+        state = self._current_state()
+        if state is None or state.eeg_total_channels <= 0:
             return 1
-        return max(1, (self.eeg_total_channels + self.eeg_channels_per_page - 1) // self.eeg_channels_per_page)
+        return max(1, (state.eeg_total_channels + state.eeg_channels_per_page - 1) // state.eeg_channels_per_page)
 
     def _eeg_page_range(self):
+        state = self._current_state()
+        if state is None:
+            return 0, 0
         page_count = self._eeg_page_count()
-        self.eeg_page_index = max(0, min(self.eeg_page_index, page_count - 1))
-        start = self.eeg_page_index * self.eeg_channels_per_page
-        end = min(start + self.eeg_channels_per_page, self.eeg_total_channels)
+        state.eeg_page_index = max(0, min(state.eeg_page_index, page_count - 1))
+        start = state.eeg_page_index * state.eeg_channels_per_page
+        end = min(start + state.eeg_channels_per_page, state.eeg_total_channels)
         return start, end
 
     def _update_page_label(self):
+        state = self._current_state()
         page_count = self._eeg_page_count()
-        self.page_label.setText(f"Page {self.eeg_page_index + 1} / {page_count}")
+        page_index = state.eeg_page_index if state is not None else 0
+        self.page_label.setText(f"Page {page_index + 1} / {page_count}")
 
     def _update_page_buttons(self):
+        state = self._current_state()
         page_count = self._eeg_page_count()
-        self.btn_prev_page.setEnabled(self.eeg_page_index > 0)
-        self.btn_next_page.setEnabled(self.eeg_page_index < page_count - 1)
+        page_index = state.eeg_page_index if state is not None else 0
+        self.btn_prev_page.setEnabled(state is not None and page_index > 0)
+        self.btn_next_page.setEnabled(state is not None and page_index < page_count - 1)
 
     def _prev_page(self):
-        if self.eeg_page_index > 0:
-            self.eeg_page_index -= 1
+        state = self._current_state()
+        if state is not None and state.eeg_page_index > 0:
+            state.eeg_page_index -= 1
             self._rebuild_eeg_plot()
             self._update_page_label()
             self._update_page_buttons()
 
     def _next_page(self):
+        state = self._current_state()
+        if state is None:
+            return
         page_count = self._eeg_page_count()
-        if self.eeg_page_index < page_count - 1:
-            self.eeg_page_index += 1
+        if state.eeg_page_index < page_count - 1:
+            state.eeg_page_index += 1
             self._rebuild_eeg_plot()
             self._update_page_label()
             self._update_page_buttons()
 
     def _rebuild_eeg_plot(self):
-        self._eeg_buffer_lock.lock()
-        self._ecg_buffer_lock.lock()
-        self._brth_buffer_lock.lock()
-        try:
-            eeg_available = self.eeg_buffer is not None and self._eeg_sample_index_buffer is not None
-            ecg_available = self.has_ecg and self.ecg_buffer is not None and self._ecg_sample_index_buffer is not None
-            brth_available = self.has_brth and self.brth_buffer is not None and self._brth_sample_index_buffer is not None
-            if not eeg_available:
-                for ax in self.axes_eeg:
-                    ax.cla()
-                    ax.set_visible(True)
-                self.axes_eeg[0].set_title("EEG + ECG + BRTH (Device not supported or disabled)")
-                self.canvas_eeg.draw_idle()
-                self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
-                self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
-                self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
-                self.eeg_lines = []
-                self.ecg_line = None
-                self.brth_line = None
-                return
-            eeg_buffer_copy = self.eeg_buffer.copy()
-            eeg_idx_buf_copy = self._eeg_sample_index_buffer.copy()
-            eeg_buffer_index = self._eeg_buffer_index
-            ecg_buffer_copy = self.ecg_buffer.copy() if ecg_available else None
-            ecg_idx_buf_copy = self._ecg_sample_index_buffer.copy() if ecg_available else None
-            ecg_buffer_index = self._ecg_buffer_index if ecg_available else 0
-            brth_buffer_copy = self.brth_buffer.copy() if brth_available else None
-            brth_idx_buf_copy = self._brth_sample_index_buffer.copy() if brth_available else None
-            brth_buffer_index = self._brth_buffer_index if brth_available else 0
-        finally:
-            self._brth_buffer_lock.unlock()
-            self._ecg_buffer_lock.unlock()
-            self._eeg_buffer_lock.unlock()
+        state = self._current_state()
+        eeg_available = False
+        ecg_available = False
+        brth_available = False
+        eeg_buffer_copy = None
+        eeg_idx_buf_copy = None
+        eeg_buffer_index = 0
+        ecg_buffer_copy = None
+        ecg_idx_buf_copy = None
+        ecg_buffer_index = 0
+        brth_buffer_copy = None
+        brth_idx_buf_copy = None
+        brth_buffer_index = 0
+
+        if state is not None:
+            state.eeg_buffer_lock.lock()
+            state.ecg_buffer_lock.lock()
+            state.brth_buffer_lock.lock()
+            try:
+                eeg_available = state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None
+                ecg_available = state.has_ecg and state.ecg_buffer is not None and state.ecg_sample_index_buffer is not None
+                brth_available = state.has_brth and state.brth_buffer is not None and state.brth_sample_index_buffer is not None
+                if eeg_available:
+                    eeg_buffer_copy = state.eeg_buffer.copy()
+                    eeg_idx_buf_copy = state.eeg_sample_index_buffer.copy()
+                    eeg_buffer_index = state.eeg_buffer_index
+                if ecg_available:
+                    ecg_buffer_copy = state.ecg_buffer.copy()
+                    ecg_idx_buf_copy = state.ecg_sample_index_buffer.copy()
+                    ecg_buffer_index = state.ecg_buffer_index
+                if brth_available:
+                    brth_buffer_copy = state.brth_buffer.copy()
+                    brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
+                    brth_buffer_index = state.brth_buffer_index
+            finally:
+                state.brth_buffer_lock.unlock()
+                state.ecg_buffer_lock.unlock()
+                state.eeg_buffer_lock.unlock()
+
+        if not eeg_available:
+            for ax in self.axes_eeg:
+                ax.cla()
+                ax.set_visible(True)
+            suffix = "(Not connected)" if state is None else "(Device not supported or disabled)"
+            self.axes_eeg[0].set_title(f"EEG + ECG + BRTH {suffix}")
+            self.canvas_eeg.draw_idle()
+            self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
+            self.eeg_lines = []
+            self.ecg_line = None
+            self.brth_line = None
+            self._eeg_display_channels = 0
+            self._update_page_label()
+            self._update_page_buttons()
+            return
 
         self._last_plotted_sample_indices[DataType.NTF_EEG] = int(eeg_idx_buf_copy.max())
         if ecg_available:
@@ -844,8 +1234,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
-        brth_axis_index = len(self.axes_eeg) - 1 if self.has_brth else None
-        ecg_axis_index = len(self.axes_eeg) - 1 - int(self.has_brth) if self.has_ecg else None
+        brth_axis_index = len(self.axes_eeg) - 1 if brth_available else None
+        ecg_axis_index = len(self.axes_eeg) - 1 - int(brth_available) if ecg_available else None
 
         self.eeg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, eeg_buffer_copy.shape[1])
@@ -929,7 +1319,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self.ax_3d.quiver(0, 0, 0, 0, 0, axis_length,
                               color='b', arrow_length_ratio=0.1, linewidth=2),
         )
-        self._draw_cube()
+        self._draw_cube([1.0, 0.0, 0.0, 0.0])
 
     def _create_cube(self):
         vertices = np.array([
@@ -964,8 +1354,8 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
         ])
 
-    def _draw_cube(self):
-        R = self._quaternion_to_rotation_matrix(self.current_quaternion)
+    def _draw_cube(self, quaternion):
+        R = self._quaternion_to_rotation_matrix(quaternion)
         rotated_vertices = np.dot(self.cube_vertices, R.T)
         rotated_faces = [
             [rotated_vertices[0], rotated_vertices[1], rotated_vertices[2], rotated_vertices[3]],
@@ -977,7 +1367,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         ]
         self._cube_collection.set_verts(rotated_faces)
 
-    def _update_quaternion(self, data: SensorData):
+    def _update_quaternion(self, state: DeviceDataState, data: SensorData):
         try:
             if data.dataType == DataType.NTF_QUATERNION:
                 if len(data.channelSamples) == 4 and len(data.channelSamples[0]) > 0:
@@ -987,9 +1377,9 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                         data.channelSamples[2][0].data,
                         data.channelSamples[3][0].data,
                     ]
-                    self.quaternion_lock.lock()
-                    self.current_quaternion = quaternion
-                    self.quaternion_lock.unlock()
+                    state.quaternion_lock.lock()
+                    state.quaternion = quaternion
+                    state.quaternion_lock.unlock()
         except Exception as e:
             print(f"Quaternion update exception: {e}")
 
@@ -999,19 +1389,23 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         if self.windowState() & QtCore.Qt.WindowMinimized:
             return
 
+        state = self._current_state()
+        if state is None:
+            return
+
         dt  = self.active_data_type
         buf_copy = None
         idx_buf_copy = None
         buffer_index = 0
-        lock = self._get_buffer_lock(dt)
+        lock = state.get_buffer_lock(dt)
         lock.lock()
         try:
-            buf = self.buffers.get(dt)
-            idx_buf = self._sample_index_buffers.get(dt)
+            buf = state.buffers.get(dt)
+            idx_buf = state.sample_index_buffers.get(dt)
             if buf is not None and idx_buf is not None:
                 buf_copy = buf.copy()
                 idx_buf_copy = idx_buf.copy()
-                buffer_index = self._buffer_indices.get(dt, 0)
+                buffer_index = state.buffer_indices.get(dt, 0)
         finally:
             lock.unlock()
 
@@ -1060,32 +1454,32 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
         brth_idx_buf_copy = None
         brth_impedance_copy = None
         brth_buffer_index = 0
-        self._eeg_buffer_lock.lock()
-        self._ecg_buffer_lock.lock()
-        self._brth_buffer_lock.lock()
+        state.eeg_buffer_lock.lock()
+        state.ecg_buffer_lock.lock()
+        state.brth_buffer_lock.lock()
         try:
-            if self.eeg_buffer is not None and self._eeg_sample_index_buffer is not None:
-                eeg_buffer_copy = self.eeg_buffer.copy()
-                eeg_idx_buf_copy = self._eeg_sample_index_buffer.copy()
-                eeg_impedance_copy = list(self.eeg_impedance)
-                eeg_buffer_index = self._eeg_buffer_index
-            if self.has_ecg and self.ecg_buffer is not None and self._ecg_sample_index_buffer is not None:
-                ecg_buffer_copy = self.ecg_buffer.copy()
-                ecg_idx_buf_copy = self._ecg_sample_index_buffer.copy()
-                ecg_impedance_copy = list(self.ecg_impedance)
-                ecg_buffer_index = self._ecg_buffer_index
-            if self.has_brth and self.brth_buffer is not None and self._brth_sample_index_buffer is not None:
-                brth_buffer_copy = self.brth_buffer.copy()
-                brth_idx_buf_copy = self._brth_sample_index_buffer.copy()
-                brth_impedance_copy = list(self.brth_impedance)
-                brth_buffer_index = self._brth_buffer_index
+            if state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None:
+                eeg_buffer_copy = state.eeg_buffer.copy()
+                eeg_idx_buf_copy = state.eeg_sample_index_buffer.copy()
+                eeg_impedance_copy = list(state.eeg_impedance)
+                eeg_buffer_index = state.eeg_buffer_index
+            if state.has_ecg and state.ecg_buffer is not None and state.ecg_sample_index_buffer is not None:
+                ecg_buffer_copy = state.ecg_buffer.copy()
+                ecg_idx_buf_copy = state.ecg_sample_index_buffer.copy()
+                ecg_impedance_copy = list(state.ecg_impedance)
+                ecg_buffer_index = state.ecg_buffer_index
+            if state.has_brth and state.brth_buffer is not None and state.brth_sample_index_buffer is not None:
+                brth_buffer_copy = state.brth_buffer.copy()
+                brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
+                brth_impedance_copy = list(state.brth_impedance)
+                brth_buffer_index = state.brth_buffer_index
         finally:
-            self._brth_buffer_lock.unlock()
-            self._ecg_buffer_lock.unlock()
-            self._eeg_buffer_lock.unlock()
+            state.brth_buffer_lock.unlock()
+            state.ecg_buffer_lock.unlock()
+            state.eeg_buffer_lock.unlock()
 
-        brth_axis_index = len(self.axes_eeg) - 1 if self.has_brth else None
-        ecg_axis_index = len(self.axes_eeg) - 1 - int(self.has_brth) if self.has_ecg else None
+        brth_axis_index = len(self.axes_eeg) - 1 if state.has_brth else None
+        ecg_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) if state.has_ecg else None
         start_ch, _ = self._eeg_page_range()
 
         if eeg_buffer_copy is not None and eeg_idx_buf_copy is not None and self.eeg_lines:
@@ -1184,17 +1578,16 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
                 self._last_plotted_sample_indices[DataType.NTF_ECG] = current_last_idx
 
         try:
-            self.quaternion_lock.lock()
-            current_quaternion = self.current_quaternion[:]
-            self.quaternion_lock.unlock()
+            state.quaternion_lock.lock()
+            current_quaternion = state.quaternion[:]
+            state.quaternion_lock.unlock()
 
             now = time.time()
             elapsed_ms = (now - self._last_3d_update_time) * 1000
             quaternion_changed = current_quaternion != self._last_drawn_quaternion
 
             if elapsed_ms >= PLOT_UPDATE_INTERVAL and quaternion_changed:
-                self.current_quaternion = current_quaternion
-                self._draw_cube()
+                self._draw_cube(current_quaternion)
                 self._last_drawn_quaternion = current_quaternion[:]
                 self._last_3d_update_time = now
 
@@ -1206,49 +1599,37 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
 
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
-        if state == DeviceStateEx.Disconnected and self.current_sensor == sensor:
-            self.device_disconnected_sig.emit()
+        if state == DeviceStateEx.Disconnected:
+            self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
-    def _on_device_disconnected(self):
-        if self._pending_device is not None:
-            pending = self._pending_device
-            self._pending_device = None
+    def _on_device_disconnected(self, addr: str):
+        state = self.device_states.pop(addr, None)
+        self._update_device_item_text(addr, connected=False)
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
             self.current_sensor = None
-            self._clear_ui_data()
-            self._clear_lost_packet_stats()
-            self._do_connect_device(pending)
-            return
-
-        if self.current_sensor is None:
-            return
-        self.current_sensor = None
-        self.btn_disconnect.setEnabled(False)
-        for cb in self._ntf_checkboxes.values():
-            cb.setEnabled(False)
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(False)
-        self.status_label.setText("Disconnected (device)")
-        self.model_label.setText("Model: --")
-        self.hw_version_label.setText("HW Version: --")
-        self.fw_version_label.setText("FW Version: --")
-        self.power_label.setText("Power: --%")
-        self._clear_lost_packet_stats()
+            self._refresh_display_for_state(None)
+            self.status_label.setText("Disconnected (device)")
+        self._update_button_states()
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
 
-    def _update_lost_packet_display(self, lost_type: str, count: int):
-        self.lost_packet_counts[lost_type] = count
-        lines = [f"  {k}: {v}" for k, v in sorted(self.lost_packet_counts.items())]
-        self.lost_packet_label.setText("Packet Loss Stats:\n" + "\n".join(lines))
-
-    def _clear_lost_packet_stats(self):
-        self.lost_packet_counts.clear()
-        self.lost_packet_label.setText("Packet Loss Stats: None")
+    def _update_lost_packet_display(self, addr: str, lost_type: str, count: int):
+        state = self.device_states.get(addr)
+        if state is None:
+            return
+        state.lost_counts[lost_type] = count
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
+            text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))
+            self.lost_packet_label.setText("Packet Loss Stats: " + text)
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
-        self.power_label.setText(f"Power: {power}%")
+        state = self.device_states.get(sensor.BLEDevice.Address)
+        if state is not None:
+            state.last_power = power
+        if self.current_sensor == sensor:
+            self.power_label.setText(f"Power: {power}%")
 
     def _check_set_param_result(self, key: str, result: str) -> bool:
         """检查 setParam 结果，若报错则弹出 QMessageBox。返回 True 表示成功。"""
@@ -1295,7 +1676,7 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self._clear_ui_data()
 
     def _refresh_control_states(self, sensor: SensorProfile):
-        """根据设备当前 NTF/FILTER 参数刷新 UI 开关状态。"""
+        """查询设备当前 NTF/FILTER 参数并缓存到对应设备状态；若为当前显示设备则同步刷新 UI。"""
         info = sensor.getDeviceInfo()
         channel_map = {
             "NTF_EMG":   info.EmgChannelCount if info else 0,
@@ -1314,44 +1695,54 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             "NTF_GFORCE_GYRO": info.GyroChannelCount if info else 0,
         }
 
+        ntf_states = {}
         ntf_result = sensor.getParam("NTF")
         print(f"[Refresh] getParam(NTF) -> {ntf_result}")
         if not str(ntf_result).startswith("Error"):
             items = str(ntf_result).split("|")
-            self._updating_ntf_controls = True
-            try:
-                for i in range(0, len(items) - 1, 2):
-                    key = items[i]
-                    value = items[i + 1]
-                    cb = self._ntf_checkboxes.get(key)
-                    count = channel_map.get(key, 0)
-                    if cb is not None:
-                        cb.setEnabled(count > 0)
-                        if count > 0:
-                            cb.setChecked(value == "ON")
-                        else:
-                            cb.setChecked(False)
-            finally:
-                self._updating_ntf_controls = False
+            for i in range(0, len(items) - 1, 2):
+                key = items[i]
+                value = items[i + 1]
+                count = channel_map.get(key, 0)
+                ntf_states[key] = (count > 0, value == "ON" if count > 0 else False)
 
+        filter_states = {}
         filter_result = sensor.getParam("FILTER")
         print(f"[Refresh] getParam(FILTER) -> {filter_result}")
         has_filter = bool(filter_result) and not str(filter_result).startswith("Error")
-        for cb in self._filter_checkboxes.values():
-            cb.setEnabled(has_filter)
+        if has_filter:
+            items = str(filter_result).split("|")
+            parsed = {items[i]: items[i + 1] for i in range(0, len(items) - 1, 2)}
+            for key in self._filter_checkboxes:
+                filter_states[key] = (True, parsed.get(key) == "ON")
+        else:
+            for key in self._filter_checkboxes:
+                filter_states[key] = (False, False)
+
+        state = self.device_states.get(sensor.BLEDevice.Address)
+        if state is not None:
+            state.ntf_states = ntf_states
+            state.filter_states = filter_states
+
+        if self.current_sensor == sensor:
+            self._apply_control_states(ntf_states, filter_states)
+
+    def _apply_control_states(self, ntf_states: dict, filter_states: dict):
+        """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）。"""
+        self._updating_ntf_controls = True
+        try:
+            for key, cb in self._ntf_checkboxes.items():
+                enabled, checked = ntf_states.get(key, (False, False))
+                cb.setEnabled(enabled)
+                cb.setChecked(checked)
+        finally:
+            self._updating_ntf_controls = False
         self._updating_filter_controls = True
         try:
-            if has_filter:
-                items = str(filter_result).split("|")
-                for i in range(0, len(items) - 1, 2):
-                    key = items[i]
-                    value = items[i + 1]
-                    cb = self._filter_checkboxes.get(key)
-                    if cb is not None:
-                        cb.setChecked(value == "ON")
-            else:
-                for cb in self._filter_checkboxes.values():
-                    cb.setChecked(False)
+            for key, cb in self._filter_checkboxes.items():
+                enabled, checked = filter_states.get(key, (False, False))
+                cb.setEnabled(enabled)
+                cb.setChecked(checked)
         finally:
             self._updating_filter_controls = False
 
@@ -1371,40 +1762,51 @@ class IMUQuaternionEEGDemo(QtWidgets.QWidget):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
+    def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
+        """切换显示设备时，刷新设备信息、丢包统计、开关状态与图表。"""
+        self._last_plotted_sample_indices.clear()
+        self._last_drawn_quaternion = None
+
+        if state is not None and state.info is not None:
+            info = state.info
+            self.model_label.setText(f"Model: {info.ModelName}")
+            self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
+            self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
+        else:
+            self.model_label.setText("Model: --")
+            self.hw_version_label.setText("HW Version: --")
+            self.fw_version_label.setText("FW Version: --")
+
+        if state is not None and state.last_power is not None:
+            self.power_label.setText(f"Power: {state.last_power}%")
+        else:
+            self.power_label.setText("Power: --%")
+
+        if state is not None and state.status_text:
+            self.status_label.setText(state.status_text)
+        else:
+            self.status_label.setText("Not Connected")
+
+        if state is not None and state.lost_counts:
+            text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))
+            self.lost_packet_label.setText("Packet Loss Stats: " + text)
+        else:
+            self.lost_packet_label.setText("Packet Loss Stats: None")
+
+        ntf_states = state.ntf_states if state is not None else {}
+        filter_states = state.filter_states if state is not None else {}
+        self._apply_control_states(ntf_states, filter_states)
+
+        self._rebuild_2d_plot()
+        self._rebuild_eeg_plot()
+
     def _clear_ui_data(self):
-        """清除 UI 数据缓冲区并重建图表，等待新数据。"""
+        """清除当前显示设备的数据缓冲区并重建图表，等待新数据。"""
         self._last_plotted_sample_indices.clear()
 
-        for dt in list(self.buffers.keys()):
-            lock = self._get_buffer_lock(dt)
-            lock.lock()
-            try:
-                self.buffers[dt].fill(0)
-                self._sample_index_buffers[dt].fill(0)
-                self._buffer_indices[dt] = 0
-            finally:
-                lock.unlock()
-
-        self._eeg_buffer_lock.lock()
-        self._ecg_buffer_lock.lock()
-        self._brth_buffer_lock.lock()
-        try:
-            if self.eeg_buffer is not None:
-                self.eeg_buffer.fill(0)
-                self._eeg_sample_index_buffer.fill(0)
-                self._eeg_buffer_index = 0
-            if self.ecg_buffer is not None:
-                self.ecg_buffer.fill(0)
-                self._ecg_sample_index_buffer.fill(0)
-                self._ecg_buffer_index = 0
-            if self.brth_buffer is not None:
-                self.brth_buffer.fill(0)
-                self._brth_sample_index_buffer.fill(0)
-                self._brth_buffer_index = 0
-        finally:
-            self._brth_buffer_lock.unlock()
-            self._ecg_buffer_lock.unlock()
-            self._eeg_buffer_lock.unlock()
+        state = self._current_state()
+        if state is not None:
+            state.clear_buffers()
 
         self._rebuild_2d_plot()
         self._rebuild_eeg_plot()
