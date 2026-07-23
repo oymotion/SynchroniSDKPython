@@ -111,6 +111,75 @@ class DeviceDataState:
         self.quaternion = [1.0, 0.0, 0.0, 0.0]
         self.quaternion_lock = QtCore.QMutex()
 
+        # 状态行显示项：(label, 通道数, 标称采样率, 数据类型)；GEST 的标称值
+        # DeviceInfo 不提供，首个数据批到达时从批次自带的 sampleRate/通道数补齐
+        self.status_parts = None
+        # 实际采样率收集：rate_counts 为当前统计窗口的样本数，actual_rates 为
+        # 每秒结算后的实测速率；nominal_rates/nominal_channels 记录批次自带标称值
+        self.rate_lock = threading.Lock()
+        self.rate_counts: dict = {}
+        self.rate_window_start = time.time()
+        self.actual_rates: dict = {}
+        self.nominal_rates: dict = {}
+        self.nominal_channels: dict = {}
+
+    def note_data_received(self, data: SensorData):
+        """统计每种数据类型实际收到的样本数（不含丢包占位样本），
+        并记录数据批携带的标称采样率/通道数。"""
+        if not data.channelSamples:
+            return
+        n = sum(1 for s in data.channelSamples[0] if not getattr(s, "isLost", False))
+        with self.rate_lock:
+            if n > 0:
+                self.rate_counts[data.dataType] = self.rate_counts.get(data.dataType, 0) + n
+            if data.sampleRate and data.sampleRate > 0:
+                self.nominal_rates[data.dataType] = data.sampleRate
+            ch = len(data.channelSamples)
+            if ch > 0:
+                self.nominal_channels[data.dataType] = ch
+
+    def update_actual_rates(self):
+        """每秒由 UI 定时器调用：结算上一窗口的实测速率并重置计数。"""
+        now = time.time()
+        with self.rate_lock:
+            elapsed = now - self.rate_window_start
+            if elapsed <= 0:
+                return
+            self.actual_rates = {dt: c / elapsed for dt, c in self.rate_counts.items()}
+            self.rate_counts = {}
+            self.rate_window_start = now
+
+    def build_status_text(self) -> str:
+        """组合状态行：连接名与各数据项的通道数、标称采样率。"""
+        name = self.sensor.BLEDevice.Name if self.sensor is not None else ""
+        parts = [f"Connected: {name}"]
+        with self.rate_lock:
+            nominal_rates = dict(self.nominal_rates)
+            nominal_channels = dict(self.nominal_channels)
+        for label, ch, sr, dt in (self.status_parts or []):
+            nominal = nominal_rates.get(dt) or sr
+            ch = nominal_channels.get(dt, ch)
+            nominal_txt = f"{nominal:g}" if nominal else "--"
+            entry = f"{label} {ch}ch @ {nominal_txt}Hz" if ch else f"{label} @ {nominal_txt}Hz"
+            parts.append(entry)
+        return " | ".join(parts)
+
+    def build_rate_text(self) -> str:
+        """组合实测采样率行（显示在状态行下一行）：各数据项每秒实测速率，
+        标称值作对照；尚无实测数据时返回空串。"""
+        entries = []
+        with self.rate_lock:
+            actual_rates = dict(self.actual_rates)
+            nominal_rates = dict(self.nominal_rates)
+        for label, ch, sr, dt in (self.status_parts or []):
+            actual = actual_rates.get(dt)
+            if actual is None:
+                continue
+            nominal = nominal_rates.get(dt) or sr
+            nominal_txt = f"{nominal:g}" if nominal else "--"
+            entries.append(f"{label} {actual:.1f} / {nominal_txt}Hz")
+        return "Actual: " + " | ".join(entries) if entries else ""
+
     def get_buffer_lock(self, data_type):
         lock = self.buffer_locks.get(data_type)
         if lock is None:
@@ -248,6 +317,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     device_disconnected_sig = QtCore.pyqtSignal(str)              # address
     replay_done_sig = QtCore.pyqtSignal(str)
     analyze_done_sig = QtCore.pyqtSignal(str, str)
+    dongle_check_sig = QtCore.pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -287,6 +357,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._update_plots)
         self.timer.start(PLOT_UPDATE_INTERVAL)
+        self._rate_last_refresh = 0.0   # 实测采样率每秒刷新的时间戳
 
         self.add_device_sig.connect(self._add_device_item)
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
@@ -295,6 +366,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.device_disconnected_sig.connect(self._on_device_disconnected)
         self.replay_done_sig.connect(self._on_replay_done)
         self.analyze_done_sig.connect(self._on_analyze_done)
+        self.dongle_check_sig.connect(self._on_dongle_check_result)
 
         if not self.sensor_controller.hasDeviceFoundCallback:
             self.sensor_controller.onDeviceFoundCallback = self._on_device_found
@@ -345,6 +417,12 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.btn_disconnect.clicked.connect(self._disconnect_selected_device)
         self.btn_disconnect.setEnabled(False)
 
+        self.btn_check_dongle = QtWidgets.QPushButton("Check Setup Dongle")
+        self.btn_check_dongle.clicked.connect(self._check_setup_dongle)
+        _bold_font = self.btn_check_dongle.font()
+        _bold_font.setBold(True)
+        self.btn_check_dongle.setFont(_bold_font)
+
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
 
@@ -364,6 +442,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         button_layout.addWidget(self.btn_stop_scan)
         button_layout.addWidget(self.btn_connect)
         button_layout.addWidget(self.btn_disconnect)
+        button_layout.addWidget(self.btn_check_dongle)
         button_layout.addStretch()
 
         # 回放按钮放在控制行最右边
@@ -428,6 +507,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         self.status_label = QtWidgets.QLabel("Not Connected")
         controls_layout.addWidget(self.status_label)
+        self.rate_label = QtWidgets.QLabel("")
+        controls_layout.addWidget(self.rate_label)
 
         device_info_layout = QtWidgets.QHBoxLayout()
         self.model_label = QtWidgets.QLabel("Model: --")
@@ -522,6 +603,31 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.sensor_controller.stopScan()
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
+
+    def _check_setup_dongle(self):
+        # 检查/安装 dongle 驱动（Windows 弹 UAC，Linux 需终端 sudo 密码），
+        # 后台线程执行避免阻塞 UI，结果经信号回到主线程提示
+        self.btn_check_dongle.setEnabled(False)
+        self.btn_check_dongle.setText("Checking Dongle...")
+
+        def work():
+            try:
+                result = self.sensor_controller.checkSetupDongle()
+            except Exception as e:
+                result = f"Error: {e}"
+            self.dongle_check_sig.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_dongle_check_result(self, result: str):
+        self.btn_check_dongle.setEnabled(True)
+        self.btn_check_dongle.setText("Check Setup Dongle")
+        if result == "OK":
+            QtWidgets.QMessageBox.information(
+                self, "Check Setup Dongle",
+                "USB BLE dongle is ready (driver installed and usable by the SDK).")
+        else:
+            QtWidgets.QMessageBox.warning(self, "Check Setup Dongle", result)
 
     def _on_device_found(self, device_list: List[BLEDevice]):
         self._stop_scan()
@@ -619,13 +725,14 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             info = sensor.getDeviceInfo()
             state.info = info
             state.init_buffers(info, len(self.axes_emg))
-            state.status_text = (
-                f"Connected: {device.Name} | "
-                f"ACC {info.AccChannelCount}ch @ {info.AccSampleRate}Hz | "
-                f"Euler {info.EulerChannelCount}ch @ {info.EulerSampleRate}Hz | "
-                f"Quat {info.QuatChannelCount}ch @ {info.QuatSampleRate}Hz | "
-                f"EMG {info.EmgChannelCount}ch @ {info.EmgSampleRate}Hz"
-            )
+            state.status_parts = [
+                ("ACC",   info.AccChannelCount,   info.AccSampleRate,   DataType.NTF_ACC),
+                ("Euler", info.EulerChannelCount, info.EulerSampleRate, DataType.NTF_EULER_DATA),
+                ("Quat",  info.QuatChannelCount,  info.QuatSampleRate,  DataType.NTF_QUATERNION),
+                ("EMG",   info.EmgChannelCount,   info.EmgSampleRate,   DataType.NTF_EMG),
+                ("GEST",  0,                      0,                    DataType.NTF_GEST),
+            ]
+            state.status_text = state.build_status_text()
 
         if not sensor.isDataTransfering:
             if not sensor.startDataNotification():
@@ -887,6 +994,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         state = self.device_states.get(addr)
         if state is None:
             return
+        # 实际采样率收集：覆盖所有收到的数据类型（含 GEST）
+        state.note_data_received(data)
         if data.dataType in state.buffers or data.dataType == DataType.NTF_EMG:
             self.data_received.emit(addr, data)
         if data.dataType == DataType.NTF_QUATERNION:
@@ -1078,11 +1187,11 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             [-1, -1, -1],
             [ 1, -1, -1],
             [ 1,  1, -1],
-            [-1,  1,  1],
+            [-1,  1, -1],
             [-1, -1,  1],
             [ 1, -1,  1],
             [ 1,  1,  1],
-            [ 1,  1,  1]
+            [-1,  1,  1]
         ])
         faces = [
             [vertices[0], vertices[1], vertices[2], vertices[3]],
@@ -1145,6 +1254,14 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         state = self._current_state()
         if state is None:
             return
+
+        # 每秒结算一次实测采样率：状态行显示标称值，实测速率单独显示在下一行
+        now = time.time()
+        if now - self._rate_last_refresh >= 1.0:
+            self._rate_last_refresh = now
+            state.update_actual_rates()
+            self.status_label.setText(state.build_status_text())
+            self.rate_label.setText(state.build_rate_text())
 
         dt  = self.active_data_type
         buf_copy = None
@@ -1279,6 +1396,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self.current_sensor = None
             self._refresh_display_for_state(None)
             self.status_label.setText("Disconnected (device)")
+            self.rate_label.setText("")
         self._update_button_states()
 
     def _on_error(self, sensor: SensorProfile, reason: str):
@@ -1485,10 +1603,15 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         else:
             self.power_label.setText("Power: --%")
 
-        if state is not None and state.status_text:
+        if state is not None and state.status_parts:
+            self.status_label.setText(state.build_status_text())
+            self.rate_label.setText(state.build_rate_text())
+        elif state is not None and state.status_text:
             self.status_label.setText(state.status_text)
+            self.rate_label.setText("")
         else:
             self.status_label.setText("Not Connected")
+            self.rate_label.setText("")
 
         if state is not None and state.lost_counts:
             text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))

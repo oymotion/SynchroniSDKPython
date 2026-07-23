@@ -1,10 +1,11 @@
 import signal
+import sys
 import time
 from typing import List
 from sensor import *
 
 SCAN_DEVICE_PERIOD_IN_MS = 3000
-PACKAGE_COUNT = 10
+PACKAGE_COUNT = 5
 POWER_REFRESH_PERIOD_IN_MS = 5000
 
 
@@ -33,7 +34,7 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
     SensorControllerInstance.stopScan()
 
     filteredDevice = filter(
-        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Sync") or x.Name.startswith("Orion")),
+        lambda x: x.RSSI > -80 and (x.Name.startswith("OB") or x.Name.startswith("Sync")),
         deviceList,
     )
     for device in filteredDevice:
@@ -123,12 +124,66 @@ def terminate():
     exit()
 
 
+def run_bin_replay(bin_path: str) -> int:
+    """离线回放 bin 文件，走完整解析链路做冒烟测试（不需要蓝牙硬件）。
+
+    打印 bin 信息（config 版本、时长、设备），全速回放并统计收到的数据批次数；
+    至少收到一批数据返回 0，否则返回 1。
+    """
+    controller = SensorControllerInstance
+    info = controller.getBinFileInfo(bin_path)
+    if info is None:
+        print("invalid bin file: no config record found")
+        return 1
+    print(
+        "bin info: config v%s, duration %.1fs, device %s (%s)"
+        % (
+            info.get("version"),
+            info.get("replay_duration", 0.0),
+            info.get("device_name"),
+            info.get("device_mac"),
+        )
+    )
+    sensor = controller.requireSensor(
+        BLEDevice(info.get("device_name") or "", info.get("device_mac") or "", 0)
+    )
+    if sensor is None:
+        print("failed to create SensorProfile for replay")
+        return 1
+
+    received = {"count": 0}
+
+    def _on_data(sensor, data):
+        received["count"] += 1
+
+    sensor.onDataCallback = _on_data
+    sensor.onErrorCallback = onErrorCallback
+
+    profile = controller.replayBinFile(bin_path, sensor, realtime=False)
+    controller.terminate()
+    if profile is None:
+        print("replay failed to start")
+        return 1
+    print("replay finished, received %d data batches" % received["count"])
+    if received["count"] <= 0:
+        print("no data parsed during replay")
+        return 1
+    return 0
+
+
 def main():
     signal.signal(signal.SIGINT, lambda signal, frame: terminate())
+    # --replay <bin 文件>：离线回放冒烟测试（构建脚本用，无需蓝牙硬件）
+    if len(sys.argv) > 1 and sys.argv[1] == "--replay":
+        if len(sys.argv) < 3:
+            print("usage: python console.py --replay <bin_file>")
+            return 1
+        return run_bin_replay(sys.argv[2])
     SimpleTest()
     time.sleep(100)
     SensorControllerInstance.terminate()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
