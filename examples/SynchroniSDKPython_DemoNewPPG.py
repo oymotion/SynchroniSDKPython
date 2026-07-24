@@ -330,6 +330,8 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
     add_device_sig = QtCore.pyqtSignal(str)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
     device_disconnected_sig = QtCore.pyqtSignal(str)         # address
+    device_disconnected_sig = QtCore.pyqtSignal(str)         # address
+    auto_reconnect_sig = QtCore.pyqtSignal(str, bool)        # (address, restore)
     replay_done_sig = QtCore.pyqtSignal(str)
     analyze_done_sig = QtCore.pyqtSignal(str, str)
     dongle_check_sig = QtCore.pyqtSignal(str)
@@ -362,6 +364,9 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         self._filter_checkboxes: dict = {}
         self._debug_log_enabled = True
         self._data_debug_log_enabled = True
+        # 每设备上次会话的日志/bin 导出路径：重连时优先续用上一条，而不是另起新文件
+        self._last_log_paths: dict = {}
+        self._last_data_log_paths: dict = {}
         self._replay_thread = None
         self._replay_sensor = None
         self._replay_paused = False
@@ -378,6 +383,7 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
+        self.auto_reconnect_sig.connect(self._press_connect_for_address)
         self.replay_done_sig.connect(self._on_replay_done)
         self.analyze_done_sig.connect(self._on_analyze_done)
         self.dongle_check_sig.connect(self._on_dongle_check_result)
@@ -456,7 +462,6 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         button_layout.addWidget(self.btn_stop_scan)
         button_layout.addWidget(self.btn_connect)
         button_layout.addWidget(self.btn_disconnect)
-        button_layout.addWidget(self.btn_check_dongle)
         button_layout.addStretch()
 
         # 回放按钮放在控制行最右边
@@ -472,7 +477,11 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         self.device_list.itemClicked.connect(self._on_device_selected)
 
         device_layout = QtWidgets.QVBoxLayout()
-        device_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
+        device_header_layout = QtWidgets.QHBoxLayout()
+        device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
+        device_header_layout.addStretch()
+        device_header_layout.addWidget(self.btn_check_dongle)
+        device_layout.addLayout(device_header_layout)
         device_layout.addWidget(self.device_list)
 
         scan_layout = QtWidgets.QHBoxLayout()
@@ -711,6 +720,8 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         sensor.onStateChanged  = self._on_state_changed
         sensor.onErrorCallback = self._on_error
         sensor.onPowerChanged  = self._on_power_changed
+        # 自动重连找回设备时：等效于按下 Connect 按钮（走本方法完整流程）
+        sensor.onAutoReconnect = self._on_auto_reconnect
 
         self.status_label.setText(f"Connecting: {device.Name} ...")
         self.btn_connect.setEnabled(False)
@@ -764,11 +775,20 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         if self._selected_address() == addr:
             self.current_sensor = sensor
 
-        # 根据全局 Debug Log 开关状态初始化新设备的日志设置
+        # 根据全局 Debug Log 开关状态初始化新设备的日志设置：
+        # 重连时优先续用上次的日志/bin 文件（默认追加，而不是另起新文件）
         if self._debug_log_enabled:
-            sensor.setParam("DEBUG_LOG_PATH", "True")
+            log_path = self._last_log_paths.get(addr) or "True"
+            sensor.setParam("DEBUG_LOG_PATH", log_path)
+            current = sensor.getParam("DEBUG_LOG_PATH")
+            if current:
+                self._last_log_paths[addr] = current
         if self._data_debug_log_enabled:
-            sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
+            data_path = self._last_data_log_paths.get(addr) or "True"
+            sensor.setParam("DEBUG_BLE_DATA_PATH", data_path)
+            current = sensor.getParam("DEBUG_BLE_DATA_PATH")
+            if current:
+                self._last_data_log_paths[addr] = current
 
         # 查询并缓存设备 NTF/FILTER 状态
         self._refresh_control_states(sensor)
@@ -1418,6 +1438,38 @@ class IMUQuaternionPPGDemo(QtWidgets.QWidget):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
         if state == DeviceStateEx.Disconnected:
             self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
+
+    def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool) -> bool:
+        """onAutoReconnect 回调（SDK 恢复线程）：自动重连找回设备时，
+        等效于按下 Connect 按钮——转到 UI 线程执行完整连接流程。
+        restore=True 时流程结束后回放上次会话的参数（保留和恢复原有设置）。
+        返回 True 表示由本流程接管（SDK 不再执行默认的参数回放恢复）。"""
+        self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
+        return True
+
+    def _press_connect_for_address(self, addr: str, restore: bool = True):
+        """在设备列表中选中该地址，并执行与按下 Connect 按钮完全相同的流程。
+        restore=True 时，流程结束后把上次会话的 setParam 参数回放一遍。"""
+        # 流程开始先快照上次会话参数（排除 demo 自管的 DEBUG 日志参数）
+        sensor = self.sensor_controller.getSensor(addr)
+        saved = {}
+        if restore and sensor is not None:
+            saved = {k: v for k, v in (sensor._saved_params or {}).items()
+                     if k not in ("DEBUG_LOG_PATH", "DEBUG_BLE_DATA_PATH")}
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            if f"Address: {addr}" in item.text():
+                self.device_list.setCurrentItem(item)
+                break
+        self._connect_selected_device()
+        # 回放上次会话参数，恢复原有设置
+        if saved and addr in self.device_states:
+            sensor = self.device_states[addr].sensor
+            for key, value in saved.items():
+                result = sensor.setParam(key, value)
+                print(f"[AutoReconnect] restore setParam({key}, {value}) -> {result}")
+            # 参数回放后同步复选框显示
+            self._refresh_control_states(sensor)
 
     def _on_device_disconnected(self, addr: str):
         state = self.device_states.pop(addr, None)
