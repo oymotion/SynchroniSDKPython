@@ -312,6 +312,7 @@ class DeviceDataState:
 class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     data_received  = QtCore.pyqtSignal(object, object)            # (address, SensorData)
     add_device_sig = QtCore.pyqtSignal(str)
+    update_rssi_sig = QtCore.pyqtSignal(str, int)                 # (address, rssi)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)         # (address, type_name, count)
     gesture_signal = QtCore.pyqtSignal(str, int, int, int, int)   # (address, gesture, raw, possiblity, strength)
     device_disconnected_sig = QtCore.pyqtSignal(str)              # address
@@ -364,6 +365,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._rate_last_refresh = 0.0   # 实测采样率每秒刷新的时间戳
 
         self.add_device_sig.connect(self._add_device_item)
+        self.update_rssi_sig.connect(self._update_device_rssi)
         self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.gesture_signal.connect(self._update_gesture_display)
@@ -653,9 +655,30 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._stop_scan()
         filtered = filter(lambda x: x.Name.startswith("OY") or x.Name.startswith("gForce"), device_list)
         for d in filtered:
-            if d.Address not in [x.Address for x in self.discovered_devices]:
+            existing = next((x for x in self.discovered_devices if x.Address == d.Address), None)
+            if existing is None:
                 self.discovered_devices.append(d)
                 self.add_device_sig.emit(f"RSSI: {d.RSSI}, Name: {d.Name}, Address: {d.Address}")
+            else:
+                # SDK 在回调前已更新共享 BLEDevice 的 RSSI（同一对象，比较无意义），
+                # 每次扫描返回都刷新一次列表项显示
+                existing.RSSI = d.RSSI
+                self.update_rssi_sig.emit(d.Address, d.RSSI)
+
+    def _update_device_rssi(self, addr: str, rssi: int):
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            text = item.text()
+            if f"Address: {addr}" not in text:
+                continue
+            d = next((x for x in self.discovered_devices if x.Address == addr), None)
+            if d is None:
+                return
+            new_text = f"RSSI: {rssi}, Name: {d.Name}, Address: {d.Address}"
+            if text.startswith("[Connected] "):
+                new_text = "[Connected] " + new_text
+            item.setText(new_text)
+            break
 
     def _add_device_item(self, text: str):
         self.device_list.addItem(text)
@@ -750,8 +773,10 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             state.init_buffers(info, len(self.axes_emg))
             state.status_parts = [
                 ("ACC",   info.AccChannelCount,   info.AccSampleRate,   DataType.NTF_ACC),
+                ("Gyro",  info.GyroChannelCount,  info.GyroSampleRate,  DataType.NTF_GYRO),
                 ("Euler", info.EulerChannelCount, info.EulerSampleRate, DataType.NTF_EULER_DATA),
                 ("Quat",  info.QuatChannelCount,  info.QuatSampleRate,  DataType.NTF_QUATERNION),
+                ("IMU",   info.ImuChannelCount,   info.ImuSampleRate,   DataType.NTF_IMU),
                 ("EMG",   info.EmgChannelCount,   info.EmgSampleRate,   DataType.NTF_EMG),
                 ("GEST",  0,                      0,                    DataType.NTF_GEST),
             ]
@@ -1026,6 +1051,37 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         addr = sensor.BLEDevice.Address
         state = self.device_states.get(addr)
         if state is None:
+            return
+        # 新 EMG 设备的 DeviceInfo 带 NTF_IMU 聚合流信息（ImuChannelCount > 0）；
+        # 老 EMG 设备（及旧 bin 回放）没有该信息，走 ACC/GYRO/EULER/QUAT 独立流
+        use_imu_agg = state.info is not None and getattr(state.info, "ImuChannelCount", 0) > 0
+        if data.dataType == DataType.NTF_IMU:
+            if not use_imu_agg:
+                return  # 无聚合流信息（老设备/旧 bin），忽略聚合批
+            # 聚合批自身也计入实测速率（状态行 IMU 项的实际采样率）
+            state.note_data_received(data)
+            # NTF_IMU 聚合流（通道布局 acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12）：
+            # 拆分为四个显示类型，喂给既有缓冲、实测速率统计与 3D 视图；
+            # SDK 同时广播的四路独立 IMU 流在下方直接忽略
+            for dt, offset, ch_count in ((DataType.NTF_ACC, 0, 3), (DataType.NTF_GYRO, 3, 3),
+                                         (DataType.NTF_EULER_DATA, 6, 3), (DataType.NTF_QUATERNION, 9, 4)):
+                if len(data.channelSamples) < offset + ch_count:
+                    continue  # 非 QAT6 设备的聚合流只有 acc+gyro
+                sub = SensorData()
+                sub.dataType = dt
+                sub.deviceMac = data.deviceMac
+                sub.sampleRate = data.sampleRate
+                sub.channelCount = ch_count
+                sub.lostPackageCount = data.lostPackageCount
+                sub.channelSamples = data.channelSamples[offset:offset + ch_count]
+                state.note_data_received(sub)
+                self.data_received.emit(addr, sub)
+                if dt == DataType.NTF_QUATERNION:
+                    self._update_quaternion(state, sub)
+            return
+        if use_imu_agg and data.dataType in (DataType.NTF_ACC, DataType.NTF_GYRO,
+                                             DataType.NTF_EULER_DATA, DataType.NTF_QUATERNION):
+            # 已改用 NTF_IMU 聚合流，忽略这四路独立 IMU 流
             return
         # 实际采样率收集：覆盖所有收到的数据类型（含 GEST）
         state.note_data_received(data)
