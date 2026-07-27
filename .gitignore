@@ -13,3 +13,4 @@
 sensor/**/*.c
 examples/build/
 examples/dist/
+examples/*.spec

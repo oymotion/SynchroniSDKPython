@@ -836,7 +836,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_dongle_check_result(self, result: str):
         self.btn_check_dongle.setEnabled(True)
         self.btn_check_dongle.setText("Check Setup Dongle")
-        if result == "OK":
+        if result.startswith("OK"):
             QtWidgets.QMessageBox.information(
                 self, "Check Setup Dongle",
                 "USB BLE dongle is ready (driver installed and usable by the SDK).")

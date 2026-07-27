@@ -620,7 +620,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         def work():
             try:
-                result = self.sensor_controller.checkSetupDongle()
+                result = checkSetupDongle()
             except Exception as e:
                 result = f"Error: {e}"
             self.dongle_check_sig.emit(result)
@@ -630,10 +630,12 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     def _on_dongle_check_result(self, result: str):
         self.btn_check_dongle.setEnabled(True)
         self.btn_check_dongle.setText("Check Setup Dongle")
-        if result == "OK":
-            QtWidgets.QMessageBox.information(
-                self, "Check Setup Dongle",
-                "USB BLE dongle is ready (driver installed and usable by the SDK).")
+        if result.startswith("OK"):
+            count = result.split(":", 1)[1].strip() if ":" in result else None
+            msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
+            if count is not None:
+                msg += f"\nUsable dongle count: {count}"
+            QtWidgets.QMessageBox.information(self, "Check Setup Dongle", msg)
         else:
             QtWidgets.QMessageBox.warning(self, "Check Setup Dongle", result)
 

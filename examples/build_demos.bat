@@ -3,13 +3,22 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
+rem Use the project virtual environment for all python/pip/pyinstaller calls
+set "VENV_PY=%~dp0..\.venv\Scripts\python.exe"
+if not exist "%VENV_PY%" (
+    echo [ERROR] Virtual environment python not found:
+    echo   %VENV_PY%
+    exit /b 1
+)
+
 echo ==========================================
 echo Check pyinstaller...
 echo ==========================================
-pyinstaller --version >nul 2>&1
+"%VENV_PY%" -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] pyinstaller not found. Please install it first:
-    echo   pip install pyinstaller
+    echo [ERROR] pyinstaller not found in the virtual environment.
+    echo Please install it first:
+    echo   "%VENV_PY%" -m pip install pyinstaller
     exit /b 1
 )
 
@@ -47,21 +56,28 @@ for %%F in (DemoNewEMG DemoNewEEG DemoNewPPG SynchroniSDKPython_DemoNewEMG Synch
 
 del /f /q "..\*.spec" >nul 2>&1
 
-pip install -U synchroni-sensor-sdk
+"%VENV_PY%" -m pip uninstall -U synchroni-sensor-sdk
+
+"%VENV_PY%" -m pip install -U sensor-sdk
 
 echo.
 echo ==========================================
 echo Build demos with PyInstaller...
 echo ==========================================
-set "COMMON_OPTS=--clean --noconfirm --onefile"
+rem --collect-all sensor/bleak/winrt/flatbuffers: the sensor SDK is Cython-compiled
+rem (.pyd); PyInstaller cannot see imports made inside .pyd modules, so collect the
+rem SDK and its runtime dependencies explicitly (--collect-all sensor also bundles
+rem the driver data files under sensor/tools).
+rem --hidden-import logging.handlers: stdlib submodule imported inside sensor.sdk_log.
+set "COMMON_OPTS=--clean --noconfirm --onefile --collect-all sensor --collect-all bleak --collect-all winrt --collect-all flatbuffers --hidden-import logging.handlers"
 
-pyinstaller %COMMON_OPTS% --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
+"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
 if errorlevel 1 goto :error
 
-pyinstaller %COMMON_OPTS% --name DemoNewEEG SynchroniSDKPython_DemoNewEEG.py
+"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoNewEEG SynchroniSDKPython_DemoNewEEG.py
 if errorlevel 1 goto :error
 
-pyinstaller %COMMON_OPTS% --name DemoNewPPG SynchroniSDKPython_DemoNewPPG.py
+"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoNewPPG SynchroniSDKPython_DemoNewPPG.py
 if errorlevel 1 goto :error
 
 echo.
