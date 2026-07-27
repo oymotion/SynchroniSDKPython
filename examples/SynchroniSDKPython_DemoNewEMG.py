@@ -463,6 +463,11 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         device_layout = QtWidgets.QVBoxLayout()
         device_header_layout = QtWidgets.QHBoxLayout()
+        # Auto Reconnect 总开关：选中则所有 SensorProfile 的 autoReconnect 为 True
+        self.chk_auto_reconnect = QtWidgets.QCheckBox("Auto Reconnect")
+        self.chk_auto_reconnect.setChecked(True)   # SensorProfile.autoReconnect 默认 True
+        self.chk_auto_reconnect.toggled.connect(self._on_auto_reconnect_toggled)
+        device_header_layout.addWidget(self.chk_auto_reconnect)
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
         device_header_layout.addWidget(self.btn_check_dongle)
@@ -536,7 +541,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self._debug_log_checkbox.setChecked(True)
         self._debug_log_checkbox.stateChanged.connect(self._on_debug_log_toggled)
         debug_log_layout.addWidget(self._debug_log_checkbox)
-        self._data_debug_log_checkbox = QtWidgets.QCheckBox("Enable Data Debug Log")
+        self._data_debug_log_checkbox = QtWidgets.QCheckBox("Enable Debug Bin Data")
         self._data_debug_log_checkbox.setChecked(True)
         self._data_debug_log_checkbox.stateChanged.connect(self._on_data_debug_log_toggled)
         debug_log_layout.addWidget(self._data_debug_log_checkbox)
@@ -627,6 +632,11 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_auto_reconnect_toggled(self, checked: bool):
+        # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
+        for state in self.device_states.values():
+            state.sensor.autoReconnect = checked
+
     def _on_dongle_check_result(self, result: str):
         self.btn_check_dongle.setEnabled(True)
         self.btn_check_dongle.setText("Check Setup Dongle")
@@ -716,6 +726,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         sensor.onPowerChanged  = self._on_power_changed
         # 自动重连找回设备时：等效于按下 Connect 按钮（走本方法完整流程）
         sensor.onAutoReconnect = self._on_auto_reconnect
+        sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self.status_label.setText(f"Connecting: {device.Name} ...")
         self.btn_connect.setEnabled(False)
@@ -867,6 +878,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             return
         sensor.onDataCallback = self._on_data
         sensor.onErrorCallback = self._on_error
+        sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self._replay_sensor = sensor
 

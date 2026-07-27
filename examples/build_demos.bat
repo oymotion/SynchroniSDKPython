@@ -64,12 +64,7 @@ echo.
 echo ==========================================
 echo Build demos with PyInstaller...
 echo ==========================================
-rem --collect-all sensor/bleak/winrt/flatbuffers: the sensor SDK is Cython-compiled
-rem (.pyd); PyInstaller cannot see imports made inside .pyd modules, so collect the
-rem SDK and its runtime dependencies explicitly (--collect-all sensor also bundles
-rem the driver data files under sensor/tools).
-rem --hidden-import logging.handlers: stdlib submodule imported inside sensor.sdk_log.
-set "COMMON_OPTS=--clean --noconfirm --onefile --collect-all sensor --collect-all bleak --collect-all winrt --collect-all flatbuffers --hidden-import logging.handlers"
+set "COMMON_OPTS=--clean --noconfirm --onefile"
 
 "%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
 if errorlevel 1 goto :error
