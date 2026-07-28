@@ -75,5 +75,5 @@ if __name__ == "__main__":
     sys.modules["__main__"].__spec__ = importlib.util.spec_from_file_location(
         _mod_name, os.path.abspath(__file__))
 
-    runpy.run_path(os.path.join(_EXAMPLES_DIR, "SynchroniSDKPython_DemoNewEEG.py"),
+    runpy.run_path(os.path.join(_EXAMPLES_DIR, "SynchroniSDKPython_DemoNewMulti.py"),
                    run_name="__main__")
