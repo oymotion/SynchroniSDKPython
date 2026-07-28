@@ -5,6 +5,7 @@ import subprocess
 import multiprocessing
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -20,6 +21,7 @@ from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import QRunnable, QThreadPool
 
 from sensor import *
+import sensor
 import sensor
 
 
@@ -359,6 +361,12 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         self._init_ui()
 
+        # Debug Log 复选框默认勾选但启动时不触发 stateChanged，
+        # 这里按当前开关状态主动应用一次（建时间戳子目录 + 开启调试日志），
+        # 须在首次扫描/连接（BLE 子进程启动）之前执行
+        if self._debug_log_enabled:
+            self._apply_sdk_debug_log()
+
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._update_plots)
         self.timer.start(PLOT_UPDATE_INTERVAL)
@@ -625,6 +633,14 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.btn_check_dongle.setEnabled(False)
         self.btn_check_dongle.setText("Checking Dongle...")
 
+        # Linux 非 root 时安装 udev 规则需要 sudo：密码要输到启动本程序的
+        # shell（或 SDK 弹出的终端窗口），先弹提示避免用户以为程序卡死
+        if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() != 0:
+            shell = os.path.basename(os.environ.get("SHELL") or "") or "shell"
+            QtWidgets.QMessageBox.information(
+                self, "Check Dongle",
+                f"Please input sudo password in !!{shell}!!")
+
         def work():
             try:
                 result = checkSetupDongle()
@@ -643,10 +659,13 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.btn_check_dongle.setEnabled(True)
         self.btn_check_dongle.setText("Check Setup Dongle")
         if result.startswith("OK"):
-            count = result.split(":", 1)[1].strip() if ":" in result else None
+            first_line, _, extra = result.partition("\n")
+            count = first_line.split(":", 1)[1].strip() if ":" in first_line else None
             msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
             if count is not None:
                 msg += f"\nUsable dongle count: {count}"
+            if extra:
+                msg += f"\n{extra.strip()}"
             QtWidgets.QMessageBox.information(self, "Check Setup Dongle", msg)
         else:
             QtWidgets.QMessageBox.warning(self, "Check Setup Dongle", result)
@@ -1580,10 +1599,25 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             return False
         return True
 
+    def _apply_sdk_debug_log(self):
+        # 开启时把日志目录设为 sensorsdklog 下以「当前时间戳_SDK版本」命名的
+        # 子目录：本次会话的 controller log、各设备 profile log 与 bin 导出
+        # 都归到该子目录（须在 setDebugEnabled(True) 之前设置）
+        log_dir = os.path.join(
+            str(Path.home() / "Documents" / "sensorsdklog"),
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sensor.__version__.replace('.', '_')}",
+        )
+        self.sensor_controller.setLogPath(True, log_dir)
+        print(f"[Debug Log] setLogPath -> {log_dir}")
+        self.sensor_controller.setDebugEnabled(True)
+
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
         self._debug_log_enabled = enabled
-        self.sensor_controller.setDebugEnabled(enabled)
+        if enabled:
+            self._apply_sdk_debug_log()
+        else:
+            self.sensor_controller.setDebugEnabled(False)
         value = "True" if enabled else "False"
         for sensor in self.sensor_controller.getConnectedSensors():
             if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
