@@ -5,6 +5,7 @@ import subprocess
 import multiprocessing
 import os
 import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -312,7 +313,7 @@ class DeviceDataState:
 
 
 class IMUQuaternionEMGDemo(QtWidgets.QWidget):
-    data_received  = QtCore.pyqtSignal(object, object)            # (address, SensorData)
+    power_changed_sig = QtCore.pyqtSignal(object, int)            # (sensor, power)
     add_device_sig = QtCore.pyqtSignal(str)
     update_rssi_sig = QtCore.pyqtSignal(str, int)                 # (address, rssi)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)         # (address, type_name, count)
@@ -331,6 +332,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
         self.sensor_controller = SensorController()
         self.thread_pool = QThreadPool.globalInstance()
         self._data_type_pools = {}                  # (Address, DataType) -> QThreadPool
+        # SDK 数据回调线程只往这个队列里放数据即返回；GUI 定时器负责分发（解耦显示与回调）
+        self._incoming_data_q = queue.SimpleQueue()
 
         self.active_data_type = DataType.NTF_ACC
         self._last_plotted_sample_indices = {}
@@ -374,7 +377,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
 
         self.add_device_sig.connect(self._add_device_item)
         self.update_rssi_sig.connect(self._update_device_rssi)
-        self.data_received.connect(self._dispatch_data, type=QtCore.Qt.DirectConnection)
+        self.power_changed_sig.connect(self._update_power_display)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.gesture_signal.connect(self._update_gesture_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
@@ -1094,9 +1097,7 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
                 sub.lostPackageCount = data.lostPackageCount
                 sub.channelSamples = data.channelSamples[offset:offset + ch_count]
                 state.note_data_received(sub)
-                self.data_received.emit(addr, sub)
-                if dt == DataType.NTF_QUATERNION:
-                    self._update_quaternion(state, sub)
+                self._incoming_data_q.put((addr, sub))
             return
         if use_imu_agg and data.dataType in (DataType.NTF_ACC, DataType.NTF_GYRO,
                                              DataType.NTF_EULER_DATA, DataType.NTF_QUATERNION):
@@ -1104,12 +1105,25 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             return
         # 实际采样率收集：覆盖所有收到的数据类型（含 GEST）
         state.note_data_received(data)
-        if data.dataType in state.buffers or data.dataType == DataType.NTF_EMG:
-            self.data_received.emit(addr, data)
-        if data.dataType == DataType.NTF_QUATERNION:
-            self._update_quaternion(state, data)
-        if data.dataType == DataType.NTF_GEST:
-            self._handle_gesture_data(addr, data)
+        self._incoming_data_q.put((addr, data))
+
+    def _drain_incoming_data(self):
+        """GUI 定时器侧的数据分发入口：消费 SDK 回调线程入队的数据批，
+        依次做缓冲区 append（经 _dispatch_data 的线程池）、四元数 3D 视图与手势显示。"""
+        while True:
+            try:
+                addr, data = self._incoming_data_q.get_nowait()
+            except queue.Empty:
+                break
+            state = self.device_states.get(addr)
+            if state is None:
+                continue
+            if data.dataType in state.buffers or data.dataType == DataType.NTF_EMG:
+                self._dispatch_data(addr, data)
+            if data.dataType == DataType.NTF_QUATERNION:
+                self._update_quaternion(state, data)
+            if data.dataType == DataType.NTF_GEST:
+                self._handle_gesture_data(addr, data)
 
     def _get_data_type_pool(self, key):
         pool = self._data_type_pools.get(key)
@@ -1355,6 +1369,8 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
     # ── Periodic Refresh ──────────────────────────────────────────────────────
 
     def _update_plots(self):
+        # 先消费 SDK 回调线程入队的数据：即使窗口最小化也继续分发到缓冲区
+        self._drain_incoming_data()
         # Skip rendering while the window is minimized.
         if self.windowState() & QtCore.Qt.WindowMinimized:
             return
@@ -1585,7 +1601,11 @@ class IMUQuaternionEMGDemo(QtWidgets.QWidget):
             self.gesture_label.setText(self._gesture_text((gesture, raw_gesture, possiblity, strength)))
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
+        # SDK 回调线程：只做日志与信号转发，控件更新交给 GUI 线程（Qt 控件只允许在 GUI 线程访问）
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
+        self.power_changed_sig.emit(sensor, power)
+
+    def _update_power_display(self, sensor: SensorProfile, power: int):
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None:
             state.last_power = power
