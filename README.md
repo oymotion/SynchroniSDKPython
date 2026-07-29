@@ -24,13 +24,13 @@ pip install sensor-sdk
 
 ### USB Bluetooth dongle (bumble backend)
 
-On macOS, when a USB Bluetooth HCI dongle is plugged in (e.g. Actions `10d7:b012` or `33fa:0012`; several dongles can be used at once, each serving one connection), the SDK automatically drives it directly with a [bumble](https://github.com/google/bumble) host-mode backend instead of CoreBluetooth — no Bluetooth permission prompt, works even when the internal Bluetooth is off, and allows larger ATT MTU. The [bleak-bumble](https://github.com/ekspla/bleak-bumble_dev_host_mode) backend is vendored into the SDK (`sensor/bleak_bumble/`, MIT license), and the bumble stack + libusb are declared as regular dependencies — a plain `pip install sensor-sdk` is all that is needed.
+When a USB Bluetooth HCI dongle is plugged in and usable by libusb (e.g. Actions `10d7:b012` or `33fa:0012`; several dongles can be used at once, each serving one connection), the SDK automatically drives it directly with a [bumble](https://github.com/google/bumble) host-mode backend instead of the OS Bluetooth stack — no Bluetooth permission prompt, works even when the internal Bluetooth is off, and allows larger ATT MTU. The [bleak-bumble](https://github.com/ekspla/bleak-bumble_dev_host_mode) backend is vendored into the SDK (`sensor/bleak_bumble/`, MIT license), and the bumble stack + libusb are declared as regular dependencies — a plain `pip install sensor-sdk` is all that is needed.
 
 Behavior and controls:
 
-- With the dependencies installed and a dongle present, the backend is selected automatically on macOS when the SDK starts (native `bleak` is used otherwise). Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
+- With the dependencies installed and a usable dongle present, the backend is selected automatically on all platforms when the SDK starts (native `bleak` is used otherwise). "Usable" means libusb can open the device: on Windows the dongle must be bound to the WinUSB driver, on Linux the user needs udev permission, on macOS USB access is driverless. Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
+- `SensorController.checkSetupDongle()` checks dongle readiness and, when no dongle is usable, runs the bundled setup script with elevation — UAC prompt on Windows (binds the WinUSB driver), `sudo` on Linux (installs udev rules; the password goes through the controlling terminal, or when there is none — e.g. a GUI app launched without a terminal — a terminal-emulator window is spawned to run the script, falling back to `pkexec`; a replug may still be required afterwards) — then re-checks and returns `"OK: N"` (N = number of usable dongles detected) on success or an `"Error: ..."` string with the system error detail on failure. macOS needs no setup and is check-only. The call blocks while waiting for the elevation prompt. The same logic also lives in `sensor_utils.checkSetupDongle()`, exported at package top level as `sensor.checkSetupDongle()` for use without a controller instance. The same scripts (`setup_dongle_winusb.ps1`, `setup_dongle_udev.sh` and their driver/rules files) ship inside the wheel under `sensor/tools/` and can also be run manually.
 - `SENSOR_SDK_BLE_BACKEND=bleak` forces the native backend; `SENSOR_SDK_BLE_BACKEND=bumble` forces the dongle backend on any platform; `SENSOR_SDK_BUMBLE_TRANSPORT` overrides the bumble transport spec (e.g. `usb:0`).
-- USB access needs no sudo on macOS as long as the OS has not claimed the dongle (it normally doesn't when the internal Bluetooth works).
 - With the bumble backend, each dongle serves one connection at a time: scanning uses a free dongle and is skipped while all dongles are connected; connections fail fast when no dongle is free. Connection timeout is raised to 25s automatically.
 
 ## 1. Permission
@@ -74,6 +74,8 @@ Use `def scan(period_in_ms: int) -> list[BLEDevice]` to scan once time
 bleDevices = SensorControllerInstance.scan(6000)
 ```
 
+The asynchronous variant is `asyncScan(period_in_ms: int) -> list[BLEDevice]`.
+
 ### 3. Stop scan
 
 Use `def stopScan() -> None` to stop scan
@@ -96,6 +98,12 @@ Use `property isEnable: bool` to check if bluetooth is enable
 
 ```python
 isEnable = SensorControllerInstance.isEnable
+```
+
+Use `onEnableCallback` to be notified when the bluetooth enable state changes:
+
+```python
+SensorControllerInstance.onEnableCallback = lambda enabled: print("bluetooth on" if enabled else "bluetooth off")
 ```
 
 ### 6. Create SensorProfile
@@ -171,7 +179,12 @@ def on_error_callback(sensor, reason):
     pass
 
 def on_power_changed(sensor, power):
-    # callback for get battery level of device, power from 0 - 100, -1 is invalid
+    # callback for get battery level of device, power from 0 - 100
+    # (invalid -1 readings are never reported here; getBatteryLevel() may
+    # still return -1 when no valid reading is available yet)
+    # the reported value is stabilized with a hysteresis band (±2%): it only
+    # changes when a new reading differs from the current value by 2 or more,
+    # so ±1 jitter is filtered while real drain/charge trends are still tracked
     pass
 
 def on_data_callback(sensor, data):
@@ -229,6 +242,33 @@ Use `property BLEDevice: BLEDevice` to get BLE device of SensorProfile.
 bleDevice = sensorProfile.BLEDevice
 ```
 
+### 15.1 Auto reconnect and resume data stream
+
+Use `property autoReconnect: bool` (default `True`) to control automatic recovery. While `True` and the device is streaming, an abnormal disconnect — remote link loss or a long no-data (half-dead link) disconnect — is followed by automatic reconnect → `init()` with the previous init arguments → re-applying the `setParam` parameters from the previous streaming session (in the order they were set) → `startDataNotification()`. Recovery retries on the next successful reconnect if a step fails. Explicit user calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel the pending resume, and setting `autoReconnect = False` disables the behavior entirely.
+
+```python
+sensorProfile.autoReconnect = True   # default; set False to opt out
+```
+
+**Custom recovery via `onAutoReconnect`** (default `None`): when the auto-reconnect finds the disconnected device again (back in `Ready`, about to resume), this callback is invoked instead of the default flow.
+
+```python
+def on_reconnect(sensor, restore: bool) -> bool:
+    # restore=True  -> a previous session exists (init args + setParam values can be
+    #                  preserved and restored); restore=False -> fresh-init case
+    # return True   -> the app handled recovery itself (fresh init or custom flow);
+    #                  the SDK skips the default recovery
+    # return False  -> fall back to the default flow (connect -> init -> replay
+    #                  setParam values -> startDataNotification)
+    sensor.init(32, 60000)
+    sensor.startDataNotification()
+    return True
+
+sensorProfile.onAutoReconnect = on_reconnect
+```
+
+Callback exceptions are logged and treated as `False` (fall back). The callback runs on the SDK recovery thread, so blocking calls (`init()`, `setParam()`, `startDataNotification()`) are allowed inside it.
+
 ### 16. Get device info of SensorProfile
 
 Use `def getDeviceInfo() -> DeviceInfo | None` to get device info of SensorProfile.
@@ -282,11 +322,23 @@ Data type list：
 
 ```python
 class DataType(Enum):
-    NTF_ACC = 0x1  # unit is g
-    NTF_GYRO = 0x2  # unit is degree/s
-    NTF_EEG = 0x10  # unit is uV
-    NTF_ECG = 0x11  # unit is uV
-    NTF_BRTH = 0x15  # unit is uV
+    NTF_ACC = 0x1            # acceleration, unit is g
+    NTF_GYRO = 0x2           # gyroscope, unit is degree/s
+    NTF_EULER_DATA = 0x4     # euler angle, unit is degree
+    NTF_QUATERNION = 0x5     # quaternion (w, x, y, z)
+    NTF_GEST = 0x07          # gesture id
+    NTF_EMG = 0x8            # unit is uV
+    NTF_MAG_ANGLE_DATA = 0x0D
+    NTF_EEG = 0x10           # unit is uV
+    NTF_ECG = 0x11           # unit is uV
+    NTF_IMPEDANCE = 0x12     # electrode impedance
+    NTF_IMU = 0x13           # aggregated IMU batch (acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12;
+                             # new-EMG devices only, see DeviceInfo.ImuChannelCount)
+    NTF_ADS = 0x14
+    NTF_BRTH = 0x15          # respiration, unit is uV
+    NTF_IMPEDANCE_EXT = 0x16
+    NTF_SPO2 = 0x17          # SpO2 percentage
+    NTF_PPG = 0x18           # PPG raw samples
 ```
 
 Process data in onDataCallback.
@@ -335,7 +387,8 @@ Use `def getBatteryLevel() -> int` to get battery level. Please call after devic
 ```python
 batteryPower = sensorProfile.getBatteryLevel()
 
-# batteryPower is battery level returned, value ranges from 0 to 100, 0 means out of battery, while 100 means full.
+# batteryPower is battery level returned, value ranges from 0 to 100, 0 means out of battery, while 100 means full;
+# -1 means no valid reading is available yet (onPowerChanged never reports -1).
 ```
 
 Please check console.py in examples directory
@@ -366,12 +419,16 @@ result = sensorProfile.setParam("NTF_IMU", "ON")
 result = sensorProfile.setParam("NTF_BRTH", "ON")
 result = sensorProfile.setParam("NTF_IMPEDANCE", "ON")
 result = sensorProfile.setParam("NTF_MAG_ANGLE", "ON")
-result = sensorProfile.setParam("NTF_PPG_RAW", "ON")
+result = sensorProfile.setParam("NTF_PPG", "ON")
+result = sensorProfile.setParam("NTF_PPG_RAW", "ON")   # alias of NTF_PPG
+result = sensorProfile.setParam("NTF_SPO2", "ON")
 result = sensorProfile.setParam("NTF_GFORCE_EULER", "ON")
 result = sensorProfile.setParam("NTF_GFORCE_QUAT", "ON")
 result = sensorProfile.setParam("NTF_GFORCE_ACC", "ON")
 result = sensorProfile.setParam("NTF_GFORCE_GYRO", "ON")
 # set data stream to ON or OFF, result is "OK" if succeed
+# NTF_IMU is the master switch of the four NTF_GFORCE_* streams: toggling it
+# updates all four, and toggling any of the four updates the aggregated NTF_IMU state.
 # Note: on legacy (non-new) EMG devices, NTF_GEST and NTF_EMG are mutually exclusive.
 
 # Firmware filter toggles
@@ -387,16 +444,24 @@ result = sensorProfile.setParam("FILTER_HPF", "ON")
 result = sensorProfile.setParam("FILTER_LPF", "ON")
 # set 80Hz lpf filter to ON or OFF, result is "OK" if succeed
 
+# NeuCir remote control (NeuCir devices only)
+result = sensorProfile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
+result = sensorProfile.setParam("NEUCIR_APP_CONTROL", "OPEN")   # OPEN / CLOSE / STOP
+
 result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.bin")
 # set the bin export path: the session's raw BLE capture is recorded in the system
 # temp directory and copied to this location on stopDataNotification / disconnect;
-# "True" exports to {DeviceName}_data_YYYYMMDD_HHMMSS.bin in the SDK log directory,
-# "False" or "" disables export (the temp bin is just deleted).
+# "True" exports to {DeviceName}_data_YYYYMMDD_HHMMSS.bin in the SDK log directory
+# (see setLogPath; disabled when file output is off), "False" or "" disables
+# export (the temp bin is just deleted).
 # please give an absolute path and make sure it is valid and writeable by yourself
 
 result = sensorProfile.setParam("DEBUG_LOG_PATH", "True")
-# enable SDK file logging to a default file ({DeviceName}_log_YYYYMMDD_HHMMSS.txt),
-# or pass an absolute custom path instead of "True"; "False" or "" disables it.
+# enable this profile's log file: {DeviceName}_log_YYYYMMDD_HHMMSS.txt in the SDK
+# log directory (see setLogPath), or pass an absolute custom path instead of "True";
+# "False" or "" disables it. The profile log contains only this profile's logs plus
+# the bleak/bumble logs related to its current connection; all other (common) logs
+# go to the controller log.
 # getParam("DEBUG_LOG_PATH") returns the current log file path ("" when disabled).
 ```
 
@@ -475,29 +540,52 @@ Use `def parseBinToCsv(self, bin_path: str, csv_path: Optional[str] = None) -> s
 csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin")
 # or with an explicit output path:
 csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin", "d:/temp/test.csv")
-# Returns the CSV file path. Columns:
-# timestamp, mac, type, raw_hex, data_type, sample_rate, channel_count, lost_count, samples_info, first_sample
+# Returns the CSV file path.
 ```
+
+**CSV format** — header row:
+
+```
+timestamp,mac,type,raw_hex,data_type,sample_rate,channel_count,lost_count,samples_info,first_sample
+```
+
+Row kinds in record order (config records produce no rows; a bin without a config record yields `raw` rows only):
+
+- `raw` rows — one per data record: `timestamp` = ISO 8601 (local time) of the bin record timestamp, `mac` (empty for records before the first config record), `type` = `raw`, `raw_hex` = raw packet bytes as hex; remaining columns empty.
+- `cmd_send` / `cmd_recv` rows — one per command record: `type` = `cmd_send` / `cmd_recv`, `raw_hex` = command bytes as hex, `data_type` = decoded command name (`cmd_send`, e.g. `NTF_DATA_START`) or `NAME:CODE` (`cmd_recv`, e.g. `GET_FEATURE_MAP:SUCCESS`); remaining columns empty. These rows are analysis-only and are not fed into parsing.
+- `event` rows — one per BLE event record: `type` = `event`, `raw_hex` = event name as hex, `data_type` = event name (`connect` / `disconnect` / `stream_start` / `stream_stop`); remaining columns empty.
+- `parsed` rows — one per parsed batch emitted by the real parsing pipeline (`raw_hex` empty):
+
+| Column | Meaning |
+|--------|---------|
+| `timestamp` | ISO 8601 (local time) of the bin record being fed when the batch completed |
+| `mac` | Device MAC from the config record |
+| `type` | `parsed` |
+| `data_type` | `DataType` enum name of the batch, e.g. `NTF_EMG`, `NTF_EEG`, `NTF_ACC` |
+| `sample_rate` | Batch sample rate (Hz) |
+| `channel_count` | Batch channel count |
+| `lost_count` | `lostPackageCount` of the batch (non-zero only for new-EMG devices) |
+| `samples_info` | Per-channel sample counts as a Python list string, e.g. `[32, 32, 32]` |
+| `first_sample` | First sample of the first non-empty channel: `data=<v>\|raw=<raw>\|imp=<impedance>\|sat=<saturation>\|idx=<sampleIndex>\|ts=<timeStampInMs>\|ch=<channelIndex>\|lost=<isLost>` |
 
 ## Logging controls
 
-File logging is disabled by default. Records emitted before file logging is first enabled are held in a bounded memory buffer and replayed into the file on first enable, so early (scan/connect) logs are not lost. The log path is automatically shared with the BLE subprocess, so both sides write to the same file.
+`setLogPath` sets the SDK log **directory** (it must be a directory). All default file outputs live in it: the controller log, the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin exports (`DEBUG_BLE_DATA_PATH=True`).
+
+The **controller log** (`sensor_controller_log_YYYYMMDD_HHMMSS.txt`) holds all common logs (scan, connection management, dongle/backend, and logs of profiles whose profile log is not enabled). It is created automatically in the log directory when `setDebugEnabled(True)` is called, and closed on `setDebugEnabled(False)`. Each **profile log** (`{DeviceName}_log_YYYYMMDD_HHMMSS.txt`, enabled per profile via `setParam("DEBUG_LOG_PATH", ...)`) contains only that profile's logs plus the bleak/bumble logs related to its current connection.
+
+Records emitted before a log file is first created are held in a bounded memory buffer and replayed into the file on creation, so early (scan/connect) logs are not lost. The log directory and debug switch are automatically shared with the BLE subprocess, so both sides append to the same files.
 
 ```python
 SensorControllerInstance.setDebugEnabled(True)
-# enable/disable SDK debug logs
+# enable SDK debug logs; automatically creates the controller log in the log
+# directory. setDebugEnabled(False) closes it.
 
-SensorControllerInstance.setLogPath("d:/temp/sdk.log")
-# enable file logging to a custom path; pass "" to disable
+SensorControllerInstance.setLogPath(True, "d:/temp/sdklogs")
+# set the log directory (must be a directory; created if missing, rejected if
+# it points to an existing file). setLogPath(False) disables file output
+# (controller log, default profile logs and default bin exports).
 
-SensorControllerInstance.enableFileLog(True)
-# enable file logging with the default path
-# (~/Documents/sensorsdklog/log_YYYYMMDD_HHMMSS.txt)
-
-SensorControllerInstance.setControllerLogPath("d:/temp/controller.log")
-# SensorController-dedicated log file; pass "" to disable
-
-SensorControllerInstance.enableControllerLog(True)
-# enable the controller-dedicated log with the default path
-# (~/Documents/sensorsdklog/sensor_controller_log_YYYYMMDD_HHMMSS.txt)
+SensorControllerInstance.setLogPath(True)
+# reset to the default log directory (~/Documents/sensorsdklog)
 ```
