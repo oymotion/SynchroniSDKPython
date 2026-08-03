@@ -22,7 +22,6 @@ from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import QRunnable, QThreadPool
 
 from sensor import *
-import sensor
 
 
 SCAN_DEVICE_PERIOD_IN_MS   = 3000
@@ -61,6 +60,58 @@ FIXED_Y_RANGES = {
     DataType.NTF_QUATERNION: (-1, 1),
 }
 
+# NTF_IMU 聚合批（新 EMG 设备）的固定通道布局：acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12
+_IMU_AGGREGATE_SLICES = (
+    (DataType.NTF_ACC,        0, 3),
+    (DataType.NTF_GYRO,       3, 6),
+    (DataType.NTF_EULER_DATA, 6, 9),
+    (DataType.NTF_QUATERNION, 9, 13),
+)
+
+
+def split_imu_aggregate(data: SensorData) -> List[SensorData]:
+    """把 NTF_IMU 聚合批按固定通道布局拆成四路独立 SensorData 视图
+    （channelSamples 直接切片共享 Sample 引用，不复制）；
+    通道不足的类型跳过（非 QAT6 设备聚合流只有 acc+gyro 6 通道）。
+    lostPackageCount 只挂在第一路上，避免丢包统计重复上报。"""
+    n_ch = len(data.channelSamples)
+    subs = []
+    for dt, start, end in _IMU_AGGREGATE_SLICES:
+        if n_ch < end:
+            continue
+        sub = SensorData()
+        sub.deviceMac = data.deviceMac
+        sub.dataType = dt
+        sub.sampleRate = data.sampleRate
+        sub.channelCount = end - start
+        sub.packageSampleCount = data.packageSampleCount
+        sub.channelSamples = data.channelSamples[start:end]
+        sub.lostPackageCount = data.lostPackageCount if not subs else 0
+        subs.append(sub)
+    return subs
+
+GESTURE_DEFAULT_TEXT = (
+    "Gesture:\n"
+    "  gesture: -- (0-8)\n"
+    "  raw gesture: -- (0-8)\n"
+    "  possiblity: -- (0-100)\n"
+    "  strength: -- (0-100)"
+)
+
+# PPG 设备右侧共享图表配置：(数据类型, 通道索引, 标题, 颜色)：
+# 2×EEG fp1/fp2 + 2×PPG red/ir LED + 2×SpO2 spo2/heart_rate
+BIO_PLOT_CONFIG = [
+    (DataType.NTF_EEG,  0, "fp1",   plt.cm.tab10(0)),
+    (DataType.NTF_EEG,  1, "fp2",   plt.cm.tab10(1)),
+    (DataType.NTF_PPG,  0, "red_led", plt.cm.tab10(2)),
+    (DataType.NTF_PPG,  1, "ir_led",  plt.cm.tab10(3)),
+    (DataType.NTF_SPO2, 0, "spo2",    plt.cm.tab10(4)),
+    (DataType.NTF_SPO2, 1, "heart_rate", plt.cm.tab10(5)),
+]
+
+EEG_AXIS_COUNT = 8                     # EEG/EMG 模式右侧子图数
+PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
+
 
 class DataTask(QRunnable):
     def __init__(self, callback, data):
@@ -86,6 +137,7 @@ class DeviceDataState:
         self.lost_counts: dict = {}
         self.ntf_states: dict = {}     # key -> (enabled, checked)
         self.filter_states: dict = {}  # key -> (enabled, checked)
+        self.gesture = None            # (gesture, raw_gesture, possiblity, strength)
 
         self.buffers: dict = {}
         self.sample_rates: dict = {}
@@ -128,7 +180,16 @@ class DeviceDataState:
         self.emg_impedance: list = []
         self.emg_buffer_lock = QtCore.QMutex()
 
-        # 右侧生物电显示区类型：根据设备能力在 "eeg" / "emg" 间切换
+        # PPG 设备的生物电缓冲（EEG fp1/fp2 + PPG + SpO2，5s 环形缓冲，共用一把锁）；
+        # 仅 bio_kind == "ppg" 时由 init_buffers 建立
+        self.bio_buffers: dict = {}
+        self.bio_sample_index_buffers: dict = {}
+        self.bio_buffer_indices: dict = {}
+        self.bio_sample_rates: dict = {}
+        self.bio_impedance: dict = {}
+        self.bio_buffer_lock = QtCore.QMutex()
+
+        # 右侧生物电显示区类型：根据设备能力在 "eeg" / "emg" / "ppg" 间切换
         self.bio_kind: Optional[str] = None
 
         self.quaternion = [1.0, 0.0, 0.0, 0.0]
@@ -150,6 +211,11 @@ class DeviceDataState:
         """统计每种数据类型实际收到的样本数（不含丢包占位样本），
         并记录数据批携带的标称采样率/通道数。"""
         if not data.channelSamples:
+            return
+        if data.dataType == DataType.NTF_IMU:
+            # 聚合批：按拆分后的子类型分别计数，状态栏实测速率与四路独立流一致
+            for sub in split_imu_aggregate(data):
+                self.note_data_received(sub)
             return
         n = sum(1 for s in data.channelSamples[0] if not getattr(s, "isLost", False))
         with self.rate_lock:
@@ -260,18 +326,87 @@ class DeviceDataState:
             self.emg_buffer_index = 0
             self.emg_impedance = [None] * self.emg_display_channels
 
-        # 有 EEG 能力优先按 EEG 显示，否则按 EMG 显示
-        if self.eeg_buffer is not None:
+        # PPG 设备（含 EEG fp1/fp2，在 PPG 布局内显示）优先按 PPG 显示；
+        # 否则有 EEG 能力优先按 EEG 显示，否则按 EMG 显示
+        if info.PpgSampleRate > 0:
+            self.bio_kind = "ppg"
+        elif self.eeg_buffer is not None:
             self.bio_kind = "eeg"
         elif self.emg_buffer is not None:
             self.bio_kind = "emg"
         else:
             self.bio_kind = None
 
+        if self.bio_kind == "ppg":
+            bio_configs = [
+                (DataType.NTF_EEG,  info.EegSampleRate,  info.EegChannelCount),
+                (DataType.NTF_PPG,  info.PpgSampleRate,  info.PpgChannelCount),
+                (DataType.NTF_SPO2, info.Spo2SampleRate, info.Spo2ChannelCount),
+            ]
+            for dt, sr, ch in bio_configs:
+                if sr > 0 and ch > 0:
+                    buf_len = max(sr * BUFFER_SECONDS, 1)
+                    self.bio_buffers[dt] = np.zeros((ch, buf_len))
+                    self.bio_sample_index_buffers[dt] = np.zeros((ch, buf_len), dtype=np.int64)
+                    self.bio_buffer_indices[dt] = 0
+                    self.bio_sample_rates[dt] = sr
+                    self.bio_impedance[dt] = []
+
         extra_axes = int(self.has_ecg) + int(self.has_brth)
         self.eeg_channels_per_page = eeg_axis_count - extra_axes
 
     def append_data(self, data: SensorData):
+        # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
+        # 不再写入 1s 的 eeg 缓冲
+        if self.bio_buffers and data.dataType in self.bio_buffers:
+            self.bio_buffer_lock.lock()
+            try:
+                buf = self.bio_buffers.get(data.dataType)
+                idx_buf = self.bio_sample_index_buffers.get(data.dataType)
+                if buf is None or idx_buf is None or not data.channelSamples:
+                    return
+                buffer_size = buf.shape[1]
+                n = len(data.channelSamples[0])
+                if n == 0:
+                    return
+                if n > buffer_size:
+                    n = buffer_size
+                buf_idx = self.bio_buffer_indices.get(data.dataType, 0)
+                write_start = buf_idx
+                write_end = buf_idx + n
+
+                # Circular-buffer write: avoid rolling the whole buffer on every packet.
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    if len(new_vals) == 0:
+                        continue
+                    if len(new_vals) > n:
+                        new_vals = new_vals[-n:]
+                        new_indices = new_indices[-n:]
+
+                    if write_end <= buffer_size:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buffer_size - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+
+                    if data.dataType == DataType.NTF_EEG:
+                        while len(self.bio_impedance[data.dataType]) <= ch_idx:
+                            self.bio_impedance[data.dataType].append(0)
+                        self.bio_impedance[data.dataType][ch_idx] = ch_samples[-1].impedance
+
+                self.bio_buffer_indices[data.dataType] = (buf_idx + n) % buffer_size
+            finally:
+                self.bio_buffer_lock.unlock()
+            return
+
         if data.dataType == DataType.NTF_EMG:
             self.emg_buffer_lock.lock()
             try:
@@ -502,11 +637,22 @@ class DeviceDataState:
             self.ecg_buffer_lock.unlock()
             self.eeg_buffer_lock.unlock()
 
+        self.bio_buffer_lock.lock()
+        try:
+            for dt in list(self.bio_buffers.keys()):
+                self.bio_buffers[dt].fill(0)
+                self.bio_sample_index_buffers[dt].fill(0)
+                self.bio_buffer_indices[dt] = 0
+        finally:
+            self.bio_buffer_lock.unlock()
+
 
 class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     power_changed_sig = QtCore.pyqtSignal(object, int)         # (sensor, power)
     add_device_sig = QtCore.pyqtSignal(str)
+    update_device_sig = QtCore.pyqtSignal(str, int)    # (address, rssi)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
+    gesture_signal = QtCore.pyqtSignal(str, int, int, int, int)   # (address, gesture, raw, possiblity, strength)
     device_disconnected_sig = QtCore.pyqtSignal(str)         # address
     device_disconnected_sig = QtCore.pyqtSignal(str)         # address
     auto_reconnect_sig = QtCore.pyqtSignal(str, bool)        # (address, restore)
@@ -538,6 +684,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.ecg_line = None
         self.brth_line = None
         self.emg_lines = []
+        self.bio_lines = []
         self._eeg_display_channels = 0
 
         self._updating_ntf_controls = False
@@ -570,8 +717,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._rate_last_refresh = 0.0   # 实测采样率每秒刷新的时间戳
 
         self.add_device_sig.connect(self._add_device_item)
+        self.update_device_sig.connect(self._update_device_rssi)
         self.power_changed_sig.connect(self._update_power_display)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
+        self.gesture_signal.connect(self._update_gesture_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
         self.auto_reconnect_sig.connect(self._press_connect_for_address)
         self.replay_done_sig.connect(self._on_replay_done)
@@ -706,9 +855,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         lost_packet_layout.addWidget(self.lost_packet_label)
         self.lost_packet_box.setLayout(lost_packet_layout)
 
+        self.gesture_label = QtWidgets.QLabel(GESTURE_DEFAULT_TEXT)
+        self.gesture_label.setWordWrap(True)
+        self.gesture_box = QtWidgets.QGroupBox("Gesture")
+        gesture_layout = QtWidgets.QVBoxLayout()
+        gesture_layout.addWidget(self.gesture_label)
+        self.gesture_box.setLayout(gesture_layout)
+
         status_layout = QtWidgets.QHBoxLayout()
         status_layout.addWidget(self.value_box, stretch=1)
         status_layout.addWidget(self.lost_packet_box, stretch=1)
+        status_layout.addWidget(self.gesture_box, stretch=1)
 
         display_layout = QtWidgets.QHBoxLayout()
         display_layout.addLayout(type_layout)
@@ -749,6 +906,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._ntf_checkboxes = {
             "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
             "NTF_EMG":  QtWidgets.QCheckBox("EMG"),
+            "NTF_GEST": QtWidgets.QCheckBox("GESTURE"),
             "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
         }
         for key, cb in self._ntf_checkboxes.items():
@@ -800,7 +958,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         eeg_layout.addLayout(page_controls_layout)
 
-        self.figure_eeg, self.axes_eeg = plt.subplots(8, 1, sharex=True, figsize=(8, 12))
+        self.figure_eeg, self.axes_eeg = plt.subplots(EEG_AXIS_COUNT, 1, sharex=True, figsize=(8, 12))
         self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4)
         self.canvas_eeg = FigureCanvas(self.figure_eeg)
         self.bio_title_label = QtWidgets.QLabel("EMG / EEG Waveform")
@@ -813,7 +971,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{sensor.__version__})")
+        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{self.sensor_controller.getVersion()})")
         self.resize(1600, 900)
         self.show()
 
@@ -880,12 +1038,58 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._stop_scan()
         # 不过滤设备名，扫描到的所有设备都列入列表
         for d in device_list:
-            if d.Address not in [x.Address for x in self.discovered_devices]:
+            existing = next((x for x in self.discovered_devices if x.Address == d.Address), None)
+            if existing is None:
                 self.discovered_devices.append(d)
                 self.add_device_sig.emit(f"RSSI: {d.RSSI}, Name: {d.Name}, Address: {d.Address}")
+            else:
+                # SDK 在回调前已更新共享 BLEDevice 的 RSSI（同一对象，比较无意义），
+                # 每次扫描返回都刷新一次列表项显示并重排
+                existing.RSSI = d.RSSI
+                self.update_device_sig.emit(d.Address, d.RSSI)
 
     def _add_device_item(self, text: str):
-        self.device_list.addItem(text)
+        item = QtWidgets.QListWidgetItem(text)
+        # 记录 RSSI 到 UserRole，插入后按信号强度从大到小排序
+        try:
+            rssi = int(text.split("RSSI: ")[1].split(",")[0])
+        except (IndexError, ValueError):
+            rssi = None
+        item.setData(QtCore.Qt.UserRole, rssi)
+        self.device_list.addItem(item)
+        self._sort_device_list()
+
+    def _sort_device_list(self):
+        """按 RSSI 从大到小重排设备列表项（未记录 RSSI 的排最后）。"""
+
+        def rssi_of(it):
+            rssi = it.data(QtCore.Qt.UserRole)
+            return rssi if isinstance(rssi, int) else -999
+
+        items = []
+        while self.device_list.count():
+            items.append(self.device_list.takeItem(0))
+        items.sort(key=rssi_of, reverse=True)
+        for it in items:
+            self.device_list.addItem(it)
+
+    def _update_device_rssi(self, addr: str, rssi: int):
+        """扫描到新 RSSI 时更新列表项文本（保留 [Connected] 前缀）并重排。"""
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            text = item.text()
+            if f"Address: {addr}" not in text:
+                continue
+            d = next((x for x in self.discovered_devices if x.Address == addr), None)
+            if d is None:
+                return
+            new_text = f"RSSI: {rssi}, Name: {d.Name}, Address: {d.Address}"
+            if text.startswith("[Connected] "):
+                new_text = "[Connected] " + new_text
+            item.setText(new_text)
+            item.setData(QtCore.Qt.UserRole, rssi)
+            break
+        self._sort_device_list()
 
     def _selected_address(self) -> Optional[str]:
         item = self.device_list.currentItem()
@@ -974,7 +1178,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
             info = sensor.getDeviceInfo()
             state.info = info
-            state.init_buffers(info, len(self.axes_eeg))
+            state.init_buffers(info, EEG_AXIS_COUNT)
             state.status_parts = [
                 ("ACC",   info.AccChannelCount,   info.AccSampleRate,   DataType.NTF_ACC),
                 ("Euler", info.EulerChannelCount, info.EulerSampleRate, DataType.NTF_EULER_DATA),
@@ -983,12 +1187,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if state.bio_kind == "emg":
                 state.status_parts.append(
                     ("EMG", info.EmgChannelCount, info.EmgSampleRate, DataType.NTF_EMG))
+            elif state.bio_kind == "ppg":
+                state.status_parts.extend([
+                    ("EEG",  info.EegChannelCount,  info.EegSampleRate,  DataType.NTF_EEG),
+                    ("PPG",  info.PpgChannelCount,  info.PpgSampleRate,  DataType.NTF_PPG),
+                    ("SpO2", info.Spo2ChannelCount, info.Spo2SampleRate, DataType.NTF_SPO2),
+                ])
             else:
                 state.status_parts.extend([
                     ("EEG",  info.EegChannelCount,  info.EegSampleRate,  DataType.NTF_EEG),
                     ("ECG",  info.EcgChannelCount,  info.EcgSampleRate,  DataType.NTF_ECG),
                     ("BRTH", info.BrthChannelCount, info.BrthSampleRate, DataType.NTF_BRTH),
                 ])
+            # GEST 的标称值 DeviceInfo 不提供，首个数据批到达时从批次自带的
+            # sampleRate/通道数补齐
+            state.status_parts.append(("GEST", 0, 0, DataType.NTF_GEST))
             state.status_text = state.build_status_text()
 
         if not sensor.isDataTransfering:
@@ -1120,7 +1333,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # _on_data 按地址路由到它的 DeviceDataState，显示流程与实时设备一致
         state = DeviceDataState(sensor)
         state.info = info
-        state.init_buffers(info, len(self.axes_eeg))
+        state.init_buffers(info, EEG_AXIS_COUNT)
         duration = config.get("replay_duration", 0.0)
         version = config.get("version", "?")
         state.status_text = (
@@ -1269,7 +1482,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _drain_incoming_data(self):
         """GUI 定时器侧的数据分发入口：消费 SDK 回调线程入队的数据批，
-        依次做缓冲区 append（经 _dispatch_data 的线程池）、四元数 3D 视图等显示更新。"""
+        依次做缓冲区 append（经 _dispatch_data 的线程池）、四元数 3D 视图与手势显示。"""
         while True:
             try:
                 addr, data = self._incoming_data_q.get_nowait()
@@ -1278,10 +1491,22 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             state = self.device_states.get(addr)
             if state is None:
                 continue
-            if data.dataType in state.buffers or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG):
+            if data.dataType == DataType.NTF_IMU:
+                # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
+                for sub in split_imu_aggregate(data):
+                    if sub.dataType in state.buffers:
+                        self._dispatch_data(addr, sub)
+                    if sub.dataType == DataType.NTF_QUATERNION:
+                        self._update_quaternion(state, sub)
+                continue
+            if (data.dataType in state.buffers
+                    or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
+                    or (state.bio_buffers and data.dataType in state.bio_buffers)):
                 self._dispatch_data(addr, data)
             if data.dataType == DataType.NTF_QUATERNION:
                 self._update_quaternion(state, data)
+            if data.dataType == DataType.NTF_GEST:
+                self._handle_gesture_data(addr, data)
 
     def _get_data_type_pool(self, key):
         pool = self._data_type_pools.get(key)
@@ -1422,11 +1647,27 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._update_page_label()
             self._update_page_buttons()
 
+    def _reset_eeg_axes(self, count: int):
+        """按显示模式重建右侧共享图表的子图（EEG/EMG 模式 8 个，PPG 模式 6 个）；
+        子图数量与当前一致时不做任何事，否则清空 figure 重新创建。"""
+        if len(self.axes_eeg) == count:
+            return
+        self.figure_eeg.clf()
+        axes = [self.figure_eeg.add_subplot(count, 1, 1)]
+        for i in range(1, count):
+            axes.append(self.figure_eeg.add_subplot(count, 1, i + 1, sharex=axes[0]))
+        self.axes_eeg = axes
+        self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4)
+
     def _rebuild_eeg_plot(self):
         state = self._current_state()
+        if state is not None and state.bio_kind == "ppg":
+            self._rebuild_ppg_plot(state)
+            return
         if state is not None and state.bio_kind == "emg":
             self._rebuild_emg_plot(state)
             return
+        self._reset_eeg_axes(EEG_AXIS_COUNT)
         eeg_available = False
         ecg_available = False
         brth_available = False
@@ -1481,6 +1722,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.ecg_line = None
             self.brth_line = None
             self.emg_lines = []
+            self.bio_lines = []
             self._eeg_display_channels = 0
             self._update_page_label()
             self._update_page_buttons()
@@ -1488,6 +1730,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self.bio_title_label.setText("EEG + ECG + BRTH Waveform")
         self.emg_lines = []
+        self.bio_lines = []
         self._last_plotted_sample_indices[DataType.NTF_EEG] = int(eeg_idx_buf_copy.max())
         if ecg_available:
             self._last_plotted_sample_indices[DataType.NTF_ECG] = int(ecg_idx_buf_copy.max())
@@ -1562,6 +1805,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _rebuild_emg_plot(self, state: DeviceDataState):
         """EMG 设备的右侧显示区：复用 EEG 的 8 个子图，显示 EMG 通道（不分页）。"""
+        self._reset_eeg_axes(EEG_AXIS_COUNT)
         emg_available = False
         emg_buffer_copy = None
         emg_idx_buf_copy = None
@@ -1582,6 +1826,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
+        self.bio_lines = []
         self._eeg_display_channels = 0
         self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
         self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
@@ -1625,6 +1870,76 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.set_visible(True)
             else:
                 ax.set_visible(False)
+
+        self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
+        self._update_page_label()
+        self._update_page_buttons()
+        self.canvas_eeg.draw_idle()
+
+    def _rebuild_ppg_plot(self, state: DeviceDataState):
+        """PPG 设备的右侧显示区：6 个子图（2×EEG fp1/fp2 + 2×PPG red/ir + 2×SpO2）。"""
+        self._reset_eeg_axes(PPG_AXIS_COUNT)
+        buffers_copy = {}
+        idx_buffers_copy = {}
+        has_any_data = False
+        state.bio_buffer_lock.lock()
+        try:
+            for dt in (DataType.NTF_EEG, DataType.NTF_PPG, DataType.NTF_SPO2):
+                buf = state.bio_buffers.get(dt)
+                idx_buf = state.bio_sample_index_buffers.get(dt)
+                if buf is not None and idx_buf is not None:
+                    buf_idx = state.bio_buffer_indices.get(dt, 0)
+                    # Reassemble the circular buffer into chronological order for plotting.
+                    buffers_copy[dt] = np.roll(buf.copy(), -buf_idx, axis=1)
+                    idx_buffers_copy[dt] = idx_buf.copy()
+                    has_any_data = True
+        finally:
+            state.bio_buffer_lock.unlock()
+
+        # PPG 布局不使用 EEG 分页与 EMG 线条，全部置空
+        self.eeg_lines = []
+        self.ecg_line = None
+        self.brth_line = None
+        self.emg_lines = []
+        self._eeg_display_channels = 0
+
+        if not has_any_data:
+            for ax in self.axes_eeg:
+                ax.cla()
+            self.bio_title_label.setText("EEG + PPG + SpO2 Waveform")
+            self.axes_eeg[0].set_title("EEG + PPG + SpO2 (Device not supported or disabled)")
+            self.canvas_eeg.draw_idle()
+            for dt in (DataType.NTF_EEG, DataType.NTF_PPG, DataType.NTF_SPO2):
+                self._last_plotted_sample_indices.pop(dt, None)
+            self.bio_lines = []
+            self._update_page_label()
+            self._update_page_buttons()
+            return
+
+        self.bio_title_label.setText("EEG + PPG + SpO2 Waveform")
+        for dt, idx_buf in idx_buffers_copy.items():
+            self._last_plotted_sample_indices[dt] = int(idx_buf.max())
+
+        self.bio_lines = []
+        for plot_idx, (dt, ch_idx, title, color) in enumerate(BIO_PLOT_CONFIG):
+            ax = self.axes_eeg[plot_idx]
+            ax.cla()
+
+            buf_copy = buffers_copy.get(dt)
+            if buf_copy is not None and ch_idx < buf_copy.shape[0]:
+                t = np.linspace(-BUFFER_SECONDS, 0, buf_copy.shape[1])
+                (line,) = ax.plot(t, buf_copy[ch_idx], color=color, linewidth=0.8)
+            else:
+                (line,) = ax.plot([], [], color=color, linewidth=0.8)
+
+            self.bio_lines.append(line)
+            ax.tick_params(axis='both', labelsize=7)
+            ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+            ax.set_xlim(-BUFFER_SECONDS, 0)
+            ax.set_ylabel(title, fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+            ax.yaxis.set_label_position("right")
+            for spine in ax.spines.values():
+                spine.set_color(color)
 
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
         self._update_page_label()
@@ -1791,6 +2106,88 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         self.ax_2d.set_ylim(new_ylim)
                 self.canvas_2d.draw_idle()
                 self._last_plotted_sample_indices[dt] = current_last_idx
+
+        # PPG 设备：右侧 6 子图（EEG fp1/fp2 + PPG + SpO2）按 BIO_PLOT_CONFIG 逐条刷新；
+        # 下方 EEG/ECG/BRTH/EMG 分支在 ppg 模式下线条均为空，自动跳过
+        if state.bio_kind == "ppg":
+            state.bio_buffer_lock.lock()
+            try:
+                bio_buffers_copy = {}
+                bio_idx_buffers_copy = {}
+                bio_impedance_copy = {}
+                for dt in (DataType.NTF_EEG, DataType.NTF_PPG, DataType.NTF_SPO2):
+                    buf = state.bio_buffers.get(dt)
+                    idx_buf = state.bio_sample_index_buffers.get(dt)
+                    if buf is not None and idx_buf is not None:
+                        buf_idx = state.bio_buffer_indices.get(dt, 0)
+                        # Reassemble the circular buffer into chronological order for plotting.
+                        bio_buffers_copy[dt] = np.roll(buf.copy(), -buf_idx, axis=1)
+                        bio_idx_buffers_copy[dt] = idx_buf.copy()
+                        if dt in state.bio_impedance:
+                            bio_impedance_copy[dt] = state.bio_impedance[dt][:]
+            finally:
+                state.bio_buffer_lock.unlock()
+
+            if bio_buffers_copy and self.bio_lines:
+                any_updated = False
+                for plot_idx, (dt, ch_idx, title, color) in enumerate(BIO_PLOT_CONFIG):
+                    buf_copy = bio_buffers_copy.get(dt)
+                    idx_buf_copy = bio_idx_buffers_copy.get(dt)
+                    if buf_copy is None or idx_buf_copy is None:
+                        continue
+                    if plot_idx >= len(self.bio_lines) or plot_idx >= len(self.axes_eeg):
+                        continue
+
+                    current_last_idx = int(idx_buf_copy.max())
+                    last_plotted_idx = self._last_plotted_sample_indices.get(dt, -1)
+                    if current_last_idx == last_plotted_idx:
+                        continue
+
+                    any_updated = True
+                    line = self.bio_lines[plot_idx]
+                    ax = self.axes_eeg[plot_idx]
+                    if ch_idx < buf_copy.shape[0]:
+                        line.set_ydata(buf_copy[ch_idx])
+                        ch_data = buf_copy[ch_idx]
+                        mn, mx = ch_data.min(), ch_data.max()
+                        margin = max((mx - mn) * 0.1, 0.01)
+                        if mn == mx:
+                            mn -= 1
+                            mx += 1
+                        ax.set_ylim(mn - margin, mx + margin)
+
+                        if dt == DataType.NTF_EEG:
+                            imp_list = bio_impedance_copy.get(dt, [])
+                            if ch_idx < len(imp_list) and isinstance(imp_list[ch_idx], (int, float)):
+                                current_impedance = imp_list[ch_idx] / 1000.0
+                                if current_impedance <= 500:
+                                    imp_color = "green"
+                                elif 500 < current_impedance <= 999:
+                                    imp_color = "orange"
+                                else:
+                                    imp_color = "red"
+                                ax.set_ylabel(
+                                    f"{title}\n{current_impedance:.2f} KΩ",
+                                    fontsize=8, color=imp_color, rotation=0,
+                                    va='center', ha='left', labelpad=10
+                                )
+                            else:
+                                ax.set_ylabel(
+                                    title,
+                                    fontsize=8, color=color, rotation=0,
+                                    va='center', ha='left', labelpad=10
+                                )
+                        else:
+                            ax.set_ylabel(
+                                title,
+                                fontsize=8, color=color, rotation=0,
+                                va='center', ha='left', labelpad=10
+                            )
+
+                if any_updated:
+                    self.canvas_eeg.draw_idle()
+                    for dt, idx_buf in bio_idx_buffers_copy.items():
+                        self._last_plotted_sample_indices[dt] = int(idx_buf.max())
 
         eeg_buffer_copy = None
         eeg_idx_buf_copy = None
@@ -2058,6 +2455,39 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             text = "  ".join(f"{k}: {v}" for k, v in sorted(state.lost_counts.items()))
             self.lost_packet_label.setText("Packet Loss Stats: " + text)
 
+    def _handle_gesture_data(self, addr: str, data: SensorData):
+        if not data.channelSamples:
+            return
+        samples = data.channelSamples[0]
+        if not samples:
+            return
+        sample = samples[-1]
+        gesture = int(sample.data)
+        raw_gesture = int(sample.rawData)
+        possiblity = int(sample.impedance)
+        strength = int(sample.saturation)
+        self.gesture_signal.emit(addr, gesture, raw_gesture, possiblity, strength)
+
+    @staticmethod
+    def _gesture_text(gesture_tuple) -> str:
+        if gesture_tuple is None:
+            return GESTURE_DEFAULT_TEXT
+        gesture, raw_gesture, possiblity, strength = gesture_tuple
+        return (
+            "Gesture:\n"
+            f"  gesture: {gesture} (0-8)\n"
+            f"  raw gesture: {raw_gesture} (0-8)\n"
+            f"  possiblity: {possiblity} (0-100)\n"
+            f"  strength: {strength} (0-100)"
+        )
+
+    def _update_gesture_display(self, addr: str, gesture: int, raw_gesture: int, possiblity: int, strength: int):
+        state = self.device_states.get(addr)
+        if state is not None:
+            state.gesture = (gesture, raw_gesture, possiblity, strength)
+        if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
+            self.gesture_label.setText(self._gesture_text((gesture, raw_gesture, possiblity, strength)))
+
     def _on_power_changed(self, sensor: SensorProfile, power: int):
         # SDK 回调线程：只做日志与信号转发，控件更新交给 GUI 线程（Qt 控件只允许在 GUI 线程访问）
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
@@ -2083,7 +2513,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # 都归到该子目录（须在 setDebugEnabled(True) 之前设置）
         log_dir = os.path.join(
             str(Path.home() / "Documents" / "sensorsdklog"),
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sensor.__version__.replace('.', '_')}",
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.sensor_controller.getVersion().replace('.', '_')}",
         )
         self.sensor_controller.setLogPath(True, log_dir)
         print(f"[Debug Log] setLogPath -> {log_dir}")
@@ -2217,7 +2647,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._clear_ui_data()
 
     def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
-        """切换显示设备时，刷新设备信息、丢包统计、开关状态与图表。"""
+        """切换显示设备时，刷新设备信息、丢包统计、手势、开关状态与图表。"""
         self._last_plotted_sample_indices.clear()
         self._last_drawn_quaternion = None
 
@@ -2251,6 +2681,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.lost_packet_label.setText("Packet Loss Stats: " + text)
         else:
             self.lost_packet_label.setText("Packet Loss Stats: None")
+
+        self.gesture_label.setText(self._gesture_text(state.gesture if state is not None else None))
 
         ntf_states = state.ntf_states if state is not None else {}
         filter_states = state.filter_states if state is not None else {}

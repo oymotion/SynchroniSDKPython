@@ -14,3 +14,4 @@ sensor/**/*.c
 examples/build/
 examples/dist/
 examples/*.spec
+examples/__pycache__/*.pyc
