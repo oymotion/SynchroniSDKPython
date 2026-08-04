@@ -5,7 +5,6 @@ import subprocess
 import multiprocessing
 import os
 import threading
-import queue
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
@@ -19,7 +18,6 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 
 from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtCore import QRunnable, QThreadPool
 
 from sensor import *
 
@@ -111,19 +109,6 @@ BIO_PLOT_CONFIG = [
 
 EEG_AXIS_COUNT = 8                     # EEG/EMG 模式右侧子图数
 PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
-
-
-class DataTask(QRunnable):
-    def __init__(self, callback, data):
-        super().__init__()
-        self._cb = callback
-        self._data = data
-
-    def run(self):
-        try:
-            self._cb(self._data)
-        except Exception as e:
-            print(f"[DataTask] Exception: {e}")
 
 
 class DeviceDataState:
@@ -666,10 +651,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.current_sensor: SensorProfile = None   # 当前在列表中选中、正在显示的设备
         self.device_states: dict = {}               # Address -> DeviceDataState（已连接设备）
         self.sensor_controller = SensorController()
-        self.thread_pool = QThreadPool.globalInstance()
-        self._data_type_pools = {}                  # (Address, DataType) -> QThreadPool
-        # SDK 数据回调线程只往这个队列里放数据即返回；GUI 定时器负责分发（解耦显示与回调）
-        self._incoming_data_q = queue.SimpleQueue()
 
         self.active_data_type = DataType.NTF_ACC
         self._last_plotted_sample_indices = {}
@@ -907,6 +888,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
             "NTF_EMG":  QtWidgets.QCheckBox("EMG"),
             "NTF_GEST": QtWidgets.QCheckBox("GESTURE"),
+            "NTF_PPG":  QtWidgets.QCheckBox("PPG"),
+            "NTF_SPO2": QtWidgets.QCheckBox("SpO2"),
             "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
         }
         for key, cb in self._ntf_checkboxes.items():
@@ -1467,70 +1450,49 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     # ── Data Routing ──────────────────────────────────────────────────────────
 
-    def _on_data(self, sensor: SensorProfile, data: SensorData):
-        if not (data and data.channelSamples):
-            return
+    def _on_data(self, sensor: SensorProfile, data_list: list):
+        """SDK 数据回调（回调线程）：一批 SensorData 列表一次性交付，直接循环处理。
+
+        缓冲区写入有各缓冲区锁保护，Qt 界面更新经信号/状态锁，无需再经
+        队列 + 定时器 + 线程池中转。
+        """
         addr = sensor.BLEDevice.Address
         state = self.device_states.get(addr)
         if state is None:
             return
-        # 实际采样率收集：覆盖所有收到的数据类型
-        state.note_data_received(data)
-        # 数据分发（缓冲区 append、四元数显示等）由 GUI 定时器侧的 _drain_incoming_data 完成，
-        # 回调线程只入队即返回，不做任何 Qt/绘图操作
-        self._incoming_data_q.put((addr, data))
-
-    def _drain_incoming_data(self):
-        """GUI 定时器侧的数据分发入口：消费 SDK 回调线程入队的数据批，
-        依次做缓冲区 append（经 _dispatch_data 的线程池）、四元数 3D 视图与手势显示。"""
-        while True:
-            try:
-                addr, data = self._incoming_data_q.get_nowait()
-            except queue.Empty:
-                break
-            state = self.device_states.get(addr)
-            if state is None:
+        for data in data_list:
+            if not (data and data.channelSamples):
                 continue
+            # 实际采样率收集：覆盖所有收到的数据类型
+            state.note_data_received(data)
             if data.dataType == DataType.NTF_IMU:
                 # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
                 for sub in split_imu_aggregate(data):
                     if sub.dataType in state.buffers:
-                        self._dispatch_data(addr, sub)
+                        self._append_sensor_data(addr, sub)
                     if sub.dataType == DataType.NTF_QUATERNION:
                         self._update_quaternion(state, sub)
                 continue
             if (data.dataType in state.buffers
                     or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
                     or (state.bio_buffers and data.dataType in state.bio_buffers)):
-                self._dispatch_data(addr, data)
+                self._append_sensor_data(addr, data)
             if data.dataType == DataType.NTF_QUATERNION:
                 self._update_quaternion(state, data)
             if data.dataType == DataType.NTF_GEST:
                 self._handle_gesture_data(addr, data)
 
-    def _get_data_type_pool(self, key):
-        pool = self._data_type_pools.get(key)
-        if pool is None:
-            pool = QThreadPool()
-            pool.setMaxThreadCount(1)
-            self._data_type_pools[key] = pool
-        return pool
-
-    def _dispatch_data(self, addr: str, data: SensorData):
+    def _append_sensor_data(self, addr: str, data: SensorData):
+        """丢包统计上报 + 写环形缓冲区（append_data 内部有各缓冲区锁）。"""
         state = self.device_states.get(addr)
         if state is None:
             return
         if data.lostPackageCount > 0:
             type_name = DataType(data.dataType).name if data.dataType is not None else "Unknown"
             self.lost_packet_signal.emit(addr, type_name, data.lostPackageCount)
-
-        task = DataTask(state.append_data, data)
-        pool = self._get_data_type_pool((addr, data.dataType))
-        pool.start(task)
+        state.append_data(data)
 
     def closeEvent(self, event):
-        for pool in self._data_type_pools.values():
-            pool.waitForDone()
         try:
             self.sensor_controller.terminate()
         except Exception as e:
@@ -2040,9 +2002,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     # ── Periodic Refresh ──────────────────────────────────────────────────────
 
     def _update_plots(self):
-        # 先消费 SDK 回调线程入队的数据：即使窗口最小化也继续分发到缓冲区
-        self._drain_incoming_data()
-
         if self.windowState() & QtCore.Qt.WindowMinimized:
             return
 
@@ -2612,11 +2571,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._apply_control_states(ntf_states, filter_states)
 
     def _apply_control_states(self, ntf_states: dict, filter_states: dict):
-        """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）。"""
+        """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）；设备不支持的 NTF 选项直接隐藏。"""
         self._updating_ntf_controls = True
         try:
             for key, cb in self._ntf_checkboxes.items():
                 enabled, checked = ntf_states.get(key, (False, False))
+                # 无状态信息（未选设备/查询失败）时保持全部可见，仅置灰
+                cb.setVisible(enabled or not ntf_states)
                 cb.setEnabled(enabled)
                 cb.setChecked(checked)
         finally:

@@ -1,10 +1,10 @@
 # sensor-sdk
 
-Synchroni sdk for Python
+OYMotion sdk for Python
 
 ## Brief
 
-Synchroni SDK is the software development kit for developers to access Synchroni products.
+OYMotion SDK is the software development kit for developers to access OYMotion products.
 
 ## Contributing
 
@@ -167,18 +167,23 @@ Please MAKE SURE to call terminate when exit main() or press Ctrl+C
 Please register callbacks for SensorProfile
 
 ```python
+from typing import List
+from sensor import SensorProfile, SensorData, DeviceStateEx
+
 sensorProfile = SensorControllerInstance.requireSensor(bleDevice)
 
 # register callbacks
-def on_state_changed(sensor, newState):
+def on_state_changed(sensor: SensorProfile, newState: DeviceStateEx):
+    # device state transitions (Connecting/Connected/Ready/Disconnected/...)
+    # called synchronously on the SDK state machine; return quickly
     # please do logic when device disconnected unexpected
     pass
 
-def on_error_callback(sensor, reason):
-    # called when error occurs
+def on_error_callback(sensor: SensorProfile, reason: str):
+    # called when error occurs (dongle unplugged, reconnect budget exhausted, ...)
     pass
 
-def on_power_changed(sensor, power):
+def on_power_changed(sensor: SensorProfile, power: int):
     # callback for get battery level of device, power from 0 - 100
     # (invalid -1 readings are never reported here; getBatteryLevel() may
     # still return -1 when no valid reading is available yet)
@@ -187,15 +192,27 @@ def on_power_changed(sensor, power):
     # so ±1 jitter is filtered while real drain/charge trends are still tracked
     pass
 
-def on_data_callback(sensor, data):
-    # called after start data transfer
-    pass
+def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
+    # called after start data transfer; each invocation delivers the whole
+    # batch of SensorData objects parsed together (loop over it to process
+    # each one)
+    for data in data_list:
+        pass
 
 sensorProfile.onStateChanged = on_state_changed
 sensorProfile.onErrorCallback = on_error_callback
 sensorProfile.onPowerChanged = on_power_changed
 sensorProfile.onDataCallback = on_data_callback
 ```
+
+Callback threading model:
+
+- `onDataCallback` runs on a dedicated single-worker thread pool per profile, so batches are delivered strictly in arrival order.
+- `onPowerChanged` and `onErrorCallback` share a multi-worker thread pool.
+- `onStateChanged` is invoked synchronously.
+- Keep callbacks short or thread-safe; update UI through your framework's main-thread mechanism (e.g. Qt signals).
+
+A fifth callback, `onAutoReconnect`, customizes stream recovery after an abnormal disconnect — see section 15.1.
 
 ### 12. Connect device
 
@@ -295,7 +312,7 @@ Please call after device in 'Ready' state, return True if init succeed.
 success = sensorProfile.init(5, 60*1000)
 ```
 
-packageSampleCount:   set sample counts of SensorData.channelSamples in onDataCallback()
+packageSampleCount:   set sample counts of SensorData.channelSamples per batch in onDataCallback()
 powerRefreshInterval: callback period for onPowerChanged()
 
 ### 18. Check if init data transfer succeed
@@ -341,25 +358,26 @@ class DataType(Enum):
     NTF_PPG = 0x18           # PPG raw samples
 ```
 
-Process data in onDataCallback.
+Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch.
 
 ```python
-def on_data_callback(sensor, data):
-    if data.dataType == DataType.NTF_EEG:
-        pass
-    elif data.dataType == DataType.NTF_ECG:
-        pass
+def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
+    for data in data_list:
+        if data.dataType == DataType.NTF_EEG:
+            pass
+        elif data.dataType == DataType.NTF_ECG:
+            pass
 
-    # process data as you wish
-    for oneChannelSamples in data.channelSamples:
-        for sample in oneChannelSamples:
-            if sample.isLost:
-                # do some logic
-                pass
-            else:
-                # draw with sample.data & sample.channelIndex
-                # print(f"{sample.channelIndex} | {sample.sampleIndex} | {sample.data} | {sample.impedance}")
-                pass
+        # process data as you wish
+        for oneChannelSamples in data.channelSamples:
+            for sample in oneChannelSamples:
+                if sample.isLost:
+                    # do some logic
+                    pass
+                else:
+                    # draw with sample.data & sample.channelIndex
+                    # print(f"{sample.channelIndex} | {sample.sampleIndex} | {sample.data} | {sample.impedance}")
+                    pass
 
 sensorProfile.onDataCallback = on_data_callback
 ```
