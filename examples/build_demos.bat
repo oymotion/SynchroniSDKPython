@@ -66,13 +66,7 @@ echo Build demos with PyInstaller...
 echo ==========================================
 set "COMMON_OPTS=--clean --noconfirm --onefile"
 
-"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --additional-hooks-dir "%~dp0..\sensor\pyinstaller_hooks" --name DemoNewEMG SynchroniSDKPython_DemoNewEMG.py
-if errorlevel 1 goto :error
-
-"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --additional-hooks-dir "%~dp0..\sensor\pyinstaller_hooks" --name DemoNewEEG SynchroniSDKPython_DemoNewEEG.py
-if errorlevel 1 goto :error
-
-"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --additional-hooks-dir "%~dp0..\sensor\pyinstaller_hooks" --name DemoNewPPG SynchroniSDKPython_DemoNewPPG.py
+"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoMulti SynchroniSDKPython_DemoNewMulti.py
 if errorlevel 1 goto :error
 
 echo.

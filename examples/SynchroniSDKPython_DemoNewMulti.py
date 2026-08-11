@@ -78,13 +78,14 @@ def split_imu_aggregate(data: SensorData) -> List[SensorData]:
         if n_ch < end:
             continue
         sub = SensorData()
-        sub.deviceMac = data.deviceMac
-        sub.dataType = dt
-        sub.sampleRate = data.sampleRate
-        sub.channelCount = end - start
-        sub.packageSampleCount = data.packageSampleCount
-        sub.channelSamples = data.channelSamples[start:end]
-        sub.lostPackageCount = data.lostPackageCount if not subs else 0
+        # 拆分视图是应用侧构造的 SensorData，公有接口无写入口，只能写内部字段
+        sub._deviceMac = data.getDeviceMac()
+        sub._dataType = dt
+        sub._sampleRate = data.getSampleRate()
+        sub._channelCount = end - start
+        sub._packageSampleCount = data.getSampleCount()
+        sub._channelSamples = data.channelSamples[start:end]
+        sub._lostPackageCount = data.getLostPackageCount() if not subs else 0
         subs.append(sub)
     return subs
 
@@ -191,13 +192,18 @@ class DeviceDataState:
         self.actual_rates: dict = {}
         self.nominal_rates: dict = {}
         self.nominal_channels: dict = {}
+        # 本次起流的首包 delay（毫秒，数据批自带 getDelay()，0=未上报）
+        self.stream_delay_ms = 0
 
     def note_data_received(self, data: SensorData):
         """统计每种数据类型实际收到的样本数（不含丢包占位样本），
         并记录数据批携带的标称采样率/通道数。"""
         if not data.channelSamples:
             return
-        if data.dataType == DataType.NTF_IMU:
+        delay = data.getDelay()
+        if delay:
+            self.stream_delay_ms = delay
+        if data.getDataType() == DataType.NTF_IMU:
             # 聚合批：按拆分后的子类型分别计数，状态栏实测速率与四路独立流一致
             for sub in split_imu_aggregate(data):
                 self.note_data_received(sub)
@@ -205,12 +211,12 @@ class DeviceDataState:
         n = sum(1 for s in data.channelSamples[0] if not getattr(s, "isLost", False))
         with self.rate_lock:
             if n > 0:
-                self.rate_counts[data.dataType] = self.rate_counts.get(data.dataType, 0) + n
-            if data.sampleRate and data.sampleRate > 0:
-                self.nominal_rates[data.dataType] = data.sampleRate
+                self.rate_counts[data.getDataType()] = self.rate_counts.get(data.getDataType(), 0) + n
+            if data.getSampleRate() and data.getSampleRate() > 0:
+                self.nominal_rates[data.getDataType()] = data.getSampleRate()
             ch = len(data.channelSamples)
             if ch > 0:
-                self.nominal_channels[data.dataType] = ch
+                self.nominal_channels[data.getDataType()] = ch
 
     def update_actual_rates(self):
         """每秒由 UI 定时器调用：结算上一窗口的实测速率并重置计数。"""
@@ -252,6 +258,8 @@ class DeviceDataState:
             nominal = nominal_rates.get(dt) or sr
             nominal_txt = f"{nominal:g}" if nominal else "--"
             entries.append(f"{label} {actual:.1f} / {nominal_txt}Hz")
+        if self.stream_delay_ms:
+            entries.append(f"delay {self.stream_delay_ms}ms")
         return "Actual: " + " | ".join(entries) if entries else ""
 
     def get_buffer_lock(self, data_type):
@@ -343,11 +351,11 @@ class DeviceDataState:
     def append_data(self, data: SensorData):
         # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
         # 不再写入 1s 的 eeg 缓冲
-        if self.bio_buffers and data.dataType in self.bio_buffers:
+        if self.bio_buffers and data.getDataType() in self.bio_buffers:
             self.bio_buffer_lock.lock()
             try:
-                buf = self.bio_buffers.get(data.dataType)
-                idx_buf = self.bio_sample_index_buffers.get(data.dataType)
+                buf = self.bio_buffers.get(data.getDataType())
+                idx_buf = self.bio_sample_index_buffers.get(data.getDataType())
                 if buf is None or idx_buf is None or not data.channelSamples:
                     return
                 buffer_size = buf.shape[1]
@@ -356,7 +364,7 @@ class DeviceDataState:
                     return
                 if n > buffer_size:
                     n = buffer_size
-                buf_idx = self.bio_buffer_indices.get(data.dataType, 0)
+                buf_idx = self.bio_buffer_indices.get(data.getDataType(), 0)
                 write_start = buf_idx
                 write_end = buf_idx + n
 
@@ -382,17 +390,17 @@ class DeviceDataState:
                         idx_buf[ch_idx, write_start:] = new_indices[:first_part]
                         idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
 
-                    if data.dataType == DataType.NTF_EEG:
-                        while len(self.bio_impedance[data.dataType]) <= ch_idx:
-                            self.bio_impedance[data.dataType].append(0)
-                        self.bio_impedance[data.dataType][ch_idx] = ch_samples[-1].impedance
+                    if data.getDataType() == DataType.NTF_EEG:
+                        while len(self.bio_impedance[data.getDataType()]) <= ch_idx:
+                            self.bio_impedance[data.getDataType()].append(0)
+                        self.bio_impedance[data.getDataType()][ch_idx] = ch_samples[-1].impedance
 
-                self.bio_buffer_indices[data.dataType] = (buf_idx + n) % buffer_size
+                self.bio_buffer_indices[data.getDataType()] = (buf_idx + n) % buffer_size
             finally:
                 self.bio_buffer_lock.unlock()
             return
 
-        if data.dataType == DataType.NTF_EMG:
+        if data.getDataType() == DataType.NTF_EMG:
             self.emg_buffer_lock.lock()
             try:
                 buf = self.emg_buffer
@@ -431,7 +439,7 @@ class DeviceDataState:
                 self.emg_buffer_lock.unlock()
             return
 
-        if data.dataType == DataType.NTF_EEG:
+        if data.getDataType() == DataType.NTF_EEG:
             self.eeg_buffer_lock.lock()
             try:
                 buf = self.eeg_buffer
@@ -470,7 +478,7 @@ class DeviceDataState:
                 self.eeg_buffer_lock.unlock()
             return
 
-        if data.dataType == DataType.NTF_ECG:
+        if data.getDataType() == DataType.NTF_ECG:
             self.ecg_buffer_lock.lock()
             try:
                 buf = self.ecg_buffer
@@ -509,7 +517,7 @@ class DeviceDataState:
                 self.ecg_buffer_lock.unlock()
             return
 
-        if data.dataType == DataType.NTF_BRTH:
+        if data.getDataType() == DataType.NTF_BRTH:
             self.brth_buffer_lock.lock()
             try:
                 buf = self.brth_buffer
@@ -548,16 +556,16 @@ class DeviceDataState:
                 self.brth_buffer_lock.unlock()
             return
 
-        lock = self.get_buffer_lock(data.dataType)
+        lock = self.get_buffer_lock(data.getDataType())
         lock.lock()
         try:
-            buf = self.buffers.get(data.dataType)
-            idx_buf = self.sample_index_buffers.get(data.dataType)
+            buf = self.buffers.get(data.getDataType())
+            idx_buf = self.sample_index_buffers.get(data.getDataType())
             if buf is None or idx_buf is None:
                 return
             buf_len = buf.shape[1]
             n = 0
-            buffer_index = self.buffer_indices.get(data.dataType, 0)
+            buffer_index = self.buffer_indices.get(data.getDataType(), 0)
             for ch_idx, ch_samples in enumerate(data.channelSamples):
                 if ch_idx >= buf.shape[0]:
                     break
@@ -579,7 +587,7 @@ class DeviceDataState:
                     buf[ch_idx, :n - first_part] = new_vals[first_part:]
                     idx_buf[ch_idx, write_start:] = new_indices[:first_part]
                     idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-            self.buffer_indices[data.dataType] = (buffer_index + n) % buf_len
+            self.buffer_indices[data.getDataType()] = (buffer_index + n) % buf_len
         finally:
             lock.unlock()
 
@@ -763,6 +771,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         _bold_font.setBold(True)
         self.btn_check_dongle.setFont(_bold_font)
 
+        self.btn_multi_start = QtWidgets.QPushButton("Multi Start")
+        self.btn_multi_start.clicked.connect(self._multi_start)
+        self.btn_multi_start.setEnabled(False)
+
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
 
@@ -805,6 +817,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         device_header_layout.addWidget(self.chk_auto_reconnect)
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
+        device_header_layout.addWidget(self.btn_multi_start)
         device_header_layout.addWidget(self.btn_check_dongle)
         device_layout.addLayout(device_header_layout)
         device_layout.addWidget(self.device_list)
@@ -997,6 +1010,36 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _multi_start(self):
+        # 停掉所有已连接设备的传输，再用 controller 的同步起流对齐启动：
+        # bumble(dongle)后端下各设备的起流写命令等待同一个门闩、几乎同时下发
+        sensors = [state.sensor for state in self.device_states.values()
+                   if state.sensor.deviceState == DeviceStateEx.Ready
+                   and state.sensor.hasInited]
+        if not sensors:
+            self.status_label.setText("No connected device to sync-start")
+            return
+        self.btn_multi_start.setEnabled(False)
+        try:
+            transferring = [s for s in sensors if s.isDataTransfering]
+            if transferring:
+                stop_results = self.sensor_controller.multiStopDataNotification(transferring)
+                stop_failed = [mac for mac, ok in stop_results.items() if not ok]
+                if stop_failed:
+                    self.status_label.setText(
+                        f"Multi stop failed on: {', '.join(stop_failed)}")
+                    return
+            results = self.sensor_controller.multiStartDataNotification(sensors)
+            failed = [mac for mac, ok in results.items() if not ok]
+            if failed:
+                self.status_label.setText(
+                    f"Multi start failed on: {', '.join(failed)}")
+            else:
+                self.status_label.setText(
+                    f"Multi start: {len(results)} device(s) started")
+        finally:
+            self._update_button_states()
+
     def _on_auto_reconnect_toggled(self, checked: bool):
         # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
         for state in self.device_states.values():
@@ -1105,6 +1148,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         connected = addr is not None and addr in self.device_states
         self.btn_connect.setEnabled(addr is not None and not connected)
         self.btn_disconnect.setEnabled(connected)
+        self.btn_multi_start.setEnabled(len(self.device_states) >= 1)
 
     def _update_device_item_text(self, addr: str, connected: bool):
         for i in range(self.device_list.count()):
@@ -1465,21 +1509,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 continue
             # 实际采样率收集：覆盖所有收到的数据类型
             state.note_data_received(data)
-            if data.dataType == DataType.NTF_IMU:
+            if data.getDataType() == DataType.NTF_IMU:
                 # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
                 for sub in split_imu_aggregate(data):
-                    if sub.dataType in state.buffers:
+                    if sub.getDataType() in state.buffers:
                         self._append_sensor_data(addr, sub)
-                    if sub.dataType == DataType.NTF_QUATERNION:
+                    if sub.getDataType() == DataType.NTF_QUATERNION:
                         self._update_quaternion(state, sub)
                 continue
-            if (data.dataType in state.buffers
-                    or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
-                    or (state.bio_buffers and data.dataType in state.bio_buffers)):
+            if (data.getDataType() in state.buffers
+                    or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
+                    or (state.bio_buffers and data.getDataType() in state.bio_buffers)):
                 self._append_sensor_data(addr, data)
-            if data.dataType == DataType.NTF_QUATERNION:
+            if data.getDataType() == DataType.NTF_QUATERNION:
                 self._update_quaternion(state, data)
-            if data.dataType == DataType.NTF_GEST:
+            if data.getDataType() == DataType.NTF_GEST:
                 self._handle_gesture_data(addr, data)
 
     def _append_sensor_data(self, addr: str, data: SensorData):
@@ -1487,9 +1531,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         state = self.device_states.get(addr)
         if state is None:
             return
-        if data.lostPackageCount > 0:
-            type_name = DataType(data.dataType).name if data.dataType is not None else "Unknown"
-            self.lost_packet_signal.emit(addr, type_name, data.lostPackageCount)
+        if data.getLostPackageCount() > 0:
+            type_name = DataType(data.getDataType()).name if data.getDataType() is not None else "Unknown"
+            self.lost_packet_signal.emit(addr, type_name, data.getLostPackageCount())
         state.append_data(data)
 
     def closeEvent(self, event):
@@ -1985,7 +2029,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _update_quaternion(self, state: DeviceDataState, data: SensorData):
         try:
-            if data.dataType == DataType.NTF_QUATERNION:
+            if data.getDataType() == DataType.NTF_QUATERNION:
                 if len(data.channelSamples) == 4 and len(data.channelSamples[0]) > 0:
                     quaternion = [
                         data.channelSamples[0][0].data,

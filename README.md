@@ -335,6 +335,25 @@ Please call if hasInited return True
 success = sensorProfile.startDataNotification()
 ```
 
+#### 19.2 Synchronized start on multiple devices
+
+Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting.
+
+On the bumble (USB dongle) backend, the start-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription` command write on RFSTAR devices) wait on a shared `SyncWriteGate` at the bumble send layer and are released together, so all dongles emit the start command at virtually the same time. On the native bleak backend the starts are simply issued concurrently (no low-level alignment).
+
+```python
+results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2])
+# {"AA-BB-CC-DD-EE-01": True, "AA-BB-CC-DD-EE-02": False}
+```
+
+#### 19.3 Synchronized stop on multiple devices
+
+`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the bumble backend the stop-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription(0)` command write on RFSTAR devices) wait on the same kind of shared `SyncWriteGate` and go out at virtually the same time; on the native bleak backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
+
+```python
+results = SensorControllerInstance.multiStopDataNotification([sensor1, sensor2])
+```
+
 Data type list：
 
 ```python
@@ -358,14 +377,14 @@ class DataType(Enum):
     NTF_PPG = 0x18           # PPG raw samples
 ```
 
-Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch.
+Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface mirrors the C++ SDK (`include/SensorData.hpp`): metadata via `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getDelay()`, samples via the read-only `channelSamples` / `startSampleIndex` properties or the single-point accessors `getChannelSample(ci, si)` / `getData(ci, si)` / `getRawData(ci, si)` / ...; Sample fields (`data`, `sampleIndex`, `isLost`, ...) are read-only properties.
 
 ```python
 def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
     for data in data_list:
-        if data.dataType == DataType.NTF_EEG:
+        if data.getDataType() == DataType.NTF_EEG:
             pass
-        elif data.dataType == DataType.NTF_ECG:
+        elif data.getDataType() == DataType.NTF_ECG:
             pass
 
         # process data as you wish

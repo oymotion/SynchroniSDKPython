@@ -78,27 +78,29 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
         break
 
 
-def onDataCallback(sensor: SensorProfile, data: SensorData):
-    # if (
-    #     data.dataType == DataType.NTF_EEG
-    #     or data.dataType == DataType.NTF_ECG
-    #     or data.dataType == DataType.NTF_BRTH
-    #     or data.dataType == DataType.NTF_ACC
-    #     or data.dataType == DataType.NTF_GYRO
-    # ):
-    #     print(
-    #         "got data from sensor: "
-    #         + sensor.BLEDevice.Name
-    #         + " data type: "
-    #         + str(data.dataType)
-    #     )
-    #     print(str(data.channelSamples[0][0].sampleIndex))
+def onDataCallback(sensor: SensorProfile, data_list: list):
+    # for data in data_list:
+    #     if (
+    #         data.getDataType() == DataType.NTF_EEG
+    #         or data.getDataType() == DataType.NTF_ECG
+    #         or data.getDataType() == DataType.NTF_BRTH
+    #         or data.getDataType() == DataType.NTF_ACC
+    #         or data.getDataType() == DataType.NTF_GYRO
+    #     ):
+    #         print(
+    #             "got data from sensor: "
+    #             + sensor.BLEDevice.Name
+    #             + " data type: "
+    #             + str(data.getDataType())
+    #         )
+    #         print(str(data.channelSamples[0][0].sampleIndex))
 
     # if data.channelSamples[0][0].sampleIndex == 50:
     #     sensor.stopDataNotification()
-    if data.dataType == DataType.NTF_EEG:
-        for sample in data.channelSamples[0]:
-            print(sample.data)
+    for data in data_list:
+        if data.getDataType() == DataType.NTF_EEG:
+            for sample in data.channelSamples[0]:
+                print(sample.data)
     pass
 
 
@@ -153,8 +155,8 @@ def run_bin_replay(bin_path: str) -> int:
 
     received = {"count": 0}
 
-    def _on_data(sensor, data):
-        received["count"] += 1
+    def _on_data(sensor, data_list):
+        received["count"] += len(data_list)
 
     sensor.onDataCallback = _on_data
     sensor.onErrorCallback = onErrorCallback
