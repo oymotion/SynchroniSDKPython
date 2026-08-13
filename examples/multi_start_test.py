@@ -129,7 +129,18 @@ def main() -> int:
         time.sleep(1)
 
     print("multiStart ...")
-    results = controller.multiStartDataNotification(sensors)
+    # 同型号设备用默认对齐参数，混合型号不做首包时差校验、重试 5 次
+    model_names = set()
+    for sensor in sensors:
+        info = sensor.getDeviceInfo()
+        model_names.add(info.ModelName if info else None)
+    same_model = len(model_names) == 1 and None not in model_names
+    print(f"device models: {sorted(m for m in model_names if m)}, same_model={same_model}")
+    if same_model:
+        results = controller.multiStartDataNotification(sensors)
+    else:
+        results = controller.multiStartDataNotification(
+            sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
     print("multiStart results:", results)
 
     t0 = time.time()

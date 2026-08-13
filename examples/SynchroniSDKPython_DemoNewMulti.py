@@ -111,6 +111,8 @@ BIO_PLOT_CONFIG = [
 EEG_AXIS_COUNT = 8                     # EEG/EMG 模式右侧子图数
 PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
 
+SAMPLE_RATE_CANDIDATES = (250, 500)
+
 
 class DeviceDataState:
     """单个已连接设备的数据缓冲与显示状态。多设备连接时每个设备各持有一份。"""
@@ -123,6 +125,7 @@ class DeviceDataState:
         self.lost_counts: dict = {}
         self.ntf_states: dict = {}     # key -> (enabled, checked)
         self.filter_states: dict = {}  # key -> (enabled, checked)
+        self.sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率)
         self.gesture = None            # (gesture, raw_gesture, possiblity, strength)
 
         self.buffers: dict = {}
@@ -642,6 +645,7 @@ class DeviceDataState:
 
 class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     power_changed_sig = QtCore.pyqtSignal(object, int)         # (sensor, power)
+    device_info_sig = QtCore.pyqtSignal(object)                # (sensor)
     add_device_sig = QtCore.pyqtSignal(str)
     update_device_sig = QtCore.pyqtSignal(str, int)    # (address, rssi)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
@@ -678,10 +682,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._updating_ntf_controls = False
         self._updating_filter_controls = False
+        self._updating_sample_rate_controls = False
         self._debug_log_checkbox = None
         self._data_debug_log_checkbox = None
         self._ntf_checkboxes: dict = {}
         self._filter_checkboxes: dict = {}
+        self._sample_rate_radios: dict = {}
+        self._sample_rate_button_group = None
         self._debug_log_enabled = True
         self._data_debug_log_enabled = True
         # 每设备上次会话的日志/bin 导出路径：重连时优先续用上一条，而不是另起新文件
@@ -708,6 +715,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.add_device_sig.connect(self._add_device_item)
         self.update_device_sig.connect(self._update_device_rssi)
         self.power_changed_sig.connect(self._update_power_display)
+        self.device_info_sig.connect(self._update_link_info_display)
         self.lost_packet_signal.connect(self._update_lost_packet_display)
         self.gesture_signal.connect(self._update_gesture_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
@@ -875,10 +883,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.model_label = QtWidgets.QLabel("Model: --")
         self.hw_version_label = QtWidgets.QLabel("HW Version: --")
         self.fw_version_label = QtWidgets.QLabel("FW Version: --")
+        self.link_label = QtWidgets.QLabel("Link: --")
+        self.mtu_label = QtWidgets.QLabel("MTU: --")
         self.power_label = QtWidgets.QLabel("Power: --%")
         device_info_layout.addWidget(self.model_label)
         device_info_layout.addWidget(self.hw_version_label)
         device_info_layout.addWidget(self.fw_version_label)
+        device_info_layout.addWidget(self.link_label)
+        device_info_layout.addWidget(self.mtu_label)
         device_info_layout.addWidget(self.power_label)
         device_info_layout.addStretch()
         controls_layout.addLayout(device_info_layout)
@@ -927,10 +939,24 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             filter_layout.addWidget(cb)
         filter_group.setLayout(filter_layout)
 
+        sample_rate_group = QtWidgets.QGroupBox("EEG Sample Rate")
+        sample_rate_layout = QtWidgets.QHBoxLayout()
+        self._sample_rate_button_group = QtWidgets.QButtonGroup(self)
+        for rate in SAMPLE_RATE_CANDIDATES:
+            rb = QtWidgets.QRadioButton(f"{rate} Hz")
+            rb.setAutoExclusive(False)
+            rb.setEnabled(False)
+            rb.toggled.connect(lambda checked, r=rate: self._on_sample_rate_toggled(r, checked))
+            self._sample_rate_radios[rate] = rb
+            self._sample_rate_button_group.addButton(rb)
+            sample_rate_layout.addWidget(rb)
+        sample_rate_group.setLayout(sample_rate_layout)
+
         options_layout = QtWidgets.QHBoxLayout()
         options_layout.addWidget(debug_log_group, stretch=1)
         options_layout.addWidget(ntf_group, stretch=1)
         options_layout.addWidget(filter_group, stretch=1)
+        options_layout.addWidget(sample_rate_group, stretch=1)
         controls_layout.addLayout(options_layout)
 
         controls_layout.addStretch()
@@ -1029,7 +1055,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     self.status_label.setText(
                         f"Multi stop failed on: {', '.join(stop_failed)}")
                     return
-            results = self.sensor_controller.multiStartDataNotification(sensors)
+            results = self._start_with_model_params(sensors)
             failed = [mac for mac, ok in results.items() if not ok]
             if failed:
                 self.status_label.setText(
@@ -1039,6 +1065,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     f"Multi start: {len(results)} device(s) started")
         finally:
             self._update_button_states()
+
+    def _start_with_model_params(self, sensors):
+        # 同型号设备用默认对齐参数，混合型号不做首包时差校验、重试 5 次
+        model_names = set()
+        for s in sensors:
+            info = s.getDeviceInfo()
+            model_names.add(info.ModelName if info else None)
+        if len(model_names) == 1 and None not in model_names:
+            return self.sensor_controller.multiStartDataNotification(sensors)
+        return self.sensor_controller.multiStartDataNotification(
+            sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
 
     def _on_auto_reconnect_toggled(self, checked: bool):
         # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
@@ -1182,6 +1219,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.onStateChanged  = self._on_state_changed
         sensor.onErrorCallback = self._on_error
         sensor.onPowerChanged  = self._on_power_changed
+        sensor.onDeviceInfoUpdate = self._on_device_info_update
         # 自动重连找回设备时：等效于按下 Connect 按钮（走本方法完整流程）
         sensor.onAutoReconnect = self._on_auto_reconnect
         sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
@@ -2496,6 +2534,42 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
         self.power_changed_sig.emit(sensor, power)
 
+    def _on_device_info_update(self, sensor: SensorProfile, info: DeviceInfo):
+        print(f"[Link] {sensor.BLEDevice.Name}: "
+              f"interval={info.ConnectionIntervalMs}ms latency={info.PeripheralLatency} "
+              f"timeout={info.SupervisionTimeoutMs}ms mtu={info.MTUSize}")
+        self.device_info_sig.emit(sensor)
+
+    @staticmethod
+    def _link_text(info: Optional[DeviceInfo]) -> str:
+        if info is None or info.PeripheralLatency < 0 or info.ConnectionIntervalMs <= 0:
+            return "Link: --"
+        return (f"Link: {info.ConnectionIntervalMs}ms / "
+                f"latency {info.PeripheralLatency} / "
+                f"timeout {info.SupervisionTimeoutMs}ms")
+
+    @staticmethod
+    def _mtu_text(info: Optional[DeviceInfo]) -> str:
+        if info is None or info.MTUSize <= 0:
+            return "MTU: --"
+        return f"MTU: {info.MTUSize}"
+
+    def _update_link_info_display(self, sensor: SensorProfile):
+        info = sensor.getDeviceInfo()
+        state = self.device_states.get(sensor.BLEDevice.Address)
+        if state is not None and info is not None and state.status_parts:
+            rate_map = {DataType.NTF_EEG: info.EegSampleRate, DataType.NTF_ECG: info.EcgSampleRate}
+            state.status_parts = [
+                (label, ch, rate_map.get(dt) or sr, dt)
+                for label, ch, sr, dt in state.status_parts
+            ]
+        if self.current_sensor == sensor:
+            self.link_label.setText(self._link_text(info))
+            self.mtu_label.setText(self._mtu_text(info))
+            if state is not None and state.status_parts:
+                self.status_label.setText(state.build_status_text())
+                self.rate_label.setText(state.build_rate_text())
+
     def _update_power_display(self, sensor: SensorProfile, power: int):
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None:
@@ -2606,15 +2680,36 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             for key in self._filter_checkboxes:
                 filter_states[key] = (False, False)
 
+        sample_rate_options = []
+        options_result = sensor.getParam("EEG_SAMPLE_RATE_LIST")
+        print(f"[Refresh] getParam(EEG_SAMPLE_RATE_LIST) -> {options_result}")
+        if not str(options_result).startswith("Error"):
+            for item in str(options_result).split("|"):
+                try:
+                    sample_rate_options.append(int(item))
+                except ValueError:
+                    pass
+
+        current_sample_rate = 0
+        rate_result = sensor.getParam("EEG_SAMPLE_RATE")
+        print(f"[Refresh] getParam(EEG_SAMPLE_RATE) -> {rate_result}")
+        if not str(rate_result).startswith("Error"):
+            try:
+                current_sample_rate = int(rate_result)
+            except ValueError:
+                pass
+        sample_rate_state = (sample_rate_options, current_sample_rate)
+
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None:
             state.ntf_states = ntf_states
             state.filter_states = filter_states
+            state.sample_rate_state = sample_rate_state
 
         if self.current_sensor == sensor:
-            self._apply_control_states(ntf_states, filter_states)
+            self._apply_control_states(ntf_states, filter_states, sample_rate_state)
 
-    def _apply_control_states(self, ntf_states: dict, filter_states: dict):
+    def _apply_control_states(self, ntf_states: dict, filter_states: dict, sample_rate_state: tuple = ([], 0)):
         """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）；设备不支持的 NTF 选项直接隐藏。"""
         self._updating_ntf_controls = True
         try:
@@ -2634,6 +2729,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 cb.setChecked(checked)
         finally:
             self._updating_filter_controls = False
+        options, current_rate = sample_rate_state
+        self._updating_sample_rate_controls = True
+        try:
+            if current_rate not in self._sample_rate_radios:
+                self._sample_rate_button_group.setExclusive(False)
+            for rate, rb in self._sample_rate_radios.items():
+                rb.setEnabled(rate in options)
+                rb.setChecked(rate == current_rate)
+            self._sample_rate_button_group.setExclusive(True)
+        finally:
+            self._updating_sample_rate_controls = False
 
     def _on_filter_toggled(self, key: str):
         if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
@@ -2651,6 +2757,22 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
+    def _on_sample_rate_toggled(self, rate: int, checked: bool):
+        if not checked:
+            return
+        if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
+            return
+        if self._updating_sample_rate_controls:
+            return
+        value = str(rate)
+        print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) ...")
+        result = self.current_sensor.setParam("EEG_SAMPLE_RATE", value)
+        print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
+        self._check_set_param_result("EEG_SAMPLE_RATE", result)
+        self._refresh_control_states(self.current_sensor)
+        if not str(result).startswith("Error"):
+            self._clear_ui_data()
+
     def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
         """切换显示设备时，刷新设备信息、丢包统计、手势、开关状态与图表。"""
         self._last_plotted_sample_indices.clear()
@@ -2661,10 +2783,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.model_label.setText(f"Model: {info.ModelName}")
             self.hw_version_label.setText(f"HW Version: {info.HardwareVersion}")
             self.fw_version_label.setText(f"FW Version: {info.FirmwareVersion}")
+            self.link_label.setText(self._link_text(info))
+            self.mtu_label.setText(self._mtu_text(info))
         else:
             self.model_label.setText("Model: --")
             self.hw_version_label.setText("HW Version: --")
             self.fw_version_label.setText("FW Version: --")
+            self.link_label.setText("Link: --")
+            self.mtu_label.setText("MTU: --")
 
         if state is not None and state.last_power is not None:
             self.power_label.setText(f"Power: {state.last_power}%")
@@ -2691,7 +2817,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         ntf_states = state.ntf_states if state is not None else {}
         filter_states = state.filter_states if state is not None else {}
-        self._apply_control_states(ntf_states, filter_states)
+        sample_rate_state = state.sample_rate_state if state is not None else ([], 0)
+        self._apply_control_states(ntf_states, filter_states, sample_rate_state)
 
         self._rebuild_2d_plot()
         self._rebuild_eeg_plot()

@@ -299,6 +299,8 @@ Please call after device in 'Ready' state and `init()` has succeeded, returns No
 #   DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
 #   plus a ChannelCount / SampleRate attribute pair for each modality:
 #   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
+#   plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate: the maximum
+#   sample rate reported by the device capability query (0 = not reported).
 # e.g. deviceInfo.EmgChannelCount, deviceInfo.EegSampleRate
 ```
 
@@ -337,18 +339,23 @@ success = sensorProfile.startDataNotification()
 
 #### 19.2 Synchronized start on multiple devices
 
-Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting.
+Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 30.0, maxDelayDispersionMs: int = 5, maxAttempts: int = 3) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting.
 
-Only useful on the bumble (USB dongle) backend.
+On the bumble (USB dongle) backend, the start-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription` command write on RFSTAR devices) wait on a shared `SyncWriteGate` at the bumble send layer and are released together, so all dongles emit the start command at virtually the same time. On the native bleak backend the starts are simply issued concurrently (no low-level alignment).
+
+After each start round the SDK validates the dispersion (max − min) of the devices' first-packet delays; if it exceeds `maxDelayDispersionMs` (default 5 ms; pass `-1` to skip the dispersion check entirely — devices only need to start and produce a first packet), any device produces no first packet within 2 s, or any start fails, all devices are stopped and the round retries (up to `maxAttempts`, default 3). If still not within tolerance, the streams are stopped and the call reports failure.
 
 ```python
 results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2])
 # {"AA-BB-CC-DD-EE-01": True, "AA-BB-CC-DD-EE-02": False}
+
+# relax the first-packet delay dispersion tolerance to 10 ms:
+results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2], maxDelayDispersionMs=10)
 ```
 
 #### 19.3 Synchronized stop on multiple devices
 
-`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the bumble backend the stop-streaming writes of all devices. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
+`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the bumble backend the stop-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription(0)` command write on RFSTAR devices) wait on the same kind of shared `SyncWriteGate` and go out at virtually the same time; on the native bleak backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
 
 ```python
 results = SensorControllerInstance.multiStopDataNotification([sensor1, sensor2])
@@ -472,6 +479,14 @@ result = sensorProfile.setParam("NTF_GFORCE_GYRO", "ON")
 result = sensorProfile.setParam("FILTER_50HZ", "ON")
 # set 50Hz notch filter to ON or OFF, result is "OK" if succeed
 
+# EEG/ECG sample rate (bound together on devices that have both)
+result = sensorProfile.setParam("EEG_SAMPLE_RATE", "500")
+# The value is validated against the device-reported capability list (see
+# getParam("EEG_SAMPLE_RATE_LIST")); an unsupported value returns
+# "Error: unsupported sample rate ...". When the device has both EEG and ECG,
+# both configs are written with the same rate. While streaming, the stream is
+# restarted so the new rate takes effect.
+
 result = sensorProfile.setParam("FILTER_60HZ", "ON")
 # set 60Hz notch filter to ON or OFF, result is "OK" if succeed
 
@@ -519,6 +534,14 @@ result = sensorProfile.getParam("FILTER")
 result = sensorProfile.getParam("NTF")
 # Returns a pipe-separated string of all notification states, e.g.:
 # "NTF_BRTH|ON|NTF_ECG|ON|NTF_EEG|ON|NTF_EMG|ON|..."
+
+result = sensorProfile.getParam("EEG_SAMPLE_RATE")
+# Returns the current EEG/ECG sample rate in Hz, e.g. "250"
+
+result = sensorProfile.getParam("EEG_SAMPLE_RATE_LIST")
+# Returns the device-reported selectable sample rates (EEG/ECG bound, pipe-
+# separated), e.g. "250|500"; "Error: Not supported" when the device did not
+# report a capability
 ```
 
 If the key is not supported, the result starts with `"Error"`.
