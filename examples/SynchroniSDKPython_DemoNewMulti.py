@@ -351,6 +351,88 @@ class DeviceDataState:
         extra_axes = int(self.has_ecg) + int(self.has_brth)
         self.eeg_channels_per_page = eeg_axis_count - extra_axes
 
+    def sync_bio_sample_rates(self, info: DeviceInfo) -> bool:
+        """采样率变更（setParam("EEG_SAMPLE_RATE") 生效后由 device_info_update 推送）
+        时按新速率重建生物电环形缓冲：缓冲长度 = 采样率 × 窗口秒数，不重建的话
+        横轴时间窗与实际数据速率不一致，波形会被拉伸/压缩（如 10Hz 信号在
+        250→500 后显示成 5Hz）。返回是否有缓冲被重建（调用方需重建图表横轴）。"""
+        changed = False
+        if (info.EegSampleRate > 0 and self.eeg_buffer is not None
+                and self.eeg_sample_rate != info.EegSampleRate):
+            ch = self.eeg_buffer.shape[0]
+            buf_len = max(info.EegSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.eeg_buffer_lock.lock()
+            try:
+                self.eeg_sample_rate = info.EegSampleRate
+                self.eeg_buffer = np.zeros((ch, buf_len))
+                self.eeg_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.eeg_buffer_index = 0
+            finally:
+                self.eeg_buffer_lock.unlock()
+            changed = True
+
+        if (info.EcgSampleRate > 0 and self.has_ecg and self.ecg_buffer is not None
+                and self.ecg_sample_rate != info.EcgSampleRate):
+            ch = self.ecg_buffer.shape[0]
+            buf_len = max(info.EcgSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.ecg_buffer_lock.lock()
+            try:
+                self.ecg_sample_rate = info.EcgSampleRate
+                self.ecg_buffer = np.zeros((ch, buf_len))
+                self.ecg_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.ecg_buffer_index = 0
+            finally:
+                self.ecg_buffer_lock.unlock()
+            changed = True
+
+        # PPG 模式下 EEG fp1/fp2 走 5s 的 bio_buffers
+        if (self.bio_kind == "ppg" and info.EegSampleRate > 0
+                and self.bio_sample_rates.get(DataType.NTF_EEG) not in (None, info.EegSampleRate)):
+            buf = self.bio_buffers.get(DataType.NTF_EEG)
+            if buf is not None:
+                ch = buf.shape[0]
+                buf_len = max(info.EegSampleRate * BUFFER_SECONDS, 1)
+                self.bio_buffer_lock.lock()
+                try:
+                    self.bio_buffers[DataType.NTF_EEG] = np.zeros((ch, buf_len))
+                    self.bio_sample_index_buffers[DataType.NTF_EEG] = np.zeros((ch, buf_len), dtype=np.int64)
+                    self.bio_buffer_indices[DataType.NTF_EEG] = 0
+                    self.bio_sample_rates[DataType.NTF_EEG] = info.EegSampleRate
+                finally:
+                    self.bio_buffer_lock.unlock()
+                changed = True
+        return changed
+
+    def sync_imu_sample_rates(self, info: DeviceInfo) -> list:
+        """IMU 采样率变化时（device_info_update 推送）按新速率重建四路 IMU 环形
+        缓冲（长度 = 采样率 × BUFFER_SECONDS），与 sync_bio_sample_rates 同理：
+        不重建则横轴时间窗与实际数据速率不一致，波形被拉伸/压缩。
+        返回被重建的数据类型列表（调用方按需重建 2D 图表横轴）。"""
+        configs = [
+            (DataType.NTF_ACC,        info.AccSampleRate),
+            (DataType.NTF_GYRO,       info.GyroSampleRate),
+            (DataType.NTF_EULER_DATA, info.EulerSampleRate),
+            (DataType.NTF_QUATERNION, info.QuatSampleRate),
+        ]
+        changed = []
+        for dt, sr in configs:
+            buf = self.buffers.get(dt)
+            if sr <= 0 or buf is None or self.sample_rates.get(dt) == sr:
+                continue
+            ch = buf.shape[0]
+            buf_len = max(sr * BUFFER_SECONDS, 1)
+            lock = self.get_buffer_lock(dt)
+            lock.lock()
+            try:
+                self.buffers[dt] = np.zeros((ch, buf_len))
+                self.sample_index_buffers[dt] = np.zeros((ch, buf_len), dtype=np.int64)
+                self.buffer_indices[dt] = 0
+                self.sample_rates[dt] = sr
+            finally:
+                lock.unlock()
+            changed.append(dt)
+        return changed
+
     def append_data(self, data: SensorData):
         # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
         # 不再写入 1s 的 eeg 缓冲
@@ -2563,6 +2645,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 (label, ch, rate_map.get(dt) or sr, dt)
                 for label, ch, sr, dt in state.status_parts
             ]
+        # 采样率变更后重建生物电/IMU 缓冲（横轴时间窗才能与新速率一致），当前显示
+        # 设备还需重建图表线的 x 数据；非当前设备只重建缓冲，切换过去时会整体重画
+        if state is not None and info is not None:
+            if state.sync_bio_sample_rates(info) and self.current_sensor == sensor:
+                self._rebuild_eeg_plot()
+            imu_changed = state.sync_imu_sample_rates(info)
+            if (imu_changed and self.current_sensor == sensor
+                    and self.active_data_type in imu_changed):
+                self._rebuild_2d_plot()
         if self.current_sensor == sensor:
             self.link_label.setText(self._link_text(info))
             self.mtu_label.setText(self._mtu_text(info))
