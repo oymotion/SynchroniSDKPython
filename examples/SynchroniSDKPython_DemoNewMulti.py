@@ -727,7 +727,7 @@ class DeviceDataState:
 
 class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     power_changed_sig = QtCore.pyqtSignal(object, int)         # (sensor, power)
-    device_info_sig = QtCore.pyqtSignal(object)                # (sensor)
+    device_info_sig = QtCore.pyqtSignal(object, object)        # (sensor, info)
     add_device_sig = QtCore.pyqtSignal(str)
     update_device_sig = QtCore.pyqtSignal(str, int)    # (address, rssi)
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
@@ -1472,6 +1472,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         sensor.onDataCallback = self._on_data
         sensor.onErrorCallback = self._on_error
+        # 回放中配置记录切换可能改变采样率，SDK 会推 device_info_update，
+        # 据此重建生物电/IMU 缓冲与横轴
+        sensor.onDeviceInfoUpdate = self._on_device_info_update
         sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self._replay_sensor = sensor
@@ -1488,6 +1491,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_states[mac] = state
         self.current_sensor = sensor
         self._refresh_display_for_state(state)
+        # 回放起始速率来自 bin 首条配置记录，单选框选中态同步（保持禁用态不变）
+        if info.EegSampleRate > 0:
+            state.sample_rate_state = ([], int(info.EegSampleRate))
+            self._set_sample_rate_checked(int(info.EegSampleRate))
 
         self._replay_paused = False
         self._replay_stop_requested = False
@@ -2620,7 +2627,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[Link] {sensor.BLEDevice.Name}: "
               f"interval={info.ConnectionIntervalMs}ms latency={info.PeripheralLatency} "
               f"timeout={info.SupervisionTimeoutMs}ms mtu={info.MTUSize}")
-        self.device_info_sig.emit(sensor)
+        self.device_info_sig.emit(sensor, info)
 
     @staticmethod
     def _link_text(info: Optional[DeviceInfo]) -> str:
@@ -2636,8 +2643,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return "MTU: --"
         return f"MTU: {info.MTUSize}"
 
-    def _update_link_info_display(self, sensor: SensorProfile):
-        info = sensor.getDeviceInfo()
+    def _update_link_info_display(self, sensor: SensorProfile, info: Optional[DeviceInfo] = None):
+        # info 由 onDeviceInfoUpdate 携带（回放 profile 未 init，getDeviceInfo() 返回 None）
+        if info is None:
+            info = sensor.getDeviceInfo()
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None and info is not None and state.status_parts:
             rate_map = {DataType.NTF_EEG: info.EegSampleRate, DataType.NTF_ECG: info.EcgSampleRate}
@@ -2654,6 +2663,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if (imu_changed and self.current_sensor == sensor
                     and self.active_data_type in imu_changed):
                 self._rebuild_2d_plot()
+            # 单选框选中态跟随当前速率（回放等不经 _refresh_control_states 的路径）
+            if info.EegSampleRate > 0:
+                rate = int(info.EegSampleRate)
+                options, cur = state.sample_rate_state
+                if cur != rate:
+                    state.sample_rate_state = (options, rate)
+                    if self.current_sensor == sensor:
+                        self._set_sample_rate_checked(rate)
         if self.current_sensor == sensor:
             self.link_label.setText(self._link_text(info))
             self.mtu_label.setText(self._mtu_text(info))
@@ -2828,6 +2845,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             for rate, rb in self._sample_rate_radios.items():
                 rb.setEnabled(rate in options)
                 rb.setChecked(rate == current_rate)
+            self._sample_rate_button_group.setExclusive(True)
+        finally:
+            self._updating_sample_rate_controls = False
+
+    def _set_sample_rate_checked(self, rate: int):
+        """仅更新采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
+        self._updating_sample_rate_controls = True
+        try:
+            if rate not in self._sample_rate_radios:
+                self._sample_rate_button_group.setExclusive(False)
+            for r, rb in self._sample_rate_radios.items():
+                rb.setChecked(r == rate)
             self._sample_rate_button_group.setExclusive(True)
         finally:
             self._updating_sample_rate_controls = False
