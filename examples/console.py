@@ -49,14 +49,14 @@ def deviceFoundCallback(deviceList: List[BLEDevice]):
         sensor.onErrorCallback = onErrorCallback
 
         # check state & connect
-        if sensor.deviceState != DeviceStateEx.Ready:
+        if not sensor.isReady:
             print("connecting: " + sensor.BLEDevice.Address)
             if not sensor.connect():
                 print("connect device: " + sensor.BLEDevice.Name + " failed")
                 continue
 
         # init & start data transfer
-        if sensor.deviceState == DeviceStateEx.Ready and not sensor.hasInited:
+        if sensor.isReady and not sensor.hasInited:
             # sensor.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
             sensor.setParam("NTF_ECG", "OFF")
             sensor.setParam("NTF_IMU", "OFF")

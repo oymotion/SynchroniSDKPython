@@ -95,14 +95,14 @@ async def main():
         sensor.onErrorCallback = onErrorCallback
 
         # check state & connect
-        if sensor.deviceState != DeviceStateEx.Ready:
+        if not sensor.isReady:
             print("connecting: " + sensor.BLEDevice.Address)
             if not await sensor.asyncConnect():
                 print("connect device: " + sensor.BLEDevice.Name + " failed")
                 continue
 
         # init & start data transfer
-        if sensor.deviceState == DeviceStateEx.Ready and not sensor.hasInited:
+        if sensor.isReady and not sensor.hasInited:
             await sensor.asyncSetParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.csv")
             # await sensor.asyncSetParam("NTF_ECG", "OFF")
             # await sensor.asyncSetParam("NTF_IMU", "OFF")

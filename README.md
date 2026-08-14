@@ -58,6 +58,12 @@ if not SensorControllerInstance.hasDeviceFoundCallback:
     SensorControllerInstance.onDeviceFoundCallback = on_device_callback
 ```
 
+Use `def getVersion() -> str` to get the SDK version string.
+
+```python
+version = SensorControllerInstance.getVersion()
+```
+
 ### 2. Start scan
 
 Use `def startScan(period_in_ms: int) -> bool` to start scan
@@ -251,6 +257,13 @@ deviceStateEx = sensorProfile.deviceState
 #     Invalid = 5
 ```
 
+Use `property isReady: bool` as a shortcut for `deviceState == DeviceStateEx.Ready`.
+
+```python
+if sensorProfile.isReady:
+    pass
+```
+
 ### 15. Get BLE device of SensorProfile
 
 Use `property BLEDevice: BLEDevice` to get BLE device of SensorProfile.
@@ -301,7 +314,22 @@ Please call after device in 'Ready' state and `init()` has succeeded, returns No
 #   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
 #   plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate: the maximum
 #   sample rate reported by the device capability query (0 = not reported).
+#   plus ImuChannelCount / ImuSampleRate: the aggregated NTF_IMU stream
+#   (new-EMG devices only; 0 = no aggregated stream, use the four separate
+#   ACC/GYRO/EULER/QUAT streams instead).
+#   plus ConnectionIntervalMs / PeripheralLatency / SupervisionTimeoutMs:
+#   the negotiated BLE link parameters (bumble USB-dongle backend only;
+#   0 / -1 / 0 = unknown).
 # e.g. deviceInfo.EmgChannelCount, deviceInfo.EegSampleRate
+```
+
+Use `onDeviceInfoUpdate` to get notified when the DeviceInfo changes after init — e.g. the link parameters are updated by the peripheral shortly after connect (bumble backend), or `EEG_SAMPLE_RATE` changes the reported rates. The profile patches its cached DeviceInfo in place before firing the callback.
+
+```python
+def on_device_info_update(sensor: SensorProfile, info: DeviceInfo):
+    pass
+
+sensorProfile.onDeviceInfoUpdate = on_device_info_update
 ```
 
 ### 17. Init data transfer
@@ -384,7 +412,12 @@ class DataType(Enum):
     NTF_PPG = 0x18           # PPG raw samples
 ```
 
-Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface mirrors the C++ SDK (`include/SensorData.hpp`): metadata via `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getDelay()`, samples via the read-only `channelSamples` / `startSampleIndex` properties or the single-point accessors `getChannelSample(ci, si)` / `getData(ci, si)` / `getRawData(ci, si)` / ...; Sample fields (`data`, `sampleIndex`, `isLost`, ...) are read-only properties.
+Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface mirrors the C++ SDK (`include/SensorData.hpp`):
+
+- metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getDelay()` / `isDataValid()` (always `True` in Python)
+- whole batch: read-only `channelSamples` / `startSampleIndex` properties, `clone()` for a deep copy
+- single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` / `isLost(ci, si)` return the individual field
+- Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `timeStampInMs`, `isLost`) are read-only properties.
 
 ```python
 def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
@@ -439,7 +472,10 @@ Please check console.py in examples directory
 
 ### Async methods
 
-all methods start with async is async methods, they has same params and return result as sync methods.
+All methods starting with `async` are async methods; they have the same params and return result as the sync methods:
+
+- `SensorController`: `asyncScan`, `asyncMultiStartDataNotification`, `asyncMultiStopDataNotification`
+- `SensorProfile`: `asyncConnect`, `asyncDisconnect`, `asyncInit`, `asyncStartDataNotification`, `asyncStopDataNotification`, `asyncSetParam`, `asyncGetParam`, `asyncGetBatteryLevel`
 
 Please check async_console.py in examples directory
 
@@ -649,3 +685,18 @@ SensorControllerInstance.setLogPath(True, "d:/temp/sdklogs")
 SensorControllerInstance.setLogPath(True)
 # reset to the default log directory (~/Documents/sensorsdklog)
 ```
+
+### Application log entries
+
+Applications can write their own events (user actions, business state, etc.) into the same SDK log files, keeping one shared timeline with the SDK's internal logs:
+
+```python
+SensorControllerInstance.log("User clicked start", "I")
+# written to the controller log (common channel)
+
+sensor.log("User toggled filter 50Hz", "I")
+# SensorProfile.log: routed to that profile's log file when enabled,
+# otherwise falls back to the controller log
+```
+
+`level` accepts `"D"` / `"I"` / `"W"` / `"E"` (case-insensitive, default `"I"`); `"D"` follows the `setDebugEnabled` switch, the other levels are always emitted. Entries are tagged `[App]` in the log files.

@@ -5,6 +5,7 @@ import subprocess
 import multiprocessing
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
@@ -17,6 +18,11 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 
+try:
+    from scipy import signal as scipy_signal
+except ImportError:
+    scipy_signal = None    # 无 scipy 时实时滤波单选框禁用，其余功能不受影响
+
 from PyQt5 import QtWidgets, QtCore
 
 from sensor import *
@@ -26,6 +32,8 @@ SCAN_DEVICE_PERIOD_IN_MS   = 3000
 PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
+FFT_UPDATE_INTERVAL        = 0.5   # 秒，工作线程 FFT 频谱的计算间隔
+DEMO_VERSION               = "0.0.5"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 
@@ -48,6 +56,16 @@ DATA_TYPE_NAMES = {
     DataType.NTF_EULER_DATA: "Euler Angle (Euler)",
     DataType.NTF_QUATERNION: "Quaternion (Quaternion)",
 }
+
+# 实时频段滤波选项（右侧 EMG/EEG/ECG/BRTH/PPG 生物电波形）：(显示名, (下限, 上限))，None = 关闭
+FILTER_BANDS = (
+    ("Off", None),
+    ("δ 0.5-4Hz", (0.5, 4.0)),
+    ("θ 4-8Hz", (4.0, 8.0)),
+    ("α 8-13Hz", (8.0, 13.0)),
+    ("β 13-30Hz", (13.0, 30.0)),
+    ("γ 30-45Hz", (30.0, 45.0)),
+)
 
 EEG_CHANNEL_COLORS = plt.cm.tab10(np.linspace(0, 1, 8))
 
@@ -177,6 +195,14 @@ class DeviceDataState:
         self.bio_sample_rates: dict = {}
         self.bio_impedance: dict = {}
         self.bio_buffer_lock = QtCore.QMutex()
+
+        # 实时频段滤波（Live Filter 单选框）：SDK 数据回调线程内在样本写入
+        # 环形缓冲前做因果带通（sosfilt + 跨批延续的 zi 状态），缓冲里直接
+        # 存滤波后数据，绘图路径无需改动；live_filter_band 由 UI 线程切换
+        self.live_filter_band = None           # (lo, hi) 或 None
+        self._filter_sos = None                # 当前 (band, 采样率) 对应的 sos
+        self._filter_sos_key = None
+        self._filter_zi = {}                   # DataType -> (n_sections, n_ch, 2) 滤波器状态
 
         # 右侧生物电显示区类型：根据设备能力在 "eeg" / "emg" / "ppg" 间切换
         self.bio_kind: Optional[str] = None
@@ -433,6 +459,44 @@ class DeviceDataState:
             changed.append(dt)
         return changed
 
+    def set_live_filter_band(self, band):
+        """UI 线程切换频段：更新波段并让回调线程在下个数据批重建滤波器状态
+        （环形缓冲中的旧数据随新写入自然滚动替换，无需清空）。"""
+        self.live_filter_band = band
+        self._filter_sos_key = None
+        self._filter_zi = {}
+
+    def apply_live_filter(self, dt, ch_idx: int, vals, sample_rate: int):
+        """SDK 数据回调线程内实时滤波：按当前选中频段对单通道样本批做因果带通
+        （4 阶 Butterworth，sosfilt），zi 状态跨数据批延续保证批间连续；
+        未开启/参数无效/计算出错时原样返回。"""
+        band = self.live_filter_band
+        if band is None or vals is None or len(vals) == 0:
+            return vals
+        if scipy_signal is None or not sample_rate or sample_rate <= 0:
+            return vals
+        lo, hi = band
+        if hi >= sample_rate / 2:
+            return vals  # 频段超过奈奎斯特频率
+        try:
+            key = (band, int(sample_rate))
+            if self._filter_sos_key != key:
+                self._filter_sos = scipy_signal.butter(
+                    4, [lo, hi], btype="band", fs=sample_rate, output="sos")
+                self._filter_sos_key = key
+                self._filter_zi = {}   # 频段/采样率变化：滤波器状态整体重置
+            sos = self._filter_sos
+            zi = self._filter_zi.get(dt)
+            if zi is None or zi.shape[1] <= ch_idx:
+                # 新数据类型/通道数变化：按当前通道数重建初始状态
+                zi0 = scipy_signal.sosfilt_zi(sos)      # (n_sections, 2)
+                zi = np.repeat(zi0[:, None, :], ch_idx + 1, axis=1)
+                self._filter_zi[dt] = zi
+            out, zi[:, ch_idx, :] = scipy_signal.sosfilt(sos, vals, zi=zi[:, ch_idx, :])
+            return out.astype(np.float32)
+        except Exception:
+            return vals
+
     def append_data(self, data: SensorData):
         # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
         # 不再写入 1s 的 eeg 缓冲
@@ -458,6 +522,8 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
+                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     if len(new_vals) == 0:
                         continue
@@ -498,6 +564,8 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
+                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -537,6 +605,8 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
+                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -576,6 +646,8 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
+                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -615,6 +687,8 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
+                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -738,6 +812,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     replay_done_sig = QtCore.pyqtSignal(str)
     analyze_done_sig = QtCore.pyqtSignal(str, str)
     dongle_check_sig = QtCore.pyqtSignal(str)
+    fft_done_sig = QtCore.pyqtSignal(int, object, object)   # (data_type, freqs, mags)，工作线程→UI 线程
 
     def __init__(self):
         super().__init__()
@@ -781,6 +856,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._replay_paused = False
         self._replay_stop_requested = False
 
+        # FFT 频谱：UI 定时器把波形快照打包成闭包提交到工作线程计算，
+        # 结果经 fft_done_sig 回 UI 线程更新频谱子图；_fft_pending 防止任务堆积
+        self.fft_lines = []
+        self._fft_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="FFT")
+        self._fft_pending = False
+        self._fft_last_submit = 0.0
+
+        # 实时频段滤波选中项（Live Filter 单选框）：(lo, hi) 或 None；
+        # 经 _append_sensor_data 懒同步到各设备状态的回调线程滤波路径
+        self._filter_band = None
+
         self._init_ui()
 
         # Debug Log 复选框默认勾选但启动时不触发 stateChanged，
@@ -805,6 +891,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.replay_done_sig.connect(self._on_replay_done)
         self.analyze_done_sig.connect(self._on_analyze_done)
         self.dongle_check_sig.connect(self._on_dongle_check_result)
+        self.fft_done_sig.connect(self._on_fft_done)
 
         if not self.sensor_controller.hasDeviceFoundCallback:
             self.sensor_controller.onDeviceFoundCallback = self._on_device_found
@@ -828,9 +915,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._setup_3d_plot()
 
         bottom_left_layout = QtWidgets.QVBoxLayout()
-        self.figure_2d, self.ax_2d = plt.subplots()
+        # 上：时域波形；下：工作线程 FFT 结果驱动的频谱
+        self.figure_2d, (self.ax_2d, self.ax_fft) = plt.subplots(
+            2, 1, gridspec_kw={"height_ratios": [3, 2]})
+        self.figure_2d.subplots_adjust(hspace=0.45)
         self.canvas_2d = FigureCanvas(self.figure_2d)
-        bottom_left_layout.addWidget(QtWidgets.QLabel("2D Waveform (ACC/GYRO/Euler)"))
+        bottom_left_layout.addWidget(QtWidgets.QLabel("2D Waveform + FFT Spectrum (ACC/GYRO/Euler)"))
         bottom_left_layout.addWidget(self.canvas_2d)
 
         left_layout.addLayout(top_left_layout, stretch=1)
@@ -925,6 +1015,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.type_combo.addItem(name, dt)
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         type_layout.addWidget(self.type_combo)
+
+        # 实时频段滤波下拉框（作用于右侧 EMG/EEG/ECG/BRTH/PPG 波形，
+        # 在 SDK 数据回调线程内滤波后写入显示缓冲）
+        type_layout.addWidget(QtWidgets.QLabel("Live Filter:"))
+        self.filter_combo = QtWidgets.QComboBox()
+        for name, band in FILTER_BANDS:
+            self.filter_combo.addItem(name, band)
+        if scipy_signal is None:
+            self.filter_combo.setEnabled(False)
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_combo_changed)
+        type_layout.addWidget(self.filter_combo)
+
         type_layout.addStretch()
 
         self.value_labels: dict = {}
@@ -1075,7 +1177,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{self.sensor_controller.getVersion()})")
+        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{self.sensor_controller.getVersion()}, demo v{DEMO_VERSION})")
         self.resize(1600, 900)
         self.show()
 
@@ -1083,14 +1185,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _start_scan(self):
         if not self.sensor_controller.isEnable:
+            self._app_log("User: start scan rejected (Bluetooth disabled)", "W")
             self.status_label.setText("Please enable Bluetooth first")
             return
+        self._app_log("User: start scan")
         if not self.sensor_controller.isScanning:
             self.sensor_controller.startScan(SCAN_DEVICE_PERIOD_IN_MS)
         self.btn_scan.setEnabled(False)
         self.btn_stop_scan.setEnabled(True)
 
     def _stop_scan(self):
+        self._app_log("Stop scan")
         self.sensor_controller.stopScan()
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
@@ -1098,6 +1203,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _check_setup_dongle(self):
         # 检查/安装 dongle 驱动（Windows 弹 UAC，Linux 需终端 sudo 密码），
         # 后台线程执行避免阻塞 UI，结果经信号回到主线程提示
+        self._app_log("User: check setup dongle")
         self.btn_check_dongle.setEnabled(False)
         self.btn_check_dongle.setText("Checking Dongle...")
 
@@ -1120,13 +1226,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _multi_start(self):
         # 停掉所有已连接设备的传输，再用 controller 的同步起流对齐启动：
-        # bumble(dongle)后端下各设备的起流写命令等待同一个门闩、几乎同时下发
         sensors = [state.sensor for state in self.device_states.values()
-                   if state.sensor.deviceState == DeviceStateEx.Ready
+                   if state.sensor.isReady
                    and state.sensor.hasInited]
         if not sensors:
+            self._app_log("User: multi start rejected (no connected device)", "W")
             self.status_label.setText("No connected device to sync-start")
             return
+        self._app_log(f"User: multi start on {len(sensors)} device(s)")
         self.btn_multi_start.setEnabled(False)
         try:
             transferring = [s for s in sensors if s.isDataTransfering]
@@ -1134,15 +1241,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 stop_results = self.sensor_controller.multiStopDataNotification(transferring)
                 stop_failed = [mac for mac, ok in stop_results.items() if not ok]
                 if stop_failed:
+                    self._app_log(f"App: multi stop failed on: {', '.join(stop_failed)}", "W")
                     self.status_label.setText(
                         f"Multi stop failed on: {', '.join(stop_failed)}")
                     return
             results = self._start_with_model_params(sensors)
             failed = [mac for mac, ok in results.items() if not ok]
             if failed:
+                self._app_log(f"App: multi start failed on: {', '.join(failed)}", "W")
                 self.status_label.setText(
                     f"Multi start failed on: {', '.join(failed)}")
             else:
+                self._app_log(f"App: multi start OK: {len(results)} device(s) started")
                 self.status_label.setText(
                     f"Multi start: {len(results)} device(s) started")
         finally:
@@ -1160,11 +1270,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
 
     def _on_auto_reconnect_toggled(self, checked: bool):
+        self._app_log(f"User: auto reconnect {'ON' if checked else 'OFF'}")
         # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
         for state in self.device_states.values():
             state.sensor.autoReconnect = checked
 
     def _on_dongle_check_result(self, result: str):
+        self._app_log(f"App: check dongle result: {result.splitlines()[0] if result else result}")
         self.btn_check_dongle.setEnabled(True)
         self.btn_check_dongle.setText("Check Setup Dongle")
         if result.startswith("OK"):
@@ -1286,14 +1398,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         """连接列表中选中的设备，支持同时连接多台设备。"""
         device = self._selected_list_device()
         if device is None:
+            self._app_log("User: connect rejected (no device selected)", "W")
             self.status_label.setText("Please select a device in the list first")
             return
         addr = device.Address
         if addr in self.device_states:
             return
 
+        self._app_log(f"User: connect {device.Name} ({addr})")
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
+            self._app_log(f"App: failed to create SensorProfile for {addr}", "E")
             self.status_label.setText("Failed to create SensorProfile")
             return
 
@@ -1309,8 +1424,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.status_label.setText(f"Connecting: {device.Name} ...")
         self.btn_connect.setEnabled(False)
 
-        if sensor.deviceState != DeviceStateEx.Ready:
+        if not sensor.isReady:
             if not sensor.connect():
+                self._app_log(f"App: failed to connect to {device.Name} ({addr})", "E", sensor)
                 self.status_label.setText(f"Failed to connect to {device.Name}")
                 self._update_button_states()
                 return
@@ -1319,6 +1435,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         if not sensor.hasInited:
             if not sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
+                self._app_log(f"App: failed to initialize {device.Name} ({addr})", "E", sensor)
                 self.status_label.setText(f"Failed to initialize {device.Name}")
                 self._update_button_states()
                 return
@@ -1353,10 +1470,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         if not sensor.isDataTransfering:
             if not sensor.startDataNotification():
+                self._app_log(f"App: failed to start data stream on {addr}", "E", sensor)
                 self.status_label.setText("Failed to start data stream")
                 self._update_button_states()
                 return
 
+        self._app_log(f"App: device connected and streaming: {device.Name} ({addr})", sensor=sensor)
         self.device_states[addr] = state
         self._update_device_item_text(addr, connected=True)
 
@@ -1401,6 +1520,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor = self.current_sensor
         if sensor is None:
             return
+        self._app_log(f"User: disconnect {sensor.BLEDevice.Address}", sensor=sensor)
         self.btn_disconnect.setEnabled(False)
         self.btn_connect.setEnabled(False)
         for cb in self._ntf_checkboxes.values():
@@ -1446,8 +1566,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if not path:
             return
 
+        self._app_log(f"User: replay bin file: {path}")
         config = self.sensor_controller.getBinFileInfo(path)
         if config is None:
+            self._app_log(f"App: invalid bin file (no config record): {path}", "W")
             self.status_label.setText("Invalid bin file: no config record found")
             return
 
@@ -1525,10 +1647,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor = self._replay_sensor
         if sensor is None:
             return
+        action = "resume" if self._replay_paused else "pause"
         if self._replay_paused:
             result = self.sensor_controller.resumeBinReplay(sensor)
         else:
             result = self.sensor_controller.pauseBinReplay(sensor)
+        self._app_log(f"User: {action} replay -> {result}",
+                      "I" if result == "OK" else "W", sensor)
         if result != "OK":
             self.status_label.setText(f"Replay pause/resume failed: {result}")
             return
@@ -1549,12 +1674,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_replay_stop.setEnabled(False)
         self.btn_replay_pause.setEnabled(False)
         result = self.sensor_controller.stopBinReplay(sensor)
+        self._app_log(f"User: stop replay -> {result}",
+                      "I" if result == "OK" else "W", sensor)
         if result != "OK":
             self.status_label.setText(f"Stop replay failed: {result}")
             return
         self.status_label.setText("Stopping replay ...")
 
     def _on_replay_done(self, message: str):
+        self._app_log(f"App: replay done: {message}")
         # 回放结束：移除回放用的虚拟设备状态，恢复实时设备控件
         sensor = self._replay_sensor
         if sensor is not None:
@@ -1585,6 +1713,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if not path:
             return
 
+        self._app_log(f"User: analyze bin file: {path}")
         self.btn_analyze.setEnabled(False)
         self.status_label.setText(f"Analyzing: {Path(path).name} ...")
 
@@ -1601,8 +1730,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_analyze_done(self, csv_path: str, error: str):
         self.btn_analyze.setEnabled(True)
         if error:
+            self._app_log(f"App: analyze failed: {error}", "E")
             self.status_label.setText(f"Analyze failed: {error}")
             return
+        self._app_log(f"App: CSV saved: {csv_path}")
         self.status_label.setText(f"CSV saved: {csv_path}")
         self._open_in_system_editor(csv_path)
 
@@ -1658,12 +1789,22 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         state = self.device_states.get(addr)
         if state is None:
             return
+        # 实时滤波频段懒同步：UI 切换后下个数据批把新频段带到回调线程
+        # （引用比较即可——切换时 _filter_band 整体替换，identity 必然变化）
+        if state.live_filter_band is not self._filter_band:
+            state.set_live_filter_band(self._filter_band)
         if data.getLostPackageCount() > 0:
             type_name = DataType(data.getDataType()).name if data.getDataType() is not None else "Unknown"
             self.lost_packet_signal.emit(addr, type_name, data.getLostPackageCount())
         state.append_data(data)
 
     def closeEvent(self, event):
+        self._app_log("App: demo window closing")
+        self.timer.stop()
+        try:
+            self._fft_executor.shutdown(wait=False)
+        except Exception:
+            pass
         try:
             self.sensor_controller.terminate()
         except Exception as e:
@@ -1674,6 +1815,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _on_type_changed(self, _):
         self.active_data_type = self.type_combo.currentData()
+        self._app_log(f"User: display data type -> {self.type_combo.currentText()}")
         self._rebuild_2d_plot()
 
     def _rebuild_2d_plot(self):
@@ -1706,6 +1848,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if buf_copy is None or idx_buf_copy is None:
             suffix = "(Not connected)" if state is None else "(Device not supported or disabled)"
             self.ax_2d.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} {suffix}")
+            self.ax_fft.cla()
+            self.fft_lines = []
             self.canvas_2d.draw_idle()
             self._last_plotted_sample_indices.pop(dt, None)
             return
@@ -1728,6 +1872,58 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.ax_2d.set_xlabel("Time (s)")
         self.ax_2d.set_ylabel("Value")
         self.ax_2d.legend(loc="upper right")
+
+        # 频谱子图：通道线与波形一致，数据由工作线程 FFT 闭包的结果异步填充
+        self.ax_fft.cla()
+        self.fft_lines = []
+        for line in self.lines_2d:
+            (fft_line,) = self.ax_fft.plot([], [], label=line.get_label())
+            self.fft_lines.append(fft_line)
+        self.ax_fft.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} Spectrum")
+        self.ax_fft.set_xlabel("Frequency (Hz)")
+        self.ax_fft.set_ylabel("Amplitude")
+        if self.fft_lines:
+            self.ax_fft.legend(loc="upper right")
+        self.canvas_2d.draw_idle()
+
+    # ── FFT 频谱（工作线程闭包计算，信号回 UI 线程更新）─────────────────────────
+
+    def _submit_fft(self, dt, sample_rate: int, buf_snapshot):
+        """UI 线程调用：把 FFT 计算连同数据快照打包成闭包提交到工作线程，
+        计算不占用 UI 线程；快照为已按时间序重排的副本，闭包运行期间不被改写。"""
+        self._fft_pending = True
+
+        def _compute_fft():
+            try:
+                # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
+                window = np.hanning(buf_snapshot.shape[1])
+                windowed = buf_snapshot * window
+                mags = np.abs(np.fft.rfft(windowed, axis=1)) / max(window.sum(), 1e-12) * 2
+                freqs = np.fft.rfftfreq(buf_snapshot.shape[1], d=1.0 / sample_rate)
+                self.fft_done_sig.emit(int(dt), freqs, mags)
+            except Exception as e:
+                print(f"[FFT] compute error: {e}")
+            finally:
+                self._fft_pending = False
+
+        try:
+            self._fft_executor.submit(_compute_fft)
+        except RuntimeError:
+            # 窗口关闭后执行器已 shutdown，退出途中的最后一次定时器触发
+            self._fft_pending = False
+
+    def _on_fft_done(self, dt_value: int, freqs, mags):
+        """工作线程 FFT 结果（经 fft_done_sig 回到 UI 线程）：刷新频谱子图。
+        期间用户可能已切换数据类型，类型不匹配的结果直接丢弃。"""
+        if dt_value != int(self.active_data_type) or not self.fft_lines:
+            return
+        for ch, line in enumerate(self.fft_lines):
+            if ch < mags.shape[0]:
+                line.set_data(freqs, mags[ch])
+        if freqs.size:
+            self.ax_fft.set_xlim(0, freqs[-1])
+            self.ax_fft.relim()
+            self.ax_fft.autoscale_view(scalex=False)
         self.canvas_2d.draw_idle()
 
     # ── Right-side EMG / EEG (+ ECG + BRTH) Waveform ──────────────────────────
@@ -1765,6 +1961,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         state = self._current_state()
         if state is not None and state.eeg_page_index > 0:
             state.eeg_page_index -= 1
+            self._app_log(f"User: prev page -> {state.eeg_page_index}", "D")
             self._rebuild_eeg_plot()
             self._update_page_label()
             self._update_page_buttons()
@@ -1776,6 +1973,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         page_count = self._eeg_page_count()
         if state.eeg_page_index < page_count - 1:
             state.eeg_page_index += 1
+            self._app_log(f"User: next page -> {state.eeg_page_index}", "D")
             self._rebuild_eeg_plot()
             self._update_page_label()
             self._update_page_buttons()
@@ -2210,6 +2408,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if current_last_idx != last_plotted_idx:
                 # Reassemble the circular buffer once for all channels.
                 buf_copy = np.roll(buf_copy, -buffer_index, axis=1)
+                # FFT 频谱：重排后的快照打包成闭包提交工作线程，结果经信号回 UI 线程
+                now_fft = time.time()
+                if (not self._fft_pending
+                        and now_fft - self._fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    sr = state.sample_rates.get(dt) or state.nominal_rates.get(dt) or 0
+                    if sr > 0:
+                        self._fft_last_submit = now_fft
+                        self._submit_fft(dt, sr, buf_copy)
                 labels = CHANNEL_LABELS.get(dt, [])
                 for ch, line in enumerate(self.lines_2d):
                     if ch < buf_copy.shape[0]:
@@ -2526,6 +2732,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
+    def _app_log(self, message: str, level: str = "I", sensor=None):
+        """把一条应用事件写进 SDK 日志：给定（或当前显示）设备时进其 profile
+        日志，否则进 controller 日志——与 SDK 内部日志共用同一时间线。"""
+        target = sensor if sensor is not None else self.current_sensor
+        if target is not None:
+            target.log(message, level)
+        else:
+            self.sensor_controller.log(message, level)
+
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
         if state == DeviceStateEx.Disconnected:
@@ -2536,6 +2751,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         等效于按下 Connect 按钮——转到 UI 线程执行完整连接流程。
         restore=True 时流程结束后回放上次会话的参数（保留和恢复原有设置）。
         返回 True 表示由本流程接管（SDK 不再执行默认的参数回放恢复）。"""
+        sensor.log(f"App: auto reconnect callback received, restore={restore}")
         self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
         return True
 
@@ -2560,10 +2776,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             for key, value in saved.items():
                 result = sensor.setParam(key, value)
                 print(f"[AutoReconnect] restore setParam({key}, {value}) -> {result}")
+                sensor.log(f"App: restore setParam({key}, {value}) -> {result}")
             # 参数回放后同步复选框显示
             self._refresh_control_states(sensor)
 
     def _on_device_disconnected(self, addr: str):
+        self._app_log(f"App: device disconnected, removed from UI: {addr}")
         state = self.device_states.pop(addr, None)
         self._update_device_item_text(addr, connected=False)
         if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
@@ -2575,6 +2793,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _on_error(self, sensor: SensorProfile, reason: str):
         print(f"[Error] {sensor.BLEDevice.Name}: {reason}")
+        sensor.log(f"App: error callback: {reason}", "E")
 
     def _update_lost_packet_display(self, addr: str, lost_type: str, count: int):
         state = self.device_states.get(addr)
@@ -2706,6 +2925,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
+        self._app_log(f"User: SDK debug log {'ON' if enabled else 'OFF'}")
         self._debug_log_enabled = enabled
         if enabled:
             self._apply_sdk_debug_log()
@@ -2713,23 +2933,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.sensor_controller.setDebugEnabled(False)
         value = "True" if enabled else "False"
         for sensor in self.sensor_controller.getConnectedSensors():
-            if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
+            if sensor.isReady and sensor.hasInited:
                 result = sensor.setParam("DEBUG_LOG_PATH", value)
                 print(f"[Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_LOG_PATH, {value}) -> {result}")
+                sensor.log(f"App: setParam(DEBUG_LOG_PATH, {value}) -> {result}")
                 self._check_set_param_result("DEBUG_LOG_PATH", result)
 
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
+        self._app_log(f"User: data debug log {'ON' if enabled else 'OFF'}")
         self._data_debug_log_enabled = enabled
         value = "True" if enabled else "False"
         for sensor in self.sensor_controller.getConnectedSensors():
-            if sensor.deviceState == DeviceStateEx.Ready and sensor.hasInited:
+            if sensor.isReady and sensor.hasInited:
                 result = sensor.setParam("DEBUG_BLE_DATA_PATH", value)
                 print(f"[Data Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_BLE_DATA_PATH, {value}) -> {result}")
+                sensor.log(f"App: setParam(DEBUG_BLE_DATA_PATH, {value}) -> {result}")
                 self._check_set_param_result("DEBUG_BLE_DATA_PATH", result)
 
     def _on_ntf_toggled(self, key: str):
-        if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
+        if self.current_sensor is None or not self.current_sensor.isReady:
             return
         if self._updating_ntf_controls:
             return
@@ -2740,6 +2963,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[NTF] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[NTF] setParam({key}, {value}) -> {result}")
+        self._app_log(f"User: setParam({key}, {value}) -> {result}")
         if self._check_set_param_result(key, result):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
@@ -2861,8 +3085,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         finally:
             self._updating_sample_rate_controls = False
 
+    def _on_filter_combo_changed(self, _index: int):
+        """Live Filter 频段下拉框切换：更新选中项；各设备的回调线程滤波路径
+        在下个数据批懒同步（set_live_filter_band 会重置滤波器状态）。"""
+        self._filter_band = self.filter_combo.currentData()
+        self._app_log(f"User: live filter -> {self.filter_combo.currentText()}")
+        for state in self.device_states.values():
+            state.set_live_filter_band(self._filter_band)
+
     def _on_filter_toggled(self, key: str):
-        if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
+        if self.current_sensor is None or not self.current_sensor.isReady:
             return
         if self._updating_filter_controls:
             return
@@ -2873,6 +3105,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[Filter] setParam({key}, {value}) ...")
         result = self.current_sensor.setParam(key, value)
         print(f"[Filter] setParam({key}, {value}) -> {result}")
+        self._app_log(f"User: setParam({key}, {value}) -> {result}")
         if self._check_set_param_result(key, result):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
@@ -2880,7 +3113,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_sample_rate_toggled(self, rate: int, checked: bool):
         if not checked:
             return
-        if self.current_sensor is None or self.current_sensor.deviceState != DeviceStateEx.Ready:
+        if self.current_sensor is None or not self.current_sensor.isReady:
             return
         if self._updating_sample_rate_controls:
             return
@@ -2888,6 +3121,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) ...")
         result = self.current_sensor.setParam("EEG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
+        self._app_log(f"User: setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
         self._check_set_param_result("EEG_SAMPLE_RATE", result)
         self._refresh_control_states(self.current_sensor)
         if not str(result).startswith("Error"):
