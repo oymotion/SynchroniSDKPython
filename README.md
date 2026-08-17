@@ -414,10 +414,10 @@ class DataType(Enum):
 
 Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface mirrors the C++ SDK (`include/SensorData.hpp`):
 
-- metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getDelay()` / `isDataValid()` (always `True` in Python)
+- metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getStartTimeSec()` (wall-clock stream-start anchor in LSL-style Unix seconds, 0.0 when unknown) / `getDelay()` / `isDataValid()` (always `True` in Python)
 - whole batch: read-only `channelSamples` / `startSampleIndex` properties, `clone()` for a deep copy
-- single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` / `isLost(ci, si)` return the individual field
-- Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `timeStampInMs`, `isLost`) are read-only properties.
+- single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` (computed: `sampleIndex * 1000 / sampleRate`, 0 when the rate is unknown) / `getAbsTimeStampInSec(ci, si)` (absolute LSL-style timestamp in seconds, 0.0 when the stream-start anchor is unknown) / `isLost(ci, si)` return the individual field
+- Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `absTimeStampInSec`, `isLost`) are read-only properties.
 
 ```python
 def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
@@ -662,7 +662,7 @@ Row kinds in record order (config records produce no rows; a bin without a confi
 | `channel_count` | Batch channel count |
 | `lost_count` | `lostPackageCount` of the batch (non-zero only for new-EMG devices) |
 | `samples_info` | Per-channel sample counts as a Python list string, e.g. `[32, 32, 32]` |
-| `first_sample` | First sample of the first non-empty channel: `data=<v>\|raw=<raw>\|imp=<impedance>\|sat=<saturation>\|idx=<sampleIndex>\|ts=<timeStampInMs>\|ch=<channelIndex>\|lost=<isLost>` |
+| `first_sample` | First sample of the first non-empty channel: `data=<v>\|raw=<raw>\|imp=<impedance>\|sat=<saturation>\|idx=<sampleIndex>\|ts=<computed ms timestamp>\|ch=<channelIndex>\|lost=<isLost>` |
 
 ## Logging controls
 
