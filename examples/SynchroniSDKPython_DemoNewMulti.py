@@ -5,6 +5,7 @@ import subprocess
 import multiprocessing
 import os
 import threading
+import collections
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
@@ -33,7 +34,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5   # 秒，工作线程 FFT 频谱的计算间隔
-DEMO_VERSION               = "0.0.5"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
+DEMO_VERSION               = "0.0.8"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 
@@ -222,7 +223,9 @@ class DeviceDataState:
         self.nominal_rates: dict = {}
         self.nominal_channels: dict = {}
         # 本次起流的首包 delay（毫秒，数据批自带 getDelay()，0=未上报）
+        # 与起流墙钟时刻（Unix 秒，数据批自带 getStartTimeSec()，0=未知）
         self.stream_delay_ms = 0
+        self.stream_start_time_sec = 0.0
 
     def note_data_received(self, data: SensorData):
         """统计每种数据类型实际收到的样本数（不含丢包占位样本），
@@ -232,6 +235,9 @@ class DeviceDataState:
         delay = data.getDelay()
         if delay:
             self.stream_delay_ms = delay
+        start_sec = data.getStartTimeSec()
+        if start_sec > 0:
+            self.stream_start_time_sec = start_sec
         if data.getDataType() == DataType.NTF_IMU:
             # 聚合批：按拆分后的子类型分别计数，状态栏实测速率与四路独立流一致
             for sub in split_imu_aggregate(data):
@@ -287,6 +293,10 @@ class DeviceDataState:
             nominal = nominal_rates.get(dt) or sr
             nominal_txt = f"{nominal:g}" if nominal else "--"
             entries.append(f"{label} {actual:.1f} / {nominal_txt}Hz")
+        if self.stream_start_time_sec > 0:
+            sec = self.stream_start_time_sec
+            start_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec)) + f".{int(sec * 1000) % 1000:03d}"
+            entries.append(f"start {start_txt}")
         if self.stream_delay_ms:
             entries.append(f"delay {self.stream_delay_ms}ms")
         return "Actual: " + " | ".join(entries) if entries else ""
@@ -497,6 +507,24 @@ class DeviceDataState:
         except Exception:
             return vals
 
+    def filter_sensor_data(self, data: SensorData):
+        """onData 回调线程内的实时滤波（direct / queue 两种模式共用，queue 模式
+        在入队前完成）：对生物电批次逐通道带通滤波并把结果写回样本值，
+        之后的分发/写缓冲路径不再滤波；非生物电类型不处理。"""
+        if self.live_filter_band is None:
+            return
+        dt = data.getDataType()
+        if not (dt in (DataType.NTF_EMG, DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH)
+                or (self.bio_buffers and dt in self.bio_buffers)):
+            return
+        for ch_idx, ch_samples in enumerate(data.channelSamples):
+            if not ch_samples:
+                continue
+            vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+            vals = self.apply_live_filter(dt, ch_idx, vals, data.getSampleRate())
+            for s, v in zip(ch_samples, vals):
+                s._data = float(v)
+
     def append_data(self, data: SensorData):
         # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
         # 不再写入 1s 的 eeg 缓冲
@@ -522,8 +550,6 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
-                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     if len(new_vals) == 0:
                         continue
@@ -564,8 +590,6 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
-                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -605,8 +629,6 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
-                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -646,8 +668,6 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
-                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -687,8 +707,6 @@ class DeviceDataState:
                     if ch_idx >= buf.shape[0]:
                         break
                     new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    # 实时滤波：回调线程内对写入缓冲前的样本批做带通（zi 跨批延续）
-                    new_vals = self.apply_live_filter(data.getDataType(), ch_idx, new_vals, data.getSampleRate())
                     new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
                     n = min(len(new_vals), buf_len)
                     if n == 0:
@@ -853,6 +871,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._last_data_log_paths: dict = {}
         self._replay_thread = None
         self._replay_sensor = None
+        # 回放进行中标志：由 SDK 的 onDataTransferStateChange 事件驱动
+        # （数据流真正开始/结束），取代回放线程存活判断
+        self._replay_active = False
         self._replay_paused = False
         self._replay_stop_requested = False
 
@@ -864,8 +885,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._fft_last_submit = 0.0
 
         # 实时频段滤波选中项（Live Filter 单选框）：(lo, hi) 或 None；
-        # 经 _append_sensor_data 懒同步到各设备状态的回调线程滤波路径
+        # 经 _on_data 懒同步到各设备状态的回调线程滤波路径
         self._filter_band = None
+
+        # Use Queue Data 模式（对齐 C++ Qt demo，默认关）：onData 回调线程只做
+        # 实时滤波 + clone 入队，分发处理（写缓冲/丢包统计/四元数/手势）由
+        # 数据 worker 线程从有界队列取出后执行；direct 模式则全部在回调线程内联完成
+        self._use_queue_data = False
+        self._data_queue = collections.deque()
+        self._data_queue_lock = threading.Lock()
+        self._data_queue_event = threading.Event()
+        self._data_worker_stop = False
+        self._data_worker = threading.Thread(
+            target=self._drain_data_queue, daemon=True, name="DataQueueDrain")
+        self._data_worker.start()
 
         self._init_ui()
 
@@ -995,6 +1028,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.chk_auto_reconnect.setChecked(True)   # SensorProfile.autoReconnect 默认 True
         self.chk_auto_reconnect.toggled.connect(self._on_auto_reconnect_toggled)
         device_header_layout.addWidget(self.chk_auto_reconnect)
+        # Use Queue Data 开关（对齐 C++ Qt demo，默认不勾 = direct 模式）：
+        # 勾选后 onData 只做实时滤波 + clone 入队，worker 线程再分发到显示缓冲
+        self.chk_use_queue_data = QtWidgets.QCheckBox("Use Queue Data")
+        self.chk_use_queue_data.setChecked(False)
+        self.chk_use_queue_data.toggled.connect(self._on_use_queue_data_toggled)
+        device_header_layout.addWidget(self.chk_use_queue_data)
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
         device_header_layout.addWidget(self.btn_multi_start)
@@ -1274,6 +1313,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
         for state in self.device_states.values():
             state.sensor.autoReconnect = checked
+
+    def _on_use_queue_data_toggled(self, checked: bool):
+        # direct / queue 模式切换：队列中残留批次继续由 worker 消费，
+        # 两模式的缓冲写入路径相同，无需清空
+        self._use_queue_data = checked
+        self._app_log(f"User: use queue data {'ON' if checked else 'OFF'}")
 
     def _on_dongle_check_result(self, result: str):
         self._app_log(f"App: check dongle result: {result.splitlines()[0] if result else result}")
@@ -1555,7 +1600,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if self.device_states:
             self.status_label.setText("Please disconnect all devices before replaying a bin file")
             return
-        if self._replay_thread is not None and self._replay_thread.is_alive():
+        if self._replay_active:
             return
 
         default_dir = Path.home() / "Documents" / "sensorsdklog"
@@ -1597,6 +1642,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # 回放中配置记录切换可能改变采样率，SDK 会推 device_info_update，
         # 据此重建生物电/IMU 缓冲与横轴
         sensor.onDeviceInfoUpdate = self._on_device_info_update
+        # 回放的数据流开关事件：回放开始/结束（含异常终止）时驱动 _replay_active
+        sensor.onDataTransferStateChange = self._on_replay_transfer_state
         sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self._replay_sensor = sensor
@@ -1620,6 +1667,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._replay_paused = False
         self._replay_stop_requested = False
+        # 先在点击路径上置位，挡住事件到达前的重复点击；之后由
+        # onDataTransferStateChange 事件与 _on_replay_done 维护
+        self._replay_active = True
         self.btn_replay.setEnabled(False)
         self.btn_replay_pause.setEnabled(True)
         self.btn_replay_pause.setText("Pause Replay")
@@ -1641,6 +1691,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinReplay")
         self._replay_thread.start()
+
+    def _on_replay_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
+        """回放会话的数据流开关事件（SDK 回调线程）：回放数据真正开始/结束时
+        更新 _replay_active；回放结束后的 UI 收尾仍由 replay_done_sig 携带结果消息完成。"""
+        self._replay_active = is_transferring
+        self._app_log(
+            f"App: replay data transfer {'started' if is_transferring else 'stopped'}",
+            sensor=sensor)
 
     def _toggle_replay_pause(self):
         """暂停/恢复当前回放。"""
@@ -1698,6 +1756,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._set_replay_mode_ui(False)
         self._replay_paused = False
         self._replay_stop_requested = False
+        # 回放未成功启动时不会有数据流事件，这里兜底复位
+        self._replay_active = False
 
     # ── Bin 文件离线解析 ──────────────────────────────────────────────────────
 
@@ -1753,46 +1813,93 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     # ── Data Routing ──────────────────────────────────────────────────────────
 
     def _on_data(self, sensor: SensorProfile, data_list: list):
-        """SDK 数据回调（回调线程）：一批 SensorData 列表一次性交付，直接循环处理。
+        """SDK 数据回调（回调线程）：一批 SensorData 列表一次性交付。
 
-        缓冲区写入有各缓冲区锁保护，Qt 界面更新经信号/状态锁，无需再经
-        队列 + 定时器 + 线程池中转。
+        实时滤波一律在本回调线程完成（queue 模式下也在入队前）；之后
+        direct 模式（Use Queue Data 未勾选）内联分发处理，queue 模式
+        clone 入队、由数据 worker 线程分发。缓冲区写入有各缓冲区锁保护，
+        Qt 界面更新经信号/状态锁。
         """
         addr = sensor.BLEDevice.Address
         state = self.device_states.get(addr)
         if state is None:
             return
+        use_queue = self._use_queue_data
         for data in data_list:
             if not (data and data.channelSamples):
                 continue
             # 实际采样率收集：覆盖所有收到的数据类型
             state.note_data_received(data)
-            if data.getDataType() == DataType.NTF_IMU:
-                # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
-                for sub in split_imu_aggregate(data):
-                    if sub.getDataType() in state.buffers:
-                        self._append_sensor_data(addr, sub)
-                    if sub.getDataType() == DataType.NTF_QUATERNION:
-                        self._update_quaternion(state, sub)
-                continue
-            if (data.getDataType() in state.buffers
-                    or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
-                    or (state.bio_buffers and data.getDataType() in state.bio_buffers)):
-                self._append_sensor_data(addr, data)
-            if data.getDataType() == DataType.NTF_QUATERNION:
-                self._update_quaternion(state, data)
-            if data.getDataType() == DataType.NTF_GEST:
-                self._handle_gesture_data(addr, data)
+            # 实时滤波频段懒同步：UI 切换后下个数据批把新频段带到回调线程
+            # （引用比较即可——切换时 _filter_band 整体替换，identity 必然变化）
+            if state.live_filter_band is not self._filter_band:
+                state.set_live_filter_band(self._filter_band)
+            # 实时滤波必须在 onData 中完成：queue 模式入队的数据已是滤波结果
+            state.filter_sensor_data(data)
+            if use_queue:
+                # 回调返回后 SDK 对象池会复用这批 SensorData，入队必须深拷贝
+                self._enqueue_data(addr, data.clone())
+            else:
+                self._dispatch_sensor_data(addr, data)
+
+    def _dispatch_sensor_data(self, addr: str, data: SensorData):
+        """单批数据的分发处理（写环形缓冲/丢包统计/四元数/手势）：
+        direct 模式在 SDK 回调线程内联调用；queue 模式由数据 worker 线程调用。"""
+        state = self.device_states.get(addr)
+        if state is None:
+            return
+        if data.getDataType() == DataType.NTF_IMU:
+            # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
+            for sub in split_imu_aggregate(data):
+                if sub.getDataType() in state.buffers:
+                    self._append_sensor_data(addr, sub)
+                if sub.getDataType() == DataType.NTF_QUATERNION:
+                    self._update_quaternion(state, sub)
+            return
+        if (data.getDataType() in state.buffers
+                or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
+                or (state.bio_buffers and data.getDataType() in state.bio_buffers)):
+            self._append_sensor_data(addr, data)
+        if data.getDataType() == DataType.NTF_QUATERNION:
+            self._update_quaternion(state, data)
+        if data.getDataType() == DataType.NTF_GEST:
+            self._handle_gesture_data(addr, data)
+
+    # queue 模式数据队列上限：消费跟不上时丢最旧的批次，避免内存无界增长
+    # （对齐 C++ Qt demo 的 1000 批上限）
+    DATA_QUEUE_MAX_BATCHES = 1000
+
+    def _enqueue_data(self, addr: str, data: SensorData):
+        """queue 模式入队（onData 回调线程）：有界队列，满了丢最旧。"""
+        with self._data_queue_lock:
+            while len(self._data_queue) >= self.DATA_QUEUE_MAX_BATCHES:
+                self._data_queue.popleft()
+            self._data_queue.append((addr, data))
+        self._data_queue_event.set()
+
+    def _drain_data_queue(self):
+        """数据 worker 线程：批量取出队列数据并分发到显示缓冲；
+        收到停止标记且队列排空后退出。"""
+        while True:
+            self._data_queue_event.wait()
+            with self._data_queue_lock:
+                batch = list(self._data_queue)
+                self._data_queue.clear()
+                self._data_queue_event.clear()
+                stop = self._data_worker_stop
+            for addr, data in batch:
+                try:
+                    self._dispatch_sensor_data(addr, data)
+                except Exception as e:
+                    print(f"[QueueData] dispatch error: {e}")
+            if stop:
+                return
 
     def _append_sensor_data(self, addr: str, data: SensorData):
         """丢包统计上报 + 写环形缓冲区（append_data 内部有各缓冲区锁）。"""
         state = self.device_states.get(addr)
         if state is None:
             return
-        # 实时滤波频段懒同步：UI 切换后下个数据批把新频段带到回调线程
-        # （引用比较即可——切换时 _filter_band 整体替换，identity 必然变化）
-        if state.live_filter_band is not self._filter_band:
-            state.set_live_filter_band(self._filter_band)
         if data.getLostPackageCount() > 0:
             type_name = DataType(data.getDataType()).name if data.getDataType() is not None else "Unknown"
             self.lost_packet_signal.emit(addr, type_name, data.getLostPackageCount())
@@ -1801,6 +1908,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         self._app_log("App: demo window closing")
         self.timer.stop()
+        # 停数据 worker：置停止标记并唤醒，等其排空队列后退出
+        self._data_worker_stop = True
+        self._data_queue_event.set()
+        self._data_worker.join(timeout=2)
         try:
             self._fft_executor.shutdown(wait=False)
         except Exception:
