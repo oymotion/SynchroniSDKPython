@@ -891,7 +891,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # Use Queue Data 模式（对齐 C++ Qt demo，默认关）：onData 回调线程只做
         # 实时滤波 + clone 入队，分发处理（写缓冲/丢包统计/四元数/手势）由
         # 数据 worker 线程从有界队列取出后执行；direct 模式则全部在回调线程内联完成
-        self._use_queue_data = False
+        self._use_clone_data = False
         self._data_queue = collections.deque()
         self._data_queue_lock = threading.Lock()
         self._data_queue_event = threading.Event()
@@ -1028,12 +1028,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.chk_auto_reconnect.setChecked(True)   # SensorProfile.autoReconnect 默认 True
         self.chk_auto_reconnect.toggled.connect(self._on_auto_reconnect_toggled)
         device_header_layout.addWidget(self.chk_auto_reconnect)
-        # Use Queue Data 开关（对齐 C++ Qt demo，默认不勾 = direct 模式）：
-        # 勾选后 onData 只做实时滤波 + clone 入队，worker 线程再分发到显示缓冲
-        self.chk_use_queue_data = QtWidgets.QCheckBox("Use Queue Data")
-        self.chk_use_queue_data.setChecked(False)
-        self.chk_use_queue_data.toggled.connect(self._on_use_queue_data_toggled)
-        device_header_layout.addWidget(self.chk_use_queue_data)
+        # Use Clone Data 开关（对齐 C++ Qt demo，默认不勾 = 不Clone,高性能）：
+        self.chk_use_clone_data = QtWidgets.QCheckBox("Use Clone Data")
+        self.chk_use_clone_data.setChecked(False)
+        self.chk_use_clone_data.toggled.connect(self._on_use_clone_data_toggled)
+        device_header_layout.addWidget(self.chk_use_clone_data)
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
         device_header_layout.addWidget(self.btn_multi_start)
@@ -1314,10 +1313,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         for state in self.device_states.values():
             state.sensor.autoReconnect = checked
 
-    def _on_use_queue_data_toggled(self, checked: bool):
+    def _on_use_clone_data_toggled(self, checked: bool):
         # direct / queue 模式切换：队列中残留批次继续由 worker 消费，
         # 两模式的缓冲写入路径相同，无需清空
-        self._use_queue_data = checked
+        self._use_clone_data = checked
         self._app_log(f"User: use queue data {'ON' if checked else 'OFF'}")
 
     def _on_dongle_check_result(self, result: str):
@@ -1824,7 +1823,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         state = self.device_states.get(addr)
         if state is None:
             return
-        use_queue = self._use_queue_data
+        use_clone = self._use_clone_data
         for data in data_list:
             if not (data and data.channelSamples):
                 continue
@@ -1836,18 +1835,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 state.set_live_filter_band(self._filter_band)
             # 实时滤波必须在 onData 中完成：queue 模式入队的数据已是滤波结果
             state.filter_sensor_data(data)
-            if use_queue:
+            if use_clone:
                 # 回调返回后 SDK 对象池会复用这批 SensorData，入队必须深拷贝
                 self._enqueue_data(addr, data.clone())
             else:
-                self._dispatch_sensor_data(addr, data)
+                # 回调返回后 SDK 对象池会复用这批 SensorData，处理必须要快,否则会丢数据,表现为isDataValid()返回False
+                self._enqueue_data(addr, data) 
 
     def _dispatch_sensor_data(self, addr: str, data: SensorData):
         """单批数据的分发处理（写环形缓冲/丢包统计/四元数/手势）：
-        direct 模式在 SDK 回调线程内联调用；queue 模式由数据 worker 线程调用。"""
+        queue 模式由数据 worker 线程调用。"""
         state = self.device_states.get(addr)
         if state is None:
             return
+        if not data.isDataValid():
+            self._app_log(f"App: Your data process runs too slow: {data}", "W", data.getDeviceMac())
+            return
+
+        #获得数据批的绝对时间戳（秒为单位），用于计算数据批间隔、绘图横轴等,与LSL标准相同
+        LSLTimeStamp = data.getAbsTimeStampInSec(0,0)
+        
         if data.getDataType() == DataType.NTF_IMU:
             # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
             for sub in split_imu_aggregate(data):
