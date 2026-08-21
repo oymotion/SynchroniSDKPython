@@ -130,7 +130,7 @@ BIO_PLOT_CONFIG = [
 EEG_AXIS_COUNT = 8                     # EEG/EMG 模式右侧子图数
 PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
 
-SAMPLE_RATE_CANDIDATES = (250, 500)
+SAMPLE_RATE_CANDIDATES = (250, 500, 1000, 2000)
 
 
 class DeviceDataState:
@@ -1069,7 +1069,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self.value_labels: dict = {}
         self.value_box = QtWidgets.QGroupBox("Real-time Values")
-        self.value_layout = QtWidgets.QHBoxLayout()
+        self.value_layout = QtWidgets.QVBoxLayout()
         self.value_box.setLayout(self.value_layout)
 
         self.lost_packet_label = QtWidgets.QLabel("Packet Loss Stats: None")
@@ -1118,7 +1118,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         controls_layout.addLayout(device_info_layout)
 
         debug_log_group = QtWidgets.QGroupBox("Debug Log")
-        debug_log_layout = QtWidgets.QHBoxLayout()
+        debug_log_layout = QtWidgets.QVBoxLayout()
         self._debug_log_checkbox = QtWidgets.QCheckBox("Enable SDK Debug Log")
         self._debug_log_checkbox.setChecked(True)
         self._debug_log_checkbox.stateChanged.connect(self._on_debug_log_toggled)
@@ -1849,7 +1849,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if state is None:
             return
         if not data.isDataValid():
-            self._app_log(f"App: Your data process runs too slow: {data}", "W", data.getDeviceMac())
+            self._app_log(f"App: Your data process runs too slow: {data}", "W", data.getDeviceName())
             return
 
         #获得数据批的绝对时间戳（秒为单位），用于计算数据批间隔、绘图横轴等,与LSL标准相同
