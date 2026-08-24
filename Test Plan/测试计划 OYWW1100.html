@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>测试计划</title>
+<style>
+body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 20px; line-height: 1.6; color: #1f2328; }
+h1 { border-bottom: 2px solid #0969da; padding-bottom: 8px; }
+h2 { border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 28px; }
+h3 { margin-top: 22px; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+th { background: #0969da; color: #fff; text-align: left; padding: 8px 10px; }
+td { border: 1px solid #d0d7de; padding: 6px 10px; }
+tr:nth-child(even) td { background: #f6f8fa; }
+code { background: #eff1f3; padding: 2px 5px; border-radius: 4px; font-family: Consolas, "Courier New", monospace; font-size: 13px; }
+pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+blockquote { border-left: 4px solid #0969da; margin: 12px 0; padding: 4px 16px; color: #57606a; background: #f6f8fa; }
+</style>
+</head>
+<body>
+<h1>SynchroniSDKPython 测试计划</h1>
+<h2>1. 文档信息</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>被测对象</td>
+<td><code>sensor-sdk</code>（OYMotion / Synchroni BLE 传感器 Python SDK）</td>
+</tr>
+<tr>
+<td>目标版本</td>
+<td><strong>0.8.0</strong>（接口以 0.8.0 README 为准；Python 3.10~3.14）</td>
+</tr>
+<tr>
+<td>测试范围</td>
+<td>SensorController、SensorProfile、数据流、参数、多设备同步、Bin 录制/回放/解析、日志、电量</td>
+</tr>
+<tr>
+<td>文档状态</td>
+<td>计划（待评审）</td>
+</tr>
+<tr>
+<td>前置输入</td>
+<td><a href="../README.md">README.md</a>、<a href="../examples">examples</a>（console.py / async_console.py / multi_start_test.py / SynchroniSDKPython_DemoNewMulti*.py）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>说明：本计划为“测试计划文档”，仅定义测试策略与用例设计，不包含自动化脚本实现。用例字段遵循软硬件集成测试模板（正/逆/边界/组合/状态迁移/异常恢复）。</p>
+</blockquote>
+<hr />
+<h2>2. 测试范围与对象</h2>
+<h3>2.1 被测 SDK 模块</h3>
+<table>
+<thead>
+<tr>
+<th>模块</th>
+<th>公开接口（被测点）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>控制器 <code>SensorController</code></td>
+<td><code>isEnable</code>、<code>onEnableCallback</code>、<code>hasDeviceFoundCallback</code>、<code>onDeviceFoundCallback</code>、<code>startScan(period_in_ms)</code>、<code>scan(period_in_ms)</code>、<code>asyncScan</code>、<code>stopScan()</code>、<code>isScanning</code>、<code>requireSensor(device)</code>、<code>getSensor(mac)</code>、<code>getConnectedSensors()</code>、<code>getConnectedDevices()</code>、<code>getBLEBackendName()</code>、<code>checkSetupDongle()</code>、<code>multiStartDataNotification(...)</code>、<code>asyncMultiStartDataNotification(...)</code>、<code>multiStopDataNotification(...)</code>、<code>asyncMultiStopDataNotification(...)</code>、<code>getBinFileInfo(path)</code>、<code>replayBinFile(...)</code>、<code>pauseBinReplay/resumeBinReplay/stopBinReplay</code>、<code>parseBinToCsv(...)</code>、<code>setDebugEnabled(bool)</code>、<code>setLogPath(...)</code>、<code>log(msg, level)</code>、<code>getVersion()</code>、<code>terminate()</code></td>
+</tr>
+<tr>
+<td>设备 <code>SensorProfile</code></td>
+<td>回调 <code>onStateChanged/onErrorCallback/onPowerChanged/onDataCallback/onAutoReconnect/onDeviceInfoUpdate</code>、<code>autoReconnect</code>、<code>isReady</code>、<code>connect()/asyncConnect</code>、<code>disconnect()/asyncDisconnect</code>、<code>deviceState</code>、<code>BLEDevice</code>、<code>getDeviceInfo()</code>、<code>init(...)/asyncInit</code>、<code>hasInited</code>、<code>startDataNotification()/asyncStartDataNotification</code>、<code>stopDataNotification()/asyncStopDataNotification</code>、<code>isDataTransfering</code>、<code>getBatteryLevel()/asyncGetBatteryLevel</code>、<code>setParam/asyncSetParam</code>、<code>getParam/asyncGetParam</code>、<code>log(msg, level)</code></td>
+</tr>
+<tr>
+<td>枚举/数据结构</td>
+<td><code>DeviceStateEx</code>（Disconnected/Connecting/Connected/Ready/Disconnecting/Invalid）、<code>DataType</code>（16 种，见 2.3）、<code>DeviceInfo</code>、<code>SensorData</code>、<code>Sample</code>、<code>BLEDevice</code>（新字段/接口见 2.4）</td>
+</tr>
+</tbody>
+</table>
+<h3>2.2 支持的设备类型清单（多设备）</h3>
+<p>SDK 支持多设备并存，且同一次扫描/连接/起流可操作多台。由于本仓库未提供具体设备型号清单，以下按<strong>可观测的区分维度</strong>列出“设备类型”，每类都需要纳入计划：</p>
+<h4>A. 按连接/协议/命名区分</h4>
+<table>
+<thead>
+<tr>
+<th>设备类型</th>
+<th>识别特征</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OYM 命名设备</td>
+<td>广播名前缀 <code>OY</code>（如 <code>OYWW1000</code>）</td>
+<td>传统 OYMotion 设备</td>
+</tr>
+<tr>
+<td>OB 命名设备</td>
+<td>广播名前缀 <code>OB</code>（如 <code>OB6000</code>）</td>
+<td>多设备同步测试的典型目标设备</td>
+</tr>
+<tr>
+<td>Sync 命名设备</td>
+<td>广播名前缀 <code>Sync</code></td>
+<td>console.py 中与 <code>OB</code> 并列过滤</td>
+</tr>
+<tr>
+<td>RFSTAR 芯片设备</td>
+<td>bin 配置 <code>chip_type=RFSTAR</code>；起流/停流走 <code>set_subscription</code> 命令</td>
+<td>与 OYM 的 CCCD 写路径不同</td>
+</tr>
+<tr>
+<td>NeuCir 设备</td>
+<td>支持 <code>NEUCIR_SET_MODE</code>/<code>NEUCIR_APP_CONTROL</code> 参数</td>
+<td>远程控制类设备</td>
+</tr>
+</tbody>
+</table>
+<h4>B. 按数据模态/能力区分（由 <code>DeviceInfo.*ChannelCount/*SampleRate</code> 决定）</h4>
+<table>
+<thead>
+<tr>
+<th>设备类型</th>
+<th>关键能力字段 / 数据流</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>传统 EMG 设备</td>
+<td><code>Emg*</code>，<code>NTF_EMG</code></td>
+<td><code>NTF_GEST</code> 与 <code>NTF_EMG</code> 互斥</td>
+</tr>
+<tr>
+<td>新 EMG 设备</td>
+<td><code>Emg*</code>，<code>NTF_IMU</code>（聚合 acc/gyro/euler/quat）+ <code>NTF_GEST</code></td>
+<td><code>lostPackageCount</code> 非 0 仅新 EMG 设备</td>
+</tr>
+<tr>
+<td>EEG 设备</td>
+<td><code>Eeg*</code>，<code>NTF_EEG</code></td>
+<td>支持 <code>EEG_SAMPLE_RATE</code></td>
+</tr>
+<tr>
+<td>ECG 设备</td>
+<td><code>Ecg*</code>，<code>NTF_ECG</code></td>
+<td>与 EEG 采样率绑定</td>
+</tr>
+<tr>
+<td>呼吸 BRTH 设备</td>
+<td><code>Brth*</code>，<code>NTF_BRTH</code></td>
+<td>单位 uV</td>
+</tr>
+<tr>
+<td>PPG/SpO2 设备</td>
+<td><code>Ppg*</code>/<code>Spo2*</code>，<code>NTF_PPG</code> + <code>NTF_SPO2</code></td>
+<td>常含 EEG fp1/fp2</td>
+</tr>
+<tr>
+<td>IMU 设备</td>
+<td><code>Acc*/Gyro*/Euler*/Quat*</code>，<code>NTF_ACC/GYRO/EULER/QUAT</code></td>
+<td>传统四路独立流</td>
+</tr>
+<tr>
+<td>磁角度 MagAngle 设备</td>
+<td><code>MagAngle*</code>，<code>NTF_MAG_ANGLE_DATA</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td>阻抗 Impedance 设备</td>
+<td><code>Impe*</code>，<code>NTF_IMPEDANCE</code> / <code>NTF_IMPEDANCE_EXT</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>上述两类维度是<strong>正交</strong>的：同一物理设备可能同时属于“OB 命名” + “新 EMG 设备” + “IMU 设备”。计划中“连接/生命周期/状态机”用例按 A 类逐类型覆盖，“数据流/参数”用例按 B 类逐模态覆盖。</p>
+</blockquote>
+<h3>2.3 数据流类型清单（DataType）</h3>
+<p><code>NTF_ACC</code>、<code>NTF_GYRO</code>、<code>NTF_EULER_DATA</code>、<code>NTF_QUATERNION</code>、<code>NTF_GEST</code>、<code>NTF_EMG</code>、<code>NTF_MAG_ANGLE_DATA</code>、<code>NTF_EEG</code>、<code>NTF_ECG</code>、<code>NTF_IMPEDANCE</code>、<code>NTF_IMU</code>、<code>NTF_ADS</code>、<code>NTF_BRTH</code>、<code>NTF_IMPEDANCE_EXT</code>、<code>NTF_SPO2</code>、<code>NTF_PPG</code>。</p>
+<h3>2.4 数据结构新增字段/接口（0.8.0）</h3>
+<p><strong><code>DeviceInfo</code>（<code>getDeviceInfo()</code> 返回）新增字段</strong></p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>EmgMaxSampleRate</code> / <code>EegMaxSampleRate</code> / <code>EcgMaxSampleRate</code></td>
+<td>设备能力上报的最大采样率（0 = 未上报）</td>
+</tr>
+<tr>
+<td><code>ImuChannelCount</code> / <code>ImuSampleRate</code></td>
+<td>聚合 <code>NTF_IMU</code> 流（仅新 EMG 设备；0 = 无聚合流，改用四路独立 ACC/GYRO/EULER/QUAT）</td>
+</tr>
+<tr>
+<td><code>ConnectionIntervalMs</code> / <code>PeripheralLatency</code> / <code>SupervisionTimeoutMs</code></td>
+<td>BLE 链路协商参数（仅 bumble dongle 后端；0/-1/0 = 未知）</td>
+</tr>
+</tbody>
+</table>
+<p><strong><code>SensorData</code> 新增接口</strong></p>
+<ul>
+<li>元数据：<code>getDeviceMac()</code> / <code>getChannelMask()</code> / <code>isDataValid()</code>（Python 恒为 True）。</li>
+<li>整批：<code>channelSamples</code> / <code>startSampleIndex</code>（只读）、<code>clone()</code>（深拷贝）。</li>
+<li>单点访问器（<code>ci</code>=通道索引，<code>si</code>=样本索引）：<code>getChannelSample(ci,si)</code> 返回 <code>Sample</code>；<code>getData(ci,si)</code> / <code>getRawData(ci,si)</code> / <code>getImpedance(ci,si)</code> / <code>getSaturation(ci,si)</code> / <code>getSampleIndex(ci,si)</code> / <code>getTimeStampInMs(ci,si)</code> / <code>isLost(ci,si)</code>。</li>
+</ul>
+<p><strong><code>Sample</code> 新增只读字段</strong>：<code>rawData</code> / <code>impedance</code> / <code>saturation</code> / <code>channelIndex</code> / <code>timeStampInMs</code>（原有 <code>data</code> / <code>sampleIndex</code> / <code>isLost</code>）。</p>
+<p><strong>回调交付形式</strong>：<code>onDataCallback</code> 每次交付 <code>list[SensorData]</code>（0.5.0 起为 list，非单个对象）。</p>
+<hr />
+<h2>3. 测试环境与前置条件</h2>
+<h3>3.1 硬件环境</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>被测设备</td>
+<td>上述 2.2 列出的各类型设备各 ≥1 台（若同型号有多台则 ≥2 台用于多设备同步）</td>
+</tr>
+<tr>
+<td>蓝牙接口</td>
+<td>原生 BLE（bleak 后端）或 USB BLE dongle（bumble 后端，如 <code>10d7:b012</code>/<code>33fa:0012</code>）</td>
+</tr>
+<tr>
+<td>测试主机</td>
+<td>Windows 10/11（本环境）、Linux、macOS（跨平台用例）</td>
+</tr>
+<tr>
+<td>仪器（人工用例）</td>
+<td>见 §5.9</td>
+</tr>
+</tbody>
+</table>
+<h3>3.2 软件环境</h3>
+<ul>
+<li>Python 3.10 ~ 3.14（sensor-sdk 0.8.0 提供 <code>cp310</code>~<code>cp314</code> 编译 wheel；建议 3.12+）</li>
+<li><code>pip install --upgrade sensor-sdk</code>（0.8.0；依赖 <code>bleak&gt;=3.0.2</code>、<code>bumble==0.0.233</code>、<code>libusb1</code>、<code>numpy</code> 等）</li>
+<li>示例依赖：<code>scipy</code>、<code>matplotlib</code>、<code>PyQt5</code>（可选，用于 Qt demo）</li>
+</ul>
+<h3>3.3 通用前置条件</h3>
+<ul>
+<li>蓝牙已开启，或 dongle 已正确绑定驱动（<code>checkSetupDongle()</code> 返回 <code>OK</code>）。</li>
+<li>设备已上电、在扫描范围内、广播名符合预期前缀。</li>
+<li>每次测试结束调用 <code>SensorControllerInstance.terminate()</code>；异常退出（Ctrl+C）需经 <code>terminate()</code> 释放资源。</li>
+<li>测试间运动/数据类用例间隔 ≥100ms，避免指令错乱。</li>
+</ul>
+<hr />
+<h2>4. 测试策略</h2>
+<h3>4.1 测试维度（12 维度）</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>覆盖重点</th>
+<th>优先级</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>功能</td>
+<td>全部公开 API，按正/逆/边界/组合/状态迁移设计</td>
+<td>P0</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>往返延迟、吞吐量、长时间稳定性、冷启动</td>
+<td>P1</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>安全性</td>
+<td>参数边界、异常恢复、急停/断连保护</td>
+<td>P0</td>
+<td>自动+人工</td>
+</tr>
+<tr>
+<td>健壮性</td>
+<td>并发、断连重连、不完整帧容错、资源泄漏</td>
+<td>P1</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>通信专项</td>
+<td>dongle 后端选择、MTU、帧分片、端口边界</td>
+<td>P0</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>兼容性</td>
+<td>跨平台、Python 版本、不同设备类型</td>
+<td>P2</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>系统维护</td>
+<td><code>terminate()</code>、日志开关、bin 导出、<code>checkSetupDongle</code></td>
+<td>P1-P2</td>
+<td>自动</td>
+</tr>
+<tr>
+<td>不适用</td>
+<td>不可逆/需密钥操作</td>
+<td>—</td>
+<td>人工</td>
+</tr>
+<tr>
+<td>信号完整性</td>
+<td>BLE 波形、时延、同步对齐（物理波形归硬件团队；同步对齐归 SDK 软件用例）</td>
+<td>P1</td>
+<td>人工+仪器</td>
+</tr>
+<tr>
+<td>电源</td>
+<td>设备供电、上掉电（归硬件团队）</td>
+<td>P1</td>
+<td>人工</td>
+</tr>
+<tr>
+<td>环境可靠性</td>
+<td>温湿度运行（归硬件团队）</td>
+<td>P2</td>
+<td>人工</td>
+</tr>
+<tr>
+<td>老化</td>
+<td>连续运行 24h/72h（硬件寿命归硬件团队；SDK 长稳见 <code>DATA-PERF-002</code>）</td>
+<td>P2</td>
+<td>半自动</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>备注：「信号完整性（物理波形）」「电源」「环境可靠性」「老化（硬件寿命）」等维度<strong>超出 SDK 软件测试范围</strong>，仅作记录、归口硬件/产品可靠性团队。其中与 SDK 相关的软件行为已并入对应用例：断电/上掉电重连 → <code>DEV-SM-012</code> / <code>HW-MAN-003</code>；长稳 → <code>DATA-PERF-002</code>；多设备同步对齐/时延 → <code>MULTI-FUNC-004/008/009</code>。</p>
+</blockquote>
+<h3>4.2 用例设计方法（强制）</h3>
+<p>每个数值参数用<strong>边界值 6 点法</strong>；非法输入用<strong>等价类无效值 + 错误推测</strong>；多参数用<strong>判定表</strong>；设备生命周期用<strong>状态迁移</strong>；断连/断电用<strong>异常恢复</strong>。涉及数值型参数（如 <code>init(packageSampleCount, powerRefreshInterval)</code>、<code>startScan(period_in_ms)</code>、<code>multiStartDataNotification(maxDelayDispersionMs, maxAttempts, timeout)</code>、<code>EEG_SAMPLE_RATE</code>）必须覆盖 6 点边界。</p>
+<h3>4.3 执行方式划分</h3>
+<ul>
+<li><strong>auto</strong>：无需人工/仪器，脚本可判定。</li>
+<li><strong>semi-auto</strong>：需人工触发物理动作（如拔 dongle、移动设备、断电），脚本采集与判定。</li>
+<li><strong>manual</strong>：需仪器或不可逆操作，人工执行并记录。</li>
+</ul>
+<hr />
+<h2>5. 测试用例设计</h2>
+<h3>5.1 SensorController（控制器）</h3>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CTRL-FUNC-001</td>
+<td>蓝牙未开启时 <code>isEnable==False</code>，<code>startScan</code> 应被拒绝/提示</td>
+<td>P0</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-002</td>
+<td>蓝牙开启时 <code>isEnable==True</code>，<code>onEnableCallback</code> 随开关状态触发</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-003</td>
+<td><code>startScan(period_in_ms)</code> 成功返回 True，<code>isScanning</code> 翻转</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-004</td>
+<td><code>scan(period_in_ms)</code> / <code>asyncScan</code> 单次扫描返回 <code>list[BLEDevice]</code>，含 <code>Name/Address/RSSI</code></td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-005</td>
+<td><code>onDeviceFoundCallback</code> 每 <code>period_in_ms</code> 周期触发一次，返回未连接设备</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-006</td>
+<td><code>stopScan()</code> 后 <code>isScanning==False</code>，回调停止</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-007</td>
+<td><code>requireSensor(有效 BLEDevice)</code> 返回 SensorProfile；无效/空返回 None</td>
+<td>P0</td>
+<td>正/逆</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-008</td>
+<td><code>getSensor(已创建 mac)</code> 返回 profile；未创建返回 None</td>
+<td>P1</td>
+<td>正/逆</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-009</td>
+<td><code>getConnectedSensors()</code> / <code>getConnectedDevices()</code> 返回当前已连接集合</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-010</td>
+<td><code>getBLEBackendName()</code> 返回 <code>bumble</code> 或 <code>bleak</code>，与 <code>SENSOR_SDK_BLE_BACKEND</code> 一致</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-011</td>
+<td><code>checkSetupDongle()</code> 在无 dongle 时执行引导并返回 <code>OK: N</code> 或 <code>Error: ...</code></td>
+<td>P1</td>
+<td>正向</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-012</td>
+<td><code>getVersion()</code> 返回非空版本号</td>
+<td>P2</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-FUNC-013</td>
+<td><code>terminate()</code> 正常释放，重复调用不抛异常</td>
+<td>P0</td>
+<td>异常恢复</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-BND-001</td>
+<td><code>startScan(period_in_ms)</code> 6 点边界：<code>0</code>、<code>1</code>、<code>MAX-1</code>、<code>MAX</code>、<code>-1</code>、<code>MAX+1</code></td>
+<td>P1</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>CTRL-ROB-001</td>
+<td>扫描期间重复 <code>startScan</code> / 反复 <code>stopScan</code>，无死锁无异常</td>
+<td>P1</td>
+<td>异常恢复</td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 设备连接 / 状态机（按 §2.2-A 每类型逐项执行）</h3>
+<blockquote>
+<p>下列用例在 OYM / OB / Sync / RFSTAR / NeuCir 每类设备上各执行一遍。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DEV-SM-001</td>
+<td><code>connect()</code> 成功返回 True，状态迁移 <code>Disconnected→Connecting→Connected→Ready</code></td>
+<td>P0</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-002</td>
+<td><code>connect()</code> 失败返回 False，<code>onErrorCallback</code> 收到原因</td>
+<td>P0</td>
+<td>异常恢复</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-003</td>
+<td>扫描到非目标前缀设备时 <code>requireSensor</code> 后不误连接</td>
+<td>P1</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-004</td>
+<td><code>disconnect()</code> 返回 True，状态迁移 <code>Ready→Disconnecting→Disconnected</code>，<code>onStateChanged</code> 触发</td>
+<td>P0</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-005</td>
+<td>起流中调用 <code>disconnect()</code> 自动先 <code>stopDataNotification</code> 再断开</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-006</td>
+<td><code>deviceState</code> 各枚举值语义正确（Ready 前不发送命令）</td>
+<td>P0</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-007</td>
+<td><code>BLEDevice</code> 的 Name/Address/RSSI 与扫描结果一致</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-008</td>
+<td><code>autoReconnect=True</code>（默认）异常断链后自动 <code>connect→init→恢复 setParam→startDataNotification</code></td>
+<td>P0</td>
+<td>异常恢复</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>DEV-SM-009</td>
+<td><code>autoReconnect=False</code> 异常断链后不自动重连</td>
+<td>P1</td>
+<td>异常恢复</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>DEV-SM-010</td>
+<td><code>onAutoReconnect(restore=True)</code> 自定义恢复路径生效，返回 True 跳过默认流程</td>
+<td>P1</td>
+<td>异常恢复</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>DEV-SM-011</td>
+<td>多台设备同时 <code>connect()</code>，互不干扰（并发）</td>
+<td>P0</td>
+<td>组合</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-012</td>
+<td>目标设备突然断电/超出范围：<code>onStateChanged(Disconnected)</code> 与 <code>onErrorCallback</code> 触发</td>
+<td>P0</td>
+<td>异常恢复</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>DEV-SM-013</td>
+<td><code>isReady</code> 属性等于 <code>deviceState == DeviceStateEx.Ready</code>（Ready 后 True，断开后 False）</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DEV-SM-014</td>
+<td><code>onDeviceInfoUpdate</code> 在 init 后链路参数更新（bumble 后端）或 <code>EEG_SAMPLE_RATE</code> 变更时触发，且返回的 <code>DeviceInfo</code> 已就地更新</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.3 数据流（按 §2.2-B 每模态逐项执行）</h3>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DATA-FUNC-001</td>
+<td><code>init(packageSampleCount, powerRefreshInterval)</code> 成功返回 True，<code>hasInited==True</code></td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-002</td>
+<td>未 <code>connect</code>/<code>Ready</code> 前调用 <code>init</code>/<code>startDataNotification</code> 应失败</td>
+<td>P0</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-003</td>
+<td><code>startDataNotification()</code> 成功后 <code>isDataTransfering==True</code>，<code>onDataCallback</code> 按批触发</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-004</td>
+<td><code>stopDataNotification()</code> 成功后 <code>isDataTransfering==False</code>，回调停止</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-005</td>
+<td>每个 <code>DataType</code> 流（§2.3）均能收到对应 <code>SensorData</code>，<code>getDataType()</code> 匹配</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-006</td>
+<td><code>SensorData</code> 元数据（<code>getDeviceMac/getDataType/getSampleRate/getChannelCount/getChannelMask/getSampleCount/getLostPackageCount/getStartTimeStamp/getDelay/isDataValid</code>）数值合法</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-007</td>
+<td><code>channelSamples</code>/<code>getChannelSample(ci,si)</code>/<code>getData(ci,si)</code>/<code>getRawData(ci,si)</code>/<code>getImpedance(ci,si)</code>/<code>getSaturation(ci,si)</code>/<code>getSampleIndex(ci,si)</code>/<code>getTimeStampInMs(ci,si)</code>/<code>isLost(ci,si)</code> 读取一致，<code>sampleIndex</code> 单调递增</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-008</td>
+<td><code>sample.isLost</code> 置位样本正确标记，<code>getLostPackageCount</code> 与丢包数一致</td>
+<td>P1</td>
+<td>异常恢复</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-009</td>
+<td>每批样本数 ≈ <code>packageSampleCount</code>（允许边界批不足）</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-010</td>
+<td>新 EMG 设备 <code>NTF_IMU</code> 聚合批通道布局（acc 0-2/gyro 3-5/euler 6-8/quat 9-12）正确</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-011</td>
+<td>传统 EMG 设备 <code>NTF_GEST</code> 与 <code>NTF_EMG</code> 互斥（同时 ON 只生效其一）</td>
+<td>P1</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-012</td>
+<td><code>SensorData.clone()</code> 返回深拷贝，修改副本不影响原对象</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-FUNC-013</td>
+<td><code>Sample</code> 新增字段（<code>rawData/impedance/saturation/channelIndex/timeStampInMs</code>）与单点访问器（<code>getData/getImpedance/getSaturation/getTimeStampInMs</code>）一致</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-BND-001</td>
+<td><code>init(packageSampleCount)</code> 6 点边界：<code>1</code>、<code>2</code>、<code>MAX-1</code>、<code>MAX</code>、<code>0</code>、<code>MAX+1</code></td>
+<td>P1</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-BND-002</td>
+<td><code>init(_, powerRefreshInterval)</code> 6 点边界（0、1、上限邻域、上限、负、超上限）</td>
+<td>P1</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-PERF-001</td>
+<td>实测采样率与标称采样率偏差 ≤ 容差（各模态）</td>
+<td>P1</td>
+<td>性能</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>DATA-PERF-002</td>
+<td>连续起流 ≥ 30min 无内存/句柄泄漏、无掉速</td>
+<td>P1</td>
+<td>性能</td>
+<td>semi-auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.4 setParam / getParam</h3>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PARAM-FUNC-001</td>
+<td>每个 <code>NTF_*</code> 键 <code>setParam("ON"/"OFF")</code> 返回 <code>OK</code>，<code>getParam("NTF")</code> 状态一致</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-002</td>
+<td>每个 <code>FILTER_*</code> 键 <code>setParam("ON"/"OFF")</code> 返回 <code>OK</code>，<code>getParam("FILTER")</code> 一致</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-003</td>
+<td><code>setParam("NTF_IMU")</code> 联动更新四个 <code>NTF_GFORCE_*</code>；反之亦然</td>
+<td>P1</td>
+<td>组合</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-004</td>
+<td><code>setParam("EEG_SAMPLE_RATE")</code> 取 <code>EEG_SAMPLE_RATE_LIST</code> 中值成功；EEG/ECG 同写</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-005</td>
+<td><code>setParam("EEG_SAMPLE_RATE")</code> 传不支持值返回 <code>Error: unsupported sample rate ...</code></td>
+<td>P0</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-006</td>
+<td><code>getParam("EEG_SAMPLE_RATE")</code> 返回当前采样率；<code>getParam("EEG_SAMPLE_RATE_LIST")</code> 返回管道分隔可选列表；不支持返回 <code>Error</code></td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-007</td>
+<td>起流中修改 <code>NTF_*</code>/<code>FILTER_*</code>/<code>EEG_SAMPLE_RATE</code> 自动停流重起并生效</td>
+<td>P0</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-008</td>
+<td><code>setParam</code> 传未知 key 返回以 <code>Error</code> 开头</td>
+<td>P1</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-009</td>
+<td><code>NEUCIR_SET_MODE</code>/<code>NEUCIR_APP_CONTROL</code>（NeuCir 设备）生效</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-FUNC-010</td>
+<td><code>DEBUG_BLE_DATA_PATH</code>/<code>DEBUG_LOG_PATH</code> 设置/读取/关闭</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>PARAM-BND-001</td>
+<td><code>setParam</code> 各 key 的非法 value（空串、<code>ON/OFF</code> 以外、大小写、None）</td>
+<td>P1</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.5 多设备同步</h3>
+<blockquote>
+<p>签名（0.8.0）：<code>multiStartDataNotification(sensors, timeout=30.0, maxDelayDispersionMs=5, maxAttempts=3)</code>；<code>multiStopDataNotification(sensors, timeout=10.0)</code>。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MULTI-FUNC-001</td>
+<td><code>multiStartDataNotification([s1,s2])</code> 返回 <code>{mac: bool}</code>，两台同时起流</td>
+<td>P0</td>
+<td>组合</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-002</td>
+<td><code>multiStopDataNotification([s1,s2])</code> 返回 <code>{mac: bool}</code>，两台同时停流</td>
+<td>P0</td>
+<td>组合</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-003</td>
+<td>某台未 <code>Ready</code>/未 <code>init</code> 时，其余设备不受影响仍可起流</td>
+<td>P0</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-004</td>
+<td>首包时差 ≤ <code>maxDelayDispersionMs</code>（默认 5ms）通过；超差自动停止并重试至 <code>maxAttempts</code></td>
+<td>P0</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-005</td>
+<td><code>maxDelayDispersionMs=-1</code> 跳过时差校验，仅要求首包到达</td>
+<td>P1</td>
+<td>边界</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-006</td>
+<td>混合型号设备用放宽参数（<code>timeout=60,maxDelayDispersionMs=-1,maxAttempts=5</code>）</td>
+<td>P1</td>
+<td>组合</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-007</td>
+<td>已起流设备再次 <code>multiStart</code>（restart 语义：先停后与空闲设备同刻起流）</td>
+<td>P1</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-008</td>
+<td>bumble 后端 <code>SyncWriteGate</code> 对齐下发；bleak 后端并发下发（两后端各测）</td>
+<td>P0</td>
+<td>通信专项</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>MULTI-FUNC-009</td>
+<td>跨设备 <code>startTimeStamp</code> 散布与 <code>getDelay()</code> 符合预期</td>
+<td>P1</td>
+<td>性能</td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.6 Bin 录制 / 回放 / 解析</h3>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BIN-FUNC-001</td>
+<td>成功连接后自动生成 <code>.bin</code>（<code>{DeviceName}_{MAC}_{时间戳}.bin</code>）</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-002</td>
+<td><code>getBinFileInfo(有效 bin)</code> 返回含 <code>device_mac/device_name/chip_type/replay_duration</code> 的 dict</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-003</td>
+<td><code>getBinFileInfo(不存在/无 config)</code> 返回 None</td>
+<td>P0</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-004</td>
+<td><code>replayBinFile(path, sensor, realtime=True)</code> 按原始节奏回放，<code>onDataCallback</code> 收到数据</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-005</td>
+<td><code>replayBinFile(realtime=False)</code> 全速回放，回放数据批数与实收一致</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-006</td>
+<td><code>pauseBinReplay</code>/<code>resumeBinReplay</code>/<code>stopBinReplay</code> 返回 <code>OK</code>，暂停/恢复/中止生效</td>
+<td>P1</td>
+<td>状态迁移</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-007</td>
+<td>目标 sensor 正在实时起流时拒绝回放</td>
+<td>P1</td>
+<td>逆向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-008</td>
+<td><code>parseBinToCsv</code> 生成 CSV，含 <code>raw/cmd_send/cmd_recv/event/parsed</code> 行，表头符合约定</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-FUNC-009</td>
+<td>回放还原的 <code>startTimeStamp/delay</code> 与实收值一致（multi_start_test.py 场景）</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BIN-ROB-001</td>
+<td>磁盘 &lt; 100MB 或写盘错误时跳过/停止录制且不影响实时流</td>
+<td>P2</td>
+<td>异常恢复</td>
+<td>semi-auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.7 电量 / 日志 / 调试</h3>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BATT-FUNC-001</td>
+<td><code>getBatteryLevel()</code> 返回 0~100；无有效读数返回 -1</td>
+<td>P0</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BATT-FUNC-002</td>
+<td><code>onPowerChanged</code> 上报 0~100，±2% 滞回（1% 抖动被过滤），不报 -1</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>BATT-FUNC-003</td>
+<td><code>powerRefreshInterval</code> 决定 <code>onPowerChanged</code> 周期</td>
+<td>P1</td>
+<td>性能</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>LOG-FUNC-001</td>
+<td><code>setDebugEnabled(True)</code> 创建 controller log；<code>False</code> 关闭</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>LOG-FUNC-002</td>
+<td><code>setLogPath(True, dir)</code> 创建目录；指向已存在文件被拒绝</td>
+<td>P1</td>
+<td>正/逆</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>LOG-FUNC-003</td>
+<td><code>DEBUG_LOG_PATH=True</code> 生成每设备 profile log；<code>getParam("DEBUG_LOG_PATH")</code> 返回路径</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>LOG-FUNC-004</td>
+<td>早期 scan/connect 日志不丢失（buffer 回放）</td>
+<td>P2</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+<tr>
+<td>LOG-FUNC-005</td>
+<td><code>SensorController.log(msg, level)</code> / <code>SensorProfile.log(msg, level)</code> 写入应用日志（level <code>D/I/W/E</code>），带 <code>[App]</code> 标记；profile 未启用时回退 controller log</td>
+<td>P1</td>
+<td>正向</td>
+<td>auto</td>
+</tr>
+</tbody>
+</table>
+<h3>5.8 边界值分析汇总（6 点法）</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>范围</th>
+<th>B1~B4（合法）</th>
+<th>B5/B6（非法）</th>
+<th>补充</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>startScan(period_in_ms)</code></td>
+<td>&gt;0</td>
+<td>min、min+1、max-1、max</td>
+<td>min-1(0/负)、max+1</td>
+<td>None/字符串</td>
+</tr>
+<tr>
+<td><code>init(packageSampleCount)</code></td>
+<td>≥1</td>
+<td>1、2、N-1、N</td>
+<td>0、N+1</td>
+<td>None/字符串</td>
+</tr>
+<tr>
+<td><code>init(powerRefreshInterval)</code></td>
+<td>≥0</td>
+<td>0、1、N-1、N</td>
+<td>-1、N+1</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code>multiStartDataNotification(maxDelayDispersionMs)</code></td>
+<td>≥0 或 -1 跳过</td>
+<td>0、1、N-1、N、-1</td>
+<td>—</td>
+<td>非整型</td>
+</tr>
+<tr>
+<td><code>multiStartDataNotification(maxAttempts)</code></td>
+<td>≥1</td>
+<td>1、2、N-1、N</td>
+<td>0、N+1</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>multiStartDataNotification(timeout)</code></td>
+<td>&gt;0</td>
+<td>0.1、1、N-1、N</td>
+<td>0、负</td>
+<td>默认 30.0</td>
+</tr>
+<tr>
+<td><code>EEG_SAMPLE_RATE</code></td>
+<td>列表内值</td>
+<td>每个列表值</td>
+<td>列表外值</td>
+<td>空串</td>
+</tr>
+<tr>
+<td><code>getBatteryLevel()</code> 返回</td>
+<td>0~100 或 -1</td>
+<td>0、1、99、100</td>
+<td>—</td>
+<td>-1 表示无读数</td>
+</tr>
+</tbody>
+</table>
+<h3>5.9 人工硬件用例（manual）</h3>
+<blockquote>
+<p>说明：<code>HW-MAN-003</code>（供电电压/时序）、<code>HW-MAN-004</code>（老化寿命）、<code>HW-MAN-005</code>（高低温）偏硬件可靠性，<strong>超出 SDK 软件测试范围</strong>、归口硬件团队；其中 SDK 软件响应部分（断电/上掉电重连）由 <code>DEV-SM-012</code> 覆盖。<code>HW-MAN-001/002</code>（BLE 链路稳定性、dongle 驱动绑定）与 SDK 通信直接相关，保留在 SDK 测试内。</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>case_id</th>
+<th>标题</th>
+<th>优先级</th>
+<th>类型</th>
+<th>执行方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HW-MAN-001</td>
+<td>BLE 通信链路 RSSI/连接稳定性人工验证（各设备类型）</td>
+<td>P1</td>
+<td>正向</td>
+<td>manual</td>
+</tr>
+<tr>
+<td>HW-MAN-002</td>
+<td>USB BLE dongle 驱动绑定与 <code>checkSetupDongle()</code> 引导流程</td>
+<td>P1</td>
+<td>正向</td>
+<td>manual</td>
+</tr>
+<tr>
+<td>HW-MAN-003</td>
+<td>设备供电电压/上掉电时序与 SDK 重连恢复</td>
+<td>P1</td>
+<td>异常恢复</td>
+<td>manual</td>
+</tr>
+<tr>
+<td>HW-MAN-004</td>
+<td>24h 连续起流老化稳定性</td>
+<td>P2</td>
+<td>老化</td>
+<td>semi-auto</td>
+</tr>
+<tr>
+<td>HW-MAN-005</td>
+<td>高低温环境运行（各设备类型）</td>
+<td>P2</td>
+<td>环境可靠性</td>
+<td>manual</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>完整人工用例（仪器清单、环境、接线、逐步操作、判定标准、后置处理）在进入执行阶段时按 §5.9 模板单独展开为 <code>test_manual_hardware.md</code>。</p>
+</blockquote>
+<hr />
+<h2>6. 每设备类型测试矩阵（汇总）</h2>
+<table>
+<thead>
+<tr>
+<th>设备类型</th>
+<th style="text-align: center;">连接/状态机</th>
+<th style="text-align: center;">数据流</th>
+<th style="text-align: center;">参数</th>
+<th style="text-align: center;">多设备同步</th>
+<th style="text-align: center;">人工</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OYM 命名设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>OB 命名设备（如 OB6000）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>Sync 命名设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>RFSTAR 芯片设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>NeuCir 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（NEUCIR_*）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>传统 EMG 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（EMG/GEST 互斥）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>新 EMG 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（NTF_IMU 聚合）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>EEG 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（EEG）</td>
+<td style="text-align: center;">✓（采样率）</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>ECG 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（ECG）</td>
+<td style="text-align: center;">✓（采样率绑定）</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>BRTH 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（BRTH）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>PPG/SpO2 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（PPG/SpO2/EEG）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>IMU 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（ACC/GYRO/Euler/Quat）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>MagAngle 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（MAG_ANGLE）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+<tr>
+<td>Impedance 设备</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓（IMPEDANCE/EXT）</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>7. 判定标准与通过率目标</h2>
+<ul>
+<li>单用例通过标准：<code>expected</code> 全部命中，且无未捕获异常、无内存/句柄泄漏。</li>
+<li>P0 用例：<strong>100% 通过</strong>；P1：≥95%；P2：≥90%。</li>
+<li>所有数值参数必须通过 6 点边界值分析；所有设备类型必须覆盖连接/数据流用例。</li>
+<li>失败用例须保留 SDK 日志（controller/profile log）与 <code>.bin</code>，用于复现。</li>
+</ul>
+<hr />
+<h2>8. 风险与安全注意事项</h2>
+<ol>
+<li><strong>连接/断电/断连用例</strong>：执行前确认目标设备无人员接触电极/运动部件；异常注入（拔 dongle、断电）仅允许对测试专用设备执行。</li>
+<li><strong>多设备同步</strong>：多台设备同时起流时，确保设备固定、运动范围无人员。</li>
+<li><strong>破坏性/不可逆操作</strong>（如复位、改 ID、标定等）<strong>不纳入自动化</strong>，归入人工并按文档单独评估。</li>
+<li><strong><code>terminate()</code> 必须调用</strong>：所有脚本（含异常退出路径）须在 finally 中调用，避免 BLE 子进程/句柄泄漏。</li>
+<li><strong>测试间留足间隔</strong>：起流/停流/连接类操作之间 ≥100ms。</li>
+<li><strong>配置项外置</strong>：串口/dongle/设备前缀/MAC 等写入独立 <code>config.py</code>，不硬编码。</li>
+<li><strong>后端兼容</strong>：<code>bumble</code>（dongle）与 <code>bleak</code>（原生）两后端各跑一遍通信/同步用例。</li>
+<li><strong>回调线程安全</strong>：<code>onDataCallback</code> 单线程顺序交付，<code>onStateChanged</code> 同步调用，回调内保持短小或线程安全。</li>
+</ol>
+<hr />
+<h2>9. 交付物（进入执行阶段后）</h2>
+<ul>
+<li>自动化用例：<code>test_ctrl.py</code>、<code>test_device_state.py</code>、<code>test_data_stream.py</code>、<code>test_param.py</code>、<code>test_multi_sync.py</code>、<code>test_bin_replay.py</code>、<code>test_battery_log.py</code>、<code>test_boundary.py</code>。</li>
+<li>人工用例：<code>test_manual_hardware.md</code>。</li>
+<li>配置：<code>config.py</code>；主入口：<code>run_all.py</code>（<code>--skip-manual</code> 跳过人工）。</li>
+<li>报告与截图：<code>reports/</code>、<code>reports/screenshots/</code>。</li>
+</ul>
+</body>
+</html>
