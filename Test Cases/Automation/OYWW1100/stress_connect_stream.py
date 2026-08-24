@@ -31,8 +31,8 @@ import config
 import common
 from common import _identity_of, match_target
 
-MAX_ROUNDS = 1           # 只跑一轮
-STREAM_SECONDS = 600     # 起流时长 10 分钟
+MAX_ROUNDS = 10          # 共跑 10 轮
+STREAM_SECONDS = 100     # 每轮起流时长 100 秒
 CHECK_INTERVAL = 20      # 每 20 秒输出一次电量
 
 
