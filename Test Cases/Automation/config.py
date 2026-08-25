@@ -23,26 +23,26 @@ POWER_REFRESH_INTERVAL_MS = 1000    # init(..., powerRefreshInterval)
 MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 
 # ---- 当前目标设备（逗号分隔，脚本统一从 common.py 读）----
-TARGET_IDENTITY = "80F3"            # 多设备如 "80F9,6C6B"
+TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
 DEVICES = [
     {
         "name_prefix": "OB",
-        "mac": "",
+        "mac": "78:1C:9D:E4:6C:6B",
         "identity": "6C6B",
     },
 
     {
-        "name_prefix": "OBM",
+        "name_prefix": "OB",
         "mac": "",
         "identity": "2046",
     },
 
     {
-        "name_prefix": "OBM",
-        "mac": "",
+        "name_prefix": "OB",
+        "mac": "F0:44:D3:EC:20:6F",
         "identity": "206F",
     },
 

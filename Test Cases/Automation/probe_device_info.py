@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""probe_device_info.py：快速连接目标设备并 dump DeviceInfo 全字段，验证字段名。
+"""probe_device_info.py：连接目标设备，dump DeviceInfo 全字段 + getParam 支持情况。
 
 用途：
-  DeviceInfo 是 C 扩展类，字段走 C 层动态解析，dir()/反射拿不到字段列表。
-  本脚本连接设备后 getDeviceInfo()，逐个访问候选字段，区分「字段不存在」与「字段值」。
+  1) DeviceInfo 是 C 扩展类，字段走 C 层动态解析，dir()/反射拿不到字段列表。
+     本脚本逐个访问候选字段，区分「字段不存在」与「字段值」。
+  2) getParam 探测：dump getParam("NTF") 聚合通知状态，并逐个 NTF key 探测
+     设备真实支持的 setParam key（返回 "Error" 开头表示不支持）。
 
 用法：
     python probe_device_info.py
@@ -54,6 +56,40 @@ def dump_device_info(info):
             lines.append(f"{f} = <字段不存在>")
         except Exception as e:
             lines.append(f"{f} = <{type(e).__name__}: {e}>")
+    return "\n".join(lines)
+
+
+# 候选 setParam key（来自 README「Data stream toggles」），用于逐个探测设备支持性
+NTF_KEYS = [
+    "NTF_GEST", "NTF_EMG", "NTF_EEG", "NTF_ECG", "NTF_IMU",
+    "NTF_BRTH", "NTF_IMPEDANCE", "NTF_MAG_ANGLE",
+    "NTF_PPG", "NTF_PPG_RAW", "NTF_SPO2",
+    "NTF_GFORCE_EULER", "NTF_GFORCE_QUAT", "NTF_GFORCE_ACC", "NTF_GFORCE_GYRO",
+]
+
+
+def dump_params(sensor):
+    """dump getParam 聚合状态 + 逐个 NTF key 探测，确认设备真实支持的 setParam key。"""
+    lines = []
+
+    # 聚合查询
+    for agg in ["NTF", "FILTER", "EEG_SAMPLE_RATE", "EEG_SAMPLE_RATE_LIST"]:
+        try:
+            v = sensor.getParam(agg)
+        except Exception as e:
+            v = f"<{type(e).__name__}: {e}>"
+        lines.append(f"getParam({agg!r}) = {v!r}")
+
+    # 逐个 NTF key 探测（只读 getParam，不改变设备状态）
+    lines.append("")
+    lines.append("--- 逐个 NTF key 探测（Error 开头 = 不支持）---")
+    for key in NTF_KEYS:
+        try:
+            v = sensor.getParam(key)
+        except Exception as e:
+            v = f"<{type(e).__name__}: {e}>"
+        supported = not (isinstance(v, str) and v.startswith("Error"))
+        lines.append(f"getParam({key!r}) = {v!r}  ->  {'支持' if supported else '不支持'}")
     return "\n".join(lines)
 
 
@@ -113,6 +149,10 @@ def main():
 
     print("\n=== DeviceInfo 全字段 dump ===", flush=True)
     print(dump_device_info(info), flush=True)
+    print("=" * 30, flush=True)
+
+    print("\n=== getParam 探测（确认 setParam key 支持情况） ===", flush=True)
+    print(dump_params(sensor), flush=True)
     print("=" * 30, flush=True)
 
     sensor.disconnect()

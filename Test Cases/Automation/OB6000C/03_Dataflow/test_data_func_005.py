@@ -32,7 +32,7 @@
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
-  - 待测设备：OB6000C 上电、在范围内，且已佩戴/可手持
+  - 待测设备：OB6000C 上电、在范围内，且电极已正确佩戴
 """
 
 import os
@@ -60,23 +60,23 @@ def _dt_name(dt):
 # (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数)
 MODALITIES = [
     ("EEG", DataType.NTF_EEG, "NTF_EEG", "EegChannelCount",
-     "请保持佩戴，EEG 静息/佩戴即有信号，无需额外动作", 5),
+     "请保持电极接触良好，EEG 静息即有信号，无需额外动作", 5),
     ("ECG", DataType.NTF_ECG, "NTF_ECG", "EcgChannelCount",
-     "请保持佩戴且电极接触良好，让 ECG 产生信号", 5),
+     "请保持电极接触良好，让 ECG 产生信号", 5),
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
-     "请用力握拳或绷紧被测部位肌肉，让 EMG 产生信号", 5),
+     "请保持电极接触良好，让 EMG 产生信号", 5),
     ("GEST", DataType.NTF_GEST, "NTF_GEST", "EmgChannelCount",
-     "请做手势动作（握拳/张手/翻转手腕等），触发手势识别", 5),
+     "若设备支持，请触发相应手势识别", 5),
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
-     "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25),
+     "请保持电极接触良好，让阻抗测量产生信号", 25),
     ("ACC", DataType.NTF_ACC, "NTF_GFORCE_ACC", "AccChannelCount",
-     "请晃动/移动腕带，让加速度计产生变化", 5),
+     "请轻微移动设备，让加速度计产生变化", 5),
     ("GYRO", DataType.NTF_GYRO, "NTF_GFORCE_GYRO", "GyroChannelCount",
-     "请旋转/晃动腕带，让陀螺仪产生变化", 5),
+     "请轻微旋转设备，让陀螺仪产生变化", 5),
     ("EULER", DataType.NTF_EULER_DATA, "NTF_GFORCE_EULER", "EulerChannelCount",
-     "请旋转/晃动腕带，让欧拉角产生变化", 5),
+     "请轻微旋转设备，让欧拉角产生变化", 5),
     ("QUAT", DataType.NTF_QUATERNION, "NTF_GFORCE_QUAT", "QuatChannelCount",
-     "请旋转/晃动腕带，让四元数产生变化", 5),
+     "请轻微旋转设备，让四元数产生变化", 5),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名
@@ -148,10 +148,10 @@ def main():
 
     print("\n[前置条件]", flush=True)
     print("  - 主机(电脑)：蓝牙已开启", flush=True)
-    print("  - 待测设备：OB6000C 上电、在范围内，且已佩戴/可手持", flush=True)
+    print("  - 待测设备：OB6000C 上电、在范围内，且电极已正确佩戴", flush=True)
 
-    input("\n>>> [人工操作] 请确认待测设备 OB6000C 已【开机】且在范围内，"
-          "测试中需要你配合做手势/晃动/用力动作，完成后按回车继续 ...")
+    input("\n>>> [人工操作] 请确认待测设备 OB6000C 已【开机】、电极已正确佩戴且在范围内，"
+          "测试中需要你配合做相应动作，完成后按回车继续 ...")
 
     results = []
 

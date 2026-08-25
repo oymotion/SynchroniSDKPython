@@ -30,10 +30,14 @@ from common import record, scan_and_match
 
 
 class RateCollector:
-    """统计 EEG 数据流样本数，用于计算实际采样率。"""
+    """统计 EEG 数据流样本数（sampleIndex 去重），用于计算实际采样率。"""
 
     def __init__(self):
-        self.eeg_samples = 0
+        self.eeg_samples = 0        # 投递样本数（channelSamples 长度累加，含重复，仅观测）
+        self.channel_count = 0
+        self.first_ts = None
+        self.min_sample_index = None  # 通道0 sampleIndex 最小值（跨批单调递增）
+        self.max_sample_index = None  # 通道0 sampleIndex 最大值
 
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
@@ -42,10 +46,70 @@ class RateCollector:
             if dt == DataType.NTF_EEG:
                 cs = getattr(d, 'channelSamples', None)
                 if cs:
+                    if self.first_ts is None:
+                        self.first_ts = time.time()
                     try:
+                        n_ch = len(cs)
                         self.eeg_samples += sum(len(ch) for ch in cs)
+                        if self.channel_count == 0:
+                            self.channel_count = n_ch
+                        # 用通道0 sampleIndex 记录全局首末（sampleIndex 跨批单调递增）
+                        if n_ch:
+                            for s in cs[0]:
+                                idx = getattr(s, 'sampleIndex', None)
+                                if idx is None:
+                                    continue
+                                if self.min_sample_index is None or idx < self.min_sample_index:
+                                    self.min_sample_index = idx
+                                if self.max_sample_index is None or idx > self.max_sample_index:
+                                    self.max_sample_index = idx
                     except TypeError:
                         self.eeg_samples += len(cs)
+
+    @property
+    def unique_samples(self):
+        """唯一样本数 = sampleIndex 范围跨度（去重，不含重复投递）。"""
+        if self.min_sample_index is None or self.max_sample_index is None:
+            return 0
+        return self.max_sample_index - self.min_sample_index + 1
+
+
+def wait_sample_rate_effective(sensor, target_rate, timeout=5.0):
+    """等待采样率生效：注册 onDeviceInfoUpdate，等待 info.EegSampleRate == target_rate。
+
+    EEG_SAMPLE_RATE 变更由设备异步生效，setParam 返回 "OK" 仅表示命令下发成功；
+    生效后 SDK 通过 onDeviceInfoUpdate 推送新 DeviceInfo（缓存已就地更新）。
+    超时返回 False 兜底（不阻塞测试，打印警告后继续）。
+    """
+    target = int(target_rate)
+    state = {"matched": False, "updates": 0}
+
+    def on_update(s, info):
+        state["updates"] += 1
+        sr = getattr(info, "EegSampleRate", None)
+        print(f"  [onDeviceInfoUpdate] EegSampleRate={sr!r}（目标={target}）", flush=True)
+        if sr is not None and int(sr) == target:
+            state["matched"] = True
+
+    # 先检查缓存 DeviceInfo（可能 setParam 已同步更新缓存，无需等回调）
+    try:
+        info = sensor.getDeviceInfo()
+        sr = getattr(info, "EegSampleRate", None)
+        if sr is not None and int(sr) == target:
+            state["matched"] = True
+    except Exception:
+        pass
+
+    old_cb = getattr(sensor, "onDeviceInfoUpdate", None)
+    sensor.onDeviceInfoUpdate = on_update
+    try:
+        deadline = time.time() + timeout
+        while not state["matched"] and time.time() < deadline:
+            time.sleep(0.1)
+    finally:
+        sensor.onDeviceInfoUpdate = old_cb
+
+    return state["matched"]
 
 
 def main():
@@ -213,8 +277,15 @@ def main():
             current_rate = f"抛异常 {type(e).__name__}: {e}"
             print(f"[getParam] EEG_SAMPLE_RATE 抛异常: {e}", flush=True)
 
+        # 等待采样率生效（onDeviceInfoUpdate 推送 EegSampleRate==rate），5s 超时兜底
+        if not wait_sample_rate_effective(sensor, rate, timeout=5.0):
+            print(f"[等待] EEG_SAMPLE_RATE={rate} 未在 5s 内确认生效，继续起流（兜底）", flush=True)
+
         # 起流采集
         collector.eeg_samples = 0
+        collector.first_ts = None
+        collector.min_sample_index = None
+        collector.max_sample_index = None
         try:
             sret = sensor.startDataNotification()
         except Exception as e:
@@ -229,25 +300,41 @@ def main():
                 pass
             continue
 
-        print(f"[采集] 等待 {config.COLLECT_SECONDS}s 统计 EEG 样本数 ...", flush=True)
-        collect_start = time.time()
-        time.sleep(config.COLLECT_SECONDS)
-        collect_duration = time.time() - collect_start
+        # 等待首批数据到达，排除起流建立延迟
+        print("[采集] 等待首批 EEG 数据到达 ...", flush=True)
+        t_wait0 = time.time()
+        while collector.first_ts is None and time.time() - t_wait0 < 10:
+            time.sleep(0.05)
+
+        if collector.first_ts is None:
+            print("[采集] 10s 内未收到任何 EEG 数据", flush=True)
+            collect_duration = 0
+        else:
+            t_end = collector.first_ts + config.COLLECT_SECONDS
+            print(f"[采集] 首批已到达，从首批起精确采集 {config.COLLECT_SECONDS}s ...", flush=True)
+            while time.time() < t_end:
+                time.sleep(0.05)
+            collect_duration = time.time() - collector.first_ts
 
         try:
             sensor.stopDataNotification()
         except Exception as e:
             print(f"[停流] 抛异常 {type(e).__name__}: {e}", flush=True)
 
-        actual_rate = collector.eeg_samples / collect_duration if collect_duration > 0 else 0
+        unique = collector.unique_samples
+        if collect_duration > 0 and unique > 0:
+            actual_rate = unique / collect_duration
+        else:
+            actual_rate = 0
         expected_rate = int(rate)
         # 允许 10% 容差
         tolerance = expected_rate * 0.10
         rate_ok = abs(actual_rate - expected_rate) <= tolerance
 
         print(f"[结果] 期望={expected_rate}Hz, 实际≈{actual_rate:.1f}Hz "
-              f"({collector.eeg_samples}样本/{collect_duration:.1f}s)", flush=True)
-        rate_results.append((rate, rate_ok, f"期望={expected_rate}Hz, 实际≈{actual_rate:.1f}Hz"))
+              f"(唯一样本={unique} 投递样本={collector.eeg_samples} "
+              f"通道={collector.channel_count} 时长={collect_duration:.1f}s)", flush=True)
+        rate_results.append((rate, rate_ok, f"期望={expected_rate}Hz, 实际≈{actual_rate:.1f}Hz（唯一样本={unique}）"))
 
     all_rate_ok = all(ok for _, ok, _ in rate_results if ok is not None)
     for rate, ok, detail in rate_results:
