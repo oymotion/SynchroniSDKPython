@@ -12,12 +12,12 @@
 流程：
   1) 确认 ≥2 台设备开机 -> 按回车
   2) scan 匹配 common.TARGET_IDENTITIES 中所有设备（需 ≥2 台，否则 SKIP）
-  3) 对每台 requireSensor -> connect -> 等待 Ready -> init
-  4) await ctrl.asyncMultiStartDataNotification([s1, s2])（异步起流，为停流做准备）
+  3) 对每台 requireSensor -> asyncConnect -> 等待 Ready -> asyncInit
+  4) 检测型号：同型号默认参数，混型号放宽；await asyncMultiStartDataNotification([s1, s2])（异步起流，为停流做准备）
   5) await ctrl.asyncMultiStopDataNotification([s1, s2]) -> 返回 {mac: bool}
   6) 检查返回字典中所有值皆为 True
   7) 检查所有传感器 isDataTransfering==False
-  8) 清理：disconnect 所有
+  8) 清理：asyncDisconnect 所有
 """
 
 import asyncio
@@ -118,7 +118,7 @@ async def main_async():
         # 等待 Ready
         t0 = time.time()
         while time.time() - t0 < READY_TIMEOUT and sensor.deviceState != DeviceStateEx.Ready:
-            time.sleep(0.2)
+            await asyncio.sleep(0.2)
         ready = (sensor.deviceState == DeviceStateEx.Ready)
         print(f"[{tag}] deviceState = {sensor.deviceState}", flush=True)
         record(results, f"[{tag}] 到达 Ready", ready,
@@ -153,15 +153,37 @@ async def main_async():
         ctrl.terminate()
         return
 
+    # ---- 判断是否混型号：混型号需放宽对齐参数（参见 05_多设备同步.md MULTI-FUNC-006）----
+    model_names = set()
+    for tag, sensor in sensors:
+        try:
+            info = sensor.getDeviceInfo()
+        except Exception as e:
+            info = None
+            print(f"[型号] [{tag}] getDeviceInfo() 抛异常 {type(e).__name__}: {e}", flush=True)
+        model_names.add(getattr(info, 'ModelName', None) if info else None)
+    same_model = (len(model_names) == 1 and None not in model_names)
+    model_txt = sorted(str(m) for m in model_names if m) or ['<未知>']
+    print(f"[型号] 检测到 {len(model_names)} 种型号: {model_txt}，same_model={same_model}", flush=True)
+
     # ---- asyncMultiStartDataNotification（异步起流，为停流做准备） ----
     sensor_list = [s for _, s in sensors]
     tag_list = [t for t, _ in sensors]
-    print(f"\n[异步多起流] await ctrl.asyncMultiStartDataNotification([{', '.join(tag_list)}]) ...", flush=True)
-    try:
-        multi_start_ret = await ctrl.asyncMultiStartDataNotification(sensor_list)
-    except Exception as e:
-        multi_start_ret = None
-        print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
+    if same_model:
+        print(f"\n[异步多起流] await ctrl.asyncMultiStartDataNotification([{', '.join(tag_list)}]) ...", flush=True)
+        try:
+            multi_start_ret = await ctrl.asyncMultiStartDataNotification(sensor_list)
+        except Exception as e:
+            multi_start_ret = None
+            print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
+    else:
+        print(f"\n[异步多起流] 混型号，放宽参数 timeout=60, maxDelayDispersionMs=-1, maxAttempts=5 ...", flush=True)
+        try:
+            multi_start_ret = await ctrl.asyncMultiStartDataNotification(
+                sensor_list, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
+        except Exception as e:
+            multi_start_ret = None
+            print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     print(f"[异步多起流] asyncMultiStartDataNotification() -> {multi_start_ret!r}", flush=True)
 

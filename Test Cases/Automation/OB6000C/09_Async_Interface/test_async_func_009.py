@@ -34,7 +34,8 @@ import config
 from common import record, scan_and_match, async_scan_and_match
 
 COLLECT_SECONDS = 3
-STOP_WAIT_SECONDS = 1
+DRAIN_SECONDS = 0.5
+OBSERVE_SECONDS = 1.0
 
 
 class DataResult:
@@ -196,14 +197,16 @@ async def main_async():
     record(results, "停流后 isDataTransfering==False", transferring_after is False,
            "isDataTransfering == False", f"isDataTransfering == {transferring_after}")
 
-    # 等待 1 秒，验证回调静默
-    print(f"\n[静默验证] 等待 {STOP_WAIT_SECONDS}s，检查 onDataCallback 是否不再触发 ...", flush=True)
-    await asyncio.sleep(STOP_WAIT_SECONDS)
+    # 停流后先排空在途数据，再观察一个窗口确认回调真正静默
+    print(f"\n[静默验证] 排空 {DRAIN_SECONDS}s 在途数据，再观察 {OBSERVE_SECONDS}s 是否继续增长 ...", flush=True)
+    await asyncio.sleep(DRAIN_SECONDS)
+    batches_drained = data_result.batches
+    await asyncio.sleep(OBSERVE_SECONDS)
     batches_after_stop = data_result.batches
-    callbacks_stopped = (batches_after_stop == batches_before_stop)
-    print(f"[静默验证] 停流前批数={batches_before_stop}  停流后批数={batches_after_stop}  是否静默={callbacks_stopped}", flush=True)
-    record(results, "停流后 onDataCallback 回调已静默（批数不增长）", callbacks_stopped,
-           "停流后批数不增长", f"停流前={batches_before_stop} 停流后={batches_after_stop}")
+    callbacks_stopped = (batches_after_stop == batches_drained)
+    print(f"[静默验证] 停流前={batches_before_stop} 排空后={batches_drained} 观察后={batches_after_stop} 静默={callbacks_stopped}", flush=True)
+    record(results, "停流后 onDataCallback 回调已静默（排空后批数不增长）", callbacks_stopped,
+           "停流排空后批数不增长", f"停流前={batches_before_stop} 排空后={batches_drained} 观察后={batches_after_stop}")
 
     # 清理
     sensor.onDataCallback = None

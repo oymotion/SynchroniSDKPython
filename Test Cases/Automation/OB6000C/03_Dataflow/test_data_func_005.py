@@ -112,6 +112,46 @@ def dump_device_info(info):
     return ", ".join(parts)
 
 
+def _list_bins(log_dir):
+    if not log_dir or not os.path.isdir(log_dir):
+        return {}
+    out = {}
+    try:
+        for fn in os.listdir(log_dir):
+            if fn.lower().endswith(".bin"):
+                out[fn] = os.path.join(log_dir, fn)
+    except OSError:
+        pass
+    return out
+
+
+def _list_logs(log_dir):
+    if not log_dir or not os.path.isdir(log_dir):
+        return {}
+    out = {}
+    try:
+        for fn in os.listdir(log_dir):
+            if fn.lower().endswith(".txt"):
+                out[fn] = os.path.join(log_dir, fn)
+    except OSError:
+        pass
+    return out
+
+
+def _get_ble_path(sensor):
+    try:
+        return sensor.getParam("DEBUG_BLE_DATA_PATH")
+    except Exception as e:
+        return f"抛异常 {type(e).__name__}: {e}"
+
+
+def _get_profile_log_path(sensor):
+    try:
+        return sensor.getParam("DEBUG_LOG_PATH")
+    except Exception as e:
+        return f"抛异常 {type(e).__name__}: {e}"
+
+
 class DataCollector:
     """按 DataType 统计收到的批次与样本数。"""
 
@@ -154,6 +194,35 @@ def main():
           "测试中需要你配合做相应动作，完成后按回车继续 ...")
 
     results = []
+
+    # 受控日志目录（固定路径，便于把 bin/log 贴到 bug 里）
+    log_dir = os.path.join(BASE_DIR, "data_func_005_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"\n[日志目录] 使用固定目录 {log_dir}", flush=True)
+    try:
+        ctrl.setLogPath(True, log_dir)
+        log_ok = True
+        log_txt = f"setLogPath(True, {log_dir}) 无异常"
+    except Exception as e:
+        log_ok = False
+        log_txt = f"setLogPath 抛异常 {type(e).__name__}: {e}"
+    print(f"[日志目录] {log_txt}", flush=True)
+    record(results, "SensorController.setLogPath 设置日志目录", log_ok,
+           "setLogPath(True, dir) 无异常", log_txt)
+
+    try:
+        ctrl.setDebugEnabled(True)
+        debug_ok = True
+        debug_txt = "setDebugEnabled(True) 无异常"
+    except Exception as e:
+        debug_ok = False
+        debug_txt = f"setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}"
+    print(f"[日志] SensorController.setDebugEnabled(True) -> {debug_txt}", flush=True)
+    record(results, "SensorController.setDebugEnabled(True) 开启 debug 日志", debug_ok,
+           "setDebugEnabled(True) 无异常", debug_txt)
+
+    bins_before = _list_bins(log_dir)
+    logs_before = _list_logs(log_dir)
 
     # 环境检查
     is_enable = ctrl.isEnable
@@ -249,6 +318,24 @@ def main():
         ctrl.terminate()
         return
 
+    # 开启 bin 导出 + profile log 导出（用于把完整数据/log 贴到 bug 里）
+    print("\n[导出] 开启 bin 与 profile log 导出 ...", flush=True)
+    try:
+        bret = sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
+    except Exception as e:
+        bret = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[导出] setParam('DEBUG_BLE_DATA_PATH', 'True') -> {bret!r}", flush=True)
+    record(results, "开启 DEBUG_BLE_DATA_PATH 导出", bret == "OK",
+           "setParam('DEBUG_BLE_DATA_PATH', 'True') 返回 'OK'", f"返回 {bret!r}")
+
+    try:
+        lret = sensor.setParam("DEBUG_LOG_PATH", "True")
+    except Exception as e:
+        lret = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[导出] setParam('DEBUG_LOG_PATH', 'True') -> {lret!r}", flush=True)
+    record(results, "开启 DEBUG_LOG_PATH 导出", lret == "OK",
+           "setParam('DEBUG_LOG_PATH', 'True') 返回 'OK'", f"返回 {lret!r}")
+
     # 逐模态能力判定 + 数据验证
     collector = DataCollector()
     sensor.onDataCallback = collector.on_data
@@ -325,6 +412,47 @@ def main():
     except Exception as e:
         print(f"[断开] SensorProfile.disconnect 抛异常 {type(e).__name__}: {e}", flush=True)
 
+    # ---- 导出 bin / log（供贴到 bug）----
+    ble_path = _get_ble_path(sensor)
+    profile_path = _get_profile_log_path(sensor)
+    print(f"\n[导出] disconnect 后 getParam('DEBUG_BLE_DATA_PATH') = {ble_path!r}", flush=True)
+    print(f"[导出] disconnect 后 getParam('DEBUG_LOG_PATH') = {profile_path!r}", flush=True)
+
+    # 给文件系统收尾留一点时间
+    time.sleep(0.5)
+
+    bins_after = _list_bins(log_dir)
+    logs_after = _list_logs(log_dir)
+    new_bins = sorted(set(bins_after.keys()) - set(bins_before.keys()))
+    new_logs = sorted(set(logs_after.keys()) - set(logs_before.keys()))
+
+    bin_path = ble_path if (isinstance(ble_path, str) and ble_path.strip()) else None
+    if bin_path is None and new_bins:
+        bin_path = bins_after[new_bins[0]]
+    log_path = profile_path if (isinstance(profile_path, str) and profile_path.strip()) else None
+
+    print(f"[导出] 新增 .bin 文件: {new_bins if new_bins else '无'}", flush=True)
+    print(f"[导出] 新增 .txt log 文件: {new_logs if new_logs else '无'}", flush=True)
+    print(f"[导出] bin 路径: {bin_path!r}（存在={bool(bin_path) and os.path.isfile(bin_path)}）", flush=True)
+    if log_path and os.path.isfile(log_path):
+        print(f"[导出] profile log 路径: {log_path!r}", flush=True)
+    for fn in new_logs:
+        print(f"[导出] log 文件: {logs_after[fn]}", flush=True)
+
+    # 关闭导出开关（已导出的 bin/log 文件不会被删除）
+    try:
+        sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
+    except Exception:
+        pass
+    try:
+        sensor.setParam("DEBUG_LOG_PATH", "False")
+    except Exception:
+        pass
+    try:
+        ctrl.setDebugEnabled(False)
+    except Exception:
+        pass
+
     # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)
     print("测试结果汇总", flush=True)
@@ -344,6 +472,8 @@ def main():
 
     print("\n结论: " + ("PASS" if all_pass else "FAIL"), flush=True)
     ctrl.terminate()
+    print(f"\n[提示] 本次 bin/log 落盘目录: {log_dir}", flush=True)
+    print("[提示] 请把该目录下本次新增的 .bin 与 .txt 文件贴到 bug 里", flush=True)
 
 
 if __name__ == "__main__":

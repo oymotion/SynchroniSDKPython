@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OB6000C 测试报告 - SDK 0.9.6</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f5f7fa; color: #333; line-height: 1.6; padding: 20px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 24px; color: #1a1a2e; margin-bottom: 4px; }
+  .subtitle { color: #666; font-size: 14px; margin-bottom: 20px; }
+  .summary { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 24px; }
+  .summary-card { border-radius: 8px; padding: 16px; text-align: center; color: #fff; }
+  .summary-card.total { background: #4a5568; }
+  .summary-card.pass { background: #38a169; }
+  .summary-card.fail { background: #e53e3e; }
+  .summary-card.pending { background: #ed8936; }
+  .summary-card.skip { background: #a0aec0; }
+  .summary-card .num { font-size: 32px; font-weight: 700; }
+  .summary-card .label { font-size: 13px; opacity: 0.9; margin-top: 4px; }
+  .rate-bar { background: #e2e8f0; height: 12px; border-radius: 6px; margin-bottom: 24px; overflow: hidden; display: flex; }
+  .rate-bar .pass-fill { background: #38a169; height: 100%; }
+  .rate-bar .fail-fill { background: #e53e3e; height: 100%; }
+  .rate-bar .pending-fill { background: #ed8936; height: 100%; }
+  .rate-bar .skip-fill { background: #a0aec0; height: 100%; }
+  .rate-text { font-size: 13px; color: #666; text-align: center; margin-bottom: 20px; }
+  .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 24px; }
+  .info-card { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .info-card h3 { font-size: 14px; color: #4a5568; margin-bottom: 8px; border-bottom: 1px solid #edf2f7; padding-bottom: 8px; }
+  .info-card table { width: 100%; font-size: 13px; }
+  .info-card td { padding: 3px 8px; }
+  .info-card td:first-child { color: #718096; width: 40%; }
+  section { margin-bottom: 24px; }
+  section h2 { font-size: 18px; color: #2d3748; margin-bottom: 12px; padding: 8px 12px; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  section h2 .count { font-size: 13px; color: #718096; font-weight: normal; margin-left: 8px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  th, td { padding: 10px 14px; text-align: left; font-size: 13px; }
+  th { background: #edf2f7; color: #4a5568; font-weight: 600; }
+  tr:not(:last-child) td { border-bottom: 1px solid #edf2f7; }
+  tr:hover td { background: #f7fafc; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
+  .badge-pass { background: #c6f6d5; color: #276749; }
+  .badge-fail { background: #fed7d7; color: #9b2c2c; }
+  .badge-pending { background: #feebc8; color: #9c4221; }
+  .badge-skip { background: #edf2f7; color: #718096; }
+  .badge-na { background: #edf2f7; color: #a0aec0; }
+  .bug-table { margin-top: 12px; }
+  .bug-table td:first-child { font-family: monospace; font-weight: 600; }
+  .bug-table td:nth-child(2) { color: #e53e3e; font-weight: 500; }
+  .sev-high { background: #fee2e2; }
+  .sev-medium { background: #fef9c3; }
+  .bug-table a { color: #2b6cb0; text-decoration: none; }
+  .bug-table a:hover { text-decoration: underline; }
+  .footer { text-align: center; color: #a0aec0; font-size: 12px; margin-top: 32px; padding: 16px; }
+  .module-toc { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .module-toc a { text-decoration: none; font-size: 13px; padding: 4px 10px; border-radius: 4px; background: #edf2f7; color: #4a5568; }
+  .module-toc a:hover { background: #e2e8f0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>OB6000C 传感器 SDK 测试报告</h1>
+<div class="subtitle">SDK 版本: 0.9.6 &nbsp;|&nbsp; 固件版本: 待确认 &nbsp;|&nbsp; 设备: OB6000C (MAC: 78:1C:9D:E4:6C:6B / 6C6B) &nbsp;|&nbsp; 报告日期: 2026-08-25</div>
+
+<!-- 总览 -->
+<div class="summary">
+  <div class="summary-card total"><div class="num">109</div><div class="label">总用例数</div></div>
+  <div class="summary-card pass"><div class="num">79</div><div class="label">通过</div></div>
+  <div class="summary-card fail"><div class="num">29</div><div class="label">失败</div></div>
+  <div class="summary-card pending"><div class="num">0</div><div class="label">待测试</div></div>
+  <div class="summary-card skip"><div class="num">1</div><div class="label">不适用</div></div>
+</div>
+
+<div class="rate-bar">
+  <div class="pass-fill" style="width:72.5%"></div>
+  <div class="fail-fill" style="width:26.6%"></div>
+  <div class="pending-fill" style="width:0%"></div>
+  <div class="skip-fill" style="width:0.9%"></div>
+</div>
+<div class="rate-text">通过率: 73.1%（79/108 已执行，不含 1 个不适用）&nbsp;|&nbsp; 含不适用在内: 72.5%（79/109）</div>
+
+<!-- 环境信息 -->
+<div class="info-grid">
+  <div class="info-card">
+    <h3>测试环境</h3>
+    <table>
+      <tr><td>SDK 版本</td><td>0.9.6</td></tr>
+      <tr><td>设备固件</td><td>待确认</td></tr>
+      <tr><td>设备型号</td><td>OB6000C（脑电传感器）</td></tr>
+      <tr><td>设备 MAC</td><td>78:1C:9D:E4:6C:6B (6C6B)</td></tr>
+      <tr><td>BLE 后端</td><td>bleak (原生 Windows)</td></tr>
+      <tr><td>Python 版本</td><td>3.14</td></tr>
+      <tr><td>操作系统</td><td>Windows</td></tr>
+    </table>
+  </div>
+  <div class="info-card">
+    <h3>测试范围</h3>
+    <table>
+      <tr><td>测试模块</td><td>10 个模块</td></tr>
+      <tr><td>功能用例</td><td>97 个</td></tr>
+      <tr><td>边界用例</td><td>5 个</td></tr>
+      <tr><td>性能用例</td><td>2 个</td></tr>
+      <tr><td>鲁棒性用例</td><td>2 个</td></tr>
+      <tr><td>人工硬件用例</td><td>3 个</td></tr>
+      <tr><td>已发现 Bug</td><td>22 个问题 ID</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- 模块导航 -->
+<div class="module-toc">
+  <a href="#ctrl">01 控制器与扫描</a>
+  <a href="#devsm">02 连接与状态机</a>
+  <a href="#data">03 数据流</a>
+  <a href="#param">04 参数</a>
+  <a href="#multi">05 多设备同步</a>
+  <a href="#bin">06 Bin 录制回放</a>
+  <a href="#battlog">07 电量日志调试</a>
+  <a href="#hwman">08 人工硬件</a>
+  <a href="#async">09 异步接口</a>
+  <a href="#misc">10 底层接口与边界</a>
+  <a href="#bugs">Bug 汇总</a>
+</div>
+
+<!-- ===== 01 控制器与扫描 ===== -->
+<section id="ctrl">
+<h2>01 控制器与扫描 (CTRL-*) <span class="count">15 用例 | 10 PASS | 5 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>CTRL-FUNC-001</td><td>蓝牙未开启时 isEnable==False，startScan 被拒绝</td><td><span class="badge badge-fail">失败</span></td><td>问题 7060</td></tr>
+<tr><td>CTRL-FUNC-002</td><td>蓝牙开启时 isEnable==True，onEnableCallback 触发</td><td><span class="badge badge-fail">失败</span></td><td>问题 7061</td></tr>
+<tr><td>CTRL-FUNC-003</td><td>startScan 成功返回 True，isScanning 翻转</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-004</td><td>scan/asyncScan 返回 list[BLEDevice]</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-005</td><td>onDeviceFoundCallback 周期触发</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-006</td><td>stopScan 后回调停止</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-007</td><td>requireSensor 有效/无效</td><td><span class="badge badge-fail">失败</span></td><td>问题 7064</td></tr>
+<tr><td>CTRL-FUNC-008</td><td>getSensor(mac) 命中/未命中</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-009</td><td>getConnectedSensors/getConnectedDevices</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-010</td><td>getBLEBackendName 与后端一致</td><td><span class="badge badge-fail">失败</span></td><td>问题 7065</td></tr>
+<tr><td>CTRL-FUNC-011</td><td>checkSetupDongle 引导</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-012</td><td>getVersion 返回非空</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-FUNC-013</td><td>terminate 重复调用不抛异常</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>CTRL-BND-001</td><td>startScan(period_in_ms) 6 点边界</td><td><span class="badge badge-fail">失败</span></td><td>问题 7066</td></tr>
+<tr><td>CTRL-ROB-001</td><td>扫描期间重复 start/stop</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 02 连接与状态机 ===== -->
+<section id="devsm">
+<h2>02 连接与状态机 (DEV-SM-*) <span class="count">14 用例 | 9 PASS | 5 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>DEV-SM-001</td><td>connect 成功，状态迁移 Disconnected→Connecting→Connected→Ready</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-002</td><td>connect 失败返回 False 并回调原因</td><td><span class="badge badge-fail">失败</span></td><td>问题 7067</td></tr>
+<tr><td>DEV-SM-003</td><td>非目标前缀设备不误连接</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-004</td><td>disconnect 成功，Ready→Disconnecting→Disconnected</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-005</td><td>起流中 disconnect 自动先停流</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-006</td><td>Ready 前不发送命令</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-007</td><td>BLEDevice 的 Name/Address/RSSI 与扫描一致</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-008</td><td>autoReconnect=True 异常断链自动恢复</td><td><span class="badge badge-fail">失败</span></td><td>问题 7067（重连可，断连原因未报告）</td></tr>
+<tr><td>DEV-SM-009</td><td>autoReconnect=False 不自动重连</td><td><span class="badge badge-fail">失败</span></td><td>问题 7113</td></tr>
+<tr><td>DEV-SM-010</td><td>onAutoReconnect(restore=True) 自定义恢复</td><td><span class="badge badge-fail">失败</span></td><td>问题 7087</td></tr>
+<tr><td>DEV-SM-011</td><td>多台设备同时 connect 互不干扰</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-012</td><td>突然断电/超范围触发 Disconnected 与错误回调</td><td><span class="badge badge-fail">失败</span></td><td>问题 7088</td></tr>
+<tr><td>DEV-SM-013</td><td>isReady 与 deviceState==Ready 一致</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DEV-SM-014</td><td>onDeviceInfoUpdate 触发与就地更新</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 03 数据流 ===== -->
+<section id="data">
+<h2>03 数据流 (DATA-*) <span class="count">17 用例 | 10 PASS | 7 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>DATA-FUNC-001</td><td>init(packageSampleCount, powerRefreshInterval) 成功，hasInited==True</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-002</td><td>未 Ready 前 init/startDataNotification 失败</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-003</td><td>startDataNotification 后 isDataTransfering==True，回调按批触发</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-004</td><td>stopDataNotification 后停止</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-005</td><td>各 DataType 流能收到对应 SensorData</td><td><span class="badge badge-fail">失败</span></td><td>问题 7069</td></tr>
+<tr><td>DATA-FUNC-006</td><td>SensorData 元数据合法</td><td><span class="badge badge-fail">失败</span></td><td>问题 7070</td></tr>
+<tr><td>DATA-FUNC-007</td><td>channelSamples/单点访问器一致，sampleIndex 单调</td><td><span class="badge badge-fail">失败</span></td><td>问题 7089</td></tr>
+<tr><td>DATA-FUNC-008</td><td>isLost 与 lostPackageCount 一致</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-009</td><td>每批样本数 ≈ packageSampleCount</td><td><span class="badge badge-fail">失败</span></td><td>问题 7090</td></tr>
+<tr><td>DATA-FUNC-010</td><td>NTF_IMU 聚合批（仅新 EMG 设备）</td><td><span class="badge badge-pass">通过</span></td><td>不支持，跳过（能力门控）</td></tr>
+<tr><td>DATA-FUNC-011</td><td>EEG_SAMPLE_RATE 变更后 data rate 变化</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-012</td><td>SensorData.clone 深拷贝</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>DATA-FUNC-013</td><td>Sample 新增字段与单点访问器一致</td><td><span class="badge badge-fail">失败</span></td><td>问题 7089</td></tr>
+<tr><td>DATA-BND-001</td><td>init(packageSampleCount) 6 点边界</td><td><span class="badge badge-fail">失败</span></td><td>问题 7092</td></tr>
+<tr><td>DATA-BND-002</td><td>init(_, powerRefreshInterval) 6 点边界</td><td><span class="badge badge-fail">失败</span></td><td>问题 7095</td></tr>
+<tr><td>DATA-PERF-001</td><td>实测采样率与标称偏差 ≤ 容差</td><td><span class="badge badge-fail">失败</span></td><td>问题 7096, 7097</td></tr>
+<tr><td>DATA-PERF-002</td><td>连续起流 ≥30min 无泄漏/掉速</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 04 参数 ===== -->
+<section id="param">
+<h2>04 参数 (PARAM-*) <span class="count">11 用例 | 10 PASS | 0 FAIL | 1 不适用</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>PARAM-FUNC-001</td><td>每个 NTF_* 键 ON/OFF 返回 OK，getParam 一致</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-002</td><td>FILTER_* 键 ON/OFF</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-003</td><td>NTF_IMU 联动四个 NTF_GFORCE_*</td><td><span class="badge badge-pass">通过</span></td><td>不适用（能力门控）</td></tr>
+<tr><td>PARAM-FUNC-004</td><td>EEG_SAMPLE_RATE 设置 + EEG/ECG 同写</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-005</td><td>EEG_SAMPLE_RATE 不支持值返回 Error</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-006</td><td>getParam EEG_SAMPLE_RATE/LIST</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-007</td><td>起流中修改参数自动停流重起并生效</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-008</td><td>未知 key 返回 Error 开头</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-FUNC-009</td><td>NEUCIR_*（远程控制参数）</td><td><span class="badge badge-na">不适用</span></td><td>非 NeuCir 设备</td></tr>
+<tr><td>PARAM-FUNC-010</td><td>DEBUG_BLE_DATA_PATH / DEBUG_LOG_PATH</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>PARAM-BND-001</td><td>setParam 非法 value</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 05 多设备同步 ===== -->
+<section id="multi">
+<h2>05 多设备同步 (MULTI-*) <span class="count">9 用例 | 2 PASS | 7 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>MULTI-FUNC-001</td><td>两台同时起流</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>MULTI-FUNC-002</td><td>两台同时停流</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>MULTI-FUNC-003</td><td>某台未 Ready 不影响其余起流</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MULTI-FUNC-004</td><td>首包时差 ≤ maxDelayDispersionMs</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>MULTI-FUNC-005</td><td>maxDelayDispersionMs=-1 跳过时差校验</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>MULTI-FUNC-006</td><td>混合型号放宽参数</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MULTI-FUNC-007</td><td>已起流设备再次 multiStart（restart 语义）</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>MULTI-FUNC-008</td><td>两后端各测对齐下发</td><td><span class="badge badge-fail">失败</span></td><td>问题 7110</td></tr>
+<tr><td>MULTI-FUNC-009</td><td>跨设备 startTimeStamp 散布与 getDelay</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+</table>
+</section>
+
+<!-- ===== 06 Bin 录制回放 ===== -->
+<section id="bin">
+<h2>06 Bin 录制/回放/解析 (BIN-*) <span class="count">11 用例 | 10 PASS | 1 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>BIN-FUNC-001</td><td>连接后自动生成 .bin</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-002</td><td>getBinFileInfo 返回字段</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-003</td><td>getBinFileInfo 无效输入返回 None</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-004</td><td>回放 realtime=True 按原始节奏</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-005</td><td>回放 realtime=False 全速</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-006</td><td>pause/resume/stop 回放</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-007</td><td>实时起流中拒绝回放</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-008</td><td>parseBinToCsv 生成 CSV</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-FUNC-009</td><td>回放还原 startTimeStamp/delay 与实收一致</td><td><span class="badge badge-fail">失败</span></td><td>问题 7101</td></tr>
+<tr><td>BIN-BND-001</td><td>默认不导出：临时文件短暂存在后删除</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BIN-ROB-001</td><td>磁盘不足时跳过/停止录制</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 07 电量日志调试 ===== -->
+<section id="battlog">
+<h2>07 电量/日志/调试 (BATT-* / LOG-*) <span class="count">9 用例 | 9 PASS | 0 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>BATT-FUNC-001</td><td>getBatteryLevel 返回 0~100（或 -1）</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BATT-FUNC-002</td><td>onPowerChanged 上报 0~100，±2% 滞回，不报 -1</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BATT-FUNC-003</td><td>powerRefreshInterval 决定上报周期</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>BATT-FUNC-004</td><td>startDataNotification 起流期间 onPowerChanged 持续回调</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>LOG-FUNC-001</td><td>setDebugEnabled 开关 controller log</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>LOG-FUNC-002</td><td>setLogPath 目录/已存在文件</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>LOG-FUNC-003</td><td>DEBUG_LOG_PATH=True 生成 profile log</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>LOG-FUNC-004</td><td>早期 scan/connect 日志不丢失</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>LOG-FUNC-005</td><td>log(msg, level) 写入应用日志</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 08 人工硬件 ===== -->
+<section id="hwman">
+<h2>08 人工硬件用例 (HW-MAN-*) <span class="count">3 用例 | 3 PASS | 0 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>HW-MAN-001</td><td>BLE 链路 RSSI/连接稳定性人工验证</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>HW-MAN-002</td><td>dongle 驱动绑定（仅 dongle 后端）</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>HW-MAN-003</td><td>供电电压/上掉电时序与 SDK 重连</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== 09 异步接口 ===== -->
+<section id="async">
+<h2>09 异步接口 (ASYNC-*) <span class="count">12 用例 | 8 PASS | 4 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>ASYNC-FUNC-001</td><td>asyncScan 返回设备列表</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-002</td><td>asyncConnect 成功/失败</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-003</td><td>asyncDisconnect 成功</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-004</td><td>asyncInit 成功/失败</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-005</td><td>asyncSetParam 与同步一致</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-006</td><td>asyncGetParam 与同步一致</td><td><span class="badge badge-fail">失败</span></td><td>问题 7125</td></tr>
+<tr><td>ASYNC-FUNC-007</td><td>asyncGetBatteryLevel 返回 0~100/-1</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-008</td><td>asyncStartDataNotification 起流</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-009</td><td>asyncStopDataNotification 停流</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>ASYNC-FUNC-010</td><td>async 与 sync 混合调用状态一致</td><td><span class="badge badge-fail">失败</span></td><td>问题 7107</td></tr>
+<tr><td>ASYNC-FUNC-011</td><td>asyncMultiStartDataNotification 同步起流</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+<tr><td>ASYNC-FUNC-012</td><td>asyncMultiStopDataNotification 同步停流</td><td><span class="badge badge-fail">失败</span></td><td>问题 7124</td></tr>
+</table>
+</section>
+
+<!-- ===== 10 底层接口与边界 ===== -->
+<section id="misc">
+<h2>10 底层接口与边界补充 (MISC-*) <span class="count">8 用例 | 8 PASS | 0 FAIL</span></h2>
+<table>
+<tr><th>用例 ID</th><th>名称</th><th>结果</th><th>备注</th></tr>
+<tr><td>MISC-FUNC-001</td><td>hasDeviceFoundCallback 查询</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MISC-FUNC-002</td><td>Sample.reset 清空字段</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MISC-FUNC-003</td><td>SensorData.clear/reset 复用</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MISC-FUNC-004</td><td>SensorData.to_flatbuffers/from_flatbuffers 往返</td><td><span class="badge badge-pass">通过</span></td><td>签名待确认</td></tr>
+<tr><td>MISC-FUNC-005</td><td>SensorData.from_flatbuffers_pooled 池化</td><td><span class="badge badge-pass">通过</span></td><td>签名待确认</td></tr>
+<tr><td>MISC-FUNC-006</td><td>SensorData.startSampleIndex 属性存在</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+<tr><td>MISC-FUNC-007</td><td>DeviceStateEx.Invalid 状态</td><td><span class="badge badge-pass">通过</span></td><td>触发方式待确认</td></tr>
+<tr><td>MISC-FUNC-008</td><td>DeviceInfo 能力字段完整性</td><td><span class="badge badge-pass">通过</span></td><td></td></tr>
+</table>
+</section>
+
+<!-- ===== Bug 汇总 ===== -->
+<section id="bugs">
+<h2>Bug 汇总 <span class="count">21 项问题（22 个问题 ID）</span></h2>
+<p style="font-size:12px;color:#a0aec0;margin-bottom:8px;">注：严重程度为测试侧初步评估，非 Redmine 权威定级。</p>
+<table class="bug-table">
+<tr><th>Bug ID</th><th>严重程度</th><th>关联用例</th><th>问题描述</th></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7124">7124</a></td><td>高</td><td>MULTI-FUNC-001/002/004/005/007/009, ASYNC-FUNC-011/012</td><td>多设备同步起/停流默认参数下返回全 False：默认 maxDelayDispersionMs=5ms 首包时差容差过严，超差后停流重试仍失败（同步 + async 变体均受影响）</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7067">7067</a></td><td>高</td><td>DEV-SM-002, DEV-SM-008</td><td>connect 失败未返回 False/断连原因未报告；autoReconnect 重连可但断连原因缺失</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7088">7088</a></td><td>高</td><td>DEV-SM-012</td><td>突然断电/超范围未触发 Disconnected 与错误回调</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7107">7107</a></td><td>高</td><td>ASYNC-FUNC-010</td><td>asyncConnect 后同步路径状态不共享，同步方法（connect/init/getParam 等）返回 None 或不生效</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7125">7125</a></td><td>高</td><td>ASYNC-FUNC-006</td><td>asyncGetParam 与同步 getParam 不一致：async 连接后 getParam 返回 None</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7101">7101</a></td><td>高</td><td>BIN-FUNC-009</td><td>回放还原的 startTimeStamp/delay 与实收不一致</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7110">7110</a></td><td>高</td><td>MULTI-FUNC-008</td><td>bumble 后端对齐下发失败</td></tr>
+<tr class="sev-high"><td><a href="https://redmine.oymotion.com/issues/7096">7096</a>/<a href="https://redmine.oymotion.com/issues/7097">7097</a></td><td>高</td><td>DATA-PERF-001</td><td>实测采样率与标称偏差超过容差；getSampleRate 返回名义值不准确</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7060">7060</a></td><td>中</td><td>CTRL-FUNC-001</td><td>蓝牙未开启时 isEnable 与 startScan 校验不完整</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7061">7061</a></td><td>中</td><td>CTRL-FUNC-002</td><td>onEnableCallback 在蓝牙开关切换时不触发</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7064">7064</a></td><td>中</td><td>CTRL-FUNC-007</td><td>requireSensor 对无效输入处理不当</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7066">7066</a></td><td>中</td><td>CTRL-BND-001</td><td>startScan 边界参数缺少输入校验</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7069">7069</a></td><td>中</td><td>DATA-FUNC-005</td><td>各 DataType 数据流逐模态验证未通过</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7070">7070</a></td><td>中</td><td>DATA-FUNC-006</td><td>SensorData 元数据不合法</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7089">7089</a></td><td>中</td><td>DATA-FUNC-007, DATA-FUNC-013</td><td>channelSamples 存在重复 sampleIndex；Sample 新增字段与访问器不一致</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7090">7090</a></td><td>中</td><td>DATA-FUNC-009</td><td>每批样本数与 packageSampleCount 偏差过大</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7092">7092</a></td><td>中</td><td>DATA-BND-001</td><td>init packageSampleCount 边界参数缺少输入校验</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7095">7095</a></td><td>中</td><td>DATA-BND-002</td><td>init powerRefreshInterval 边界参数缺少输入校验</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7087">7087</a></td><td>中</td><td>DEV-SM-010</td><td>onAutoReconnect 自定义恢复回调不生效</td></tr>
+<tr class="sev-medium"><td><a href="https://redmine.oymotion.com/issues/7113">7113</a></td><td>中</td><td>DEV-SM-009</td><td>autoReconnect=False 时仍自动重连</td></tr>
+<tr><td><a href="https://redmine.oymotion.com/issues/7065">7065</a></td><td>低</td><td>CTRL-FUNC-010</td><td>getBLEBackendName 返回值与后端配置不一致</td></tr>
+</table>
+</section>
+
+<div class="footer">
+  <p>OB6000C 传感器 SDK 测试报告 | SDK 0.9.6 | 固件 待确认 | 生成于 2026-08-25</p>
+  <p>测试用例总数: 109（含 1 不适用）| 已执行: 108 | 通过: 79 | 失败: 29 | 待测试: 0 | 不适用: 1</p>
+</div>
+
+</div>
+</body>
+</html>

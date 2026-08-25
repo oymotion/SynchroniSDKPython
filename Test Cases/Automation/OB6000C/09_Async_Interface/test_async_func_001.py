@@ -2,7 +2,7 @@
 """ASYNC-FUNC-001：asyncScan 返回设备列表，与同步 scan 结果一致。
 
 对应用例：09_异步接口.md -> ASYNC-FUNC-001
-可自动化：auto（无需设备连接，仅需蓝牙开启且周围有任意 BLE 设备）
+可自动化：auto（需目标设备（config.TARGET_IDENTITY）在范围内；蓝牙开启）
 
 流程：
   1) 检查 SensorController.isEnable == True
@@ -10,6 +10,7 @@
   3) ctrl.scan(config.SCAN_TIMEOUT_MS) -> 断言返回 list
   4) 比较两者设备数量一致
   5) 断言 async 结果中至少有一台设备 Name 和 Address 非空
+  6) 断言 async/scan 结果含 config.TARGET_IDENTITY 对应目标设备
 """
 
 import asyncio
@@ -22,7 +23,7 @@ sys.path.insert(0, AUTOMATION_DIR)
 
 from sensor import *
 import config
-from common import record
+from common import record, match_all_targets
 
 
 async def main_async():
@@ -64,6 +65,19 @@ async def main_async():
             addr = getattr(d, 'Address', None) or '?'
             print(f"  - {name} {addr}", flush=True)
 
+    # ---- async 结果含 config 目标设备 ----
+    if is_list_async:
+        matched_async = match_all_targets(devices_async)
+        matched_ids = [tid for tid, _ in matched_async]
+        has_target_async = len(matched_async) > 0
+        print(f"[检查] asyncScan 结果含目标设备: {matched_ids if matched_ids else '无'}", flush=True)
+        record(results, "asyncScan 结果含 config 目标设备", has_target_async,
+               f"含 TARGET_IDENTITY({config.TARGET_IDENTITY}) 对应设备",
+               f"匹配到 {matched_ids if matched_ids else '无'}")
+    else:
+        record(results, "asyncScan 结果含 config 目标设备", False,
+               f"含 TARGET_IDENTITY({config.TARGET_IDENTITY}) 对应设备", "asyncScan 返回非 list")
+
     # ---- 同步 scan ----
     print(f"\n[同步扫描] ctrl.scan({config.SCAN_TIMEOUT_MS}) ...", flush=True)
     try:
@@ -83,6 +97,19 @@ async def main_async():
             name = getattr(d, 'Name', None) or '?'
             addr = getattr(d, 'Address', None) or '?'
             print(f"  - {name} {addr}", flush=True)
+
+    # ---- sync 结果含 config 目标设备 ----
+    if is_list_sync:
+        matched_sync = match_all_targets(devices_sync)
+        matched_ids_sync = [tid for tid, _ in matched_sync]
+        has_target_sync = len(matched_sync) > 0
+        print(f"[检查] scan 结果含目标设备: {matched_ids_sync if matched_ids_sync else '无'}", flush=True)
+        record(results, "scan 结果含 config 目标设备", has_target_sync,
+               f"含 TARGET_IDENTITY({config.TARGET_IDENTITY}) 对应设备",
+               f"匹配到 {matched_ids_sync if matched_ids_sync else '无'}")
+    else:
+        record(results, "scan 结果含 config 目标设备", False,
+               f"含 TARGET_IDENTITY({config.TARGET_IDENTITY}) 对应设备", "scan 返回非 list")
 
     # ---- 比较设备数量 ----
     if is_list_async and is_list_sync:

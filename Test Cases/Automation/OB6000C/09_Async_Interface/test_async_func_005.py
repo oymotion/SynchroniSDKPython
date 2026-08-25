@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ASYNC-FUNC-005：asyncSetParam 设置参数成功，返回 OK，同步 getParam 可验证。
+"""ASYNC-FUNC-005：asyncSetParam 设置 NTF_EEG 生效性（起流验证）。
 
 对应用例：09_异步接口.md -> ASYNC-FUNC-005
 可自动化：auto（需待测设备上电在范围内）
@@ -14,9 +14,11 @@
   3) await sensor.asyncConnect() -> 到达 Ready
   4) await sensor.asyncInit(20, 1000)
   5) await sensor.asyncSetParam("NTF_EEG", "ON") -> 断言返回 "OK"
-  6) 同步 getParam("NTF") 校验 -> 应包含 "EEG"
+  6) 起流采集 -> 断言收到 NTF_EEG 数据（ON 生效）
   7) await sensor.asyncSetParam("NTF_EEG", "OFF") -> 断言返回 "OK"
-  8) 同步 getParam("NTF") 校验 -> EEG 应为 OFF
+  8) 起流采集 -> 断言无 NTF_EEG 数据（OFF 生效）
+  9) await sensor.asyncSetParam("NTF_EEG", "ON") 再次设置 -> 断言返回 "OK"
+ 10) 起流采集 -> 断言再次收到 NTF_EEG 数据（OFF->ON 可逆）
 """
 
 import asyncio
@@ -34,22 +36,62 @@ import common
 from common import record, scan_and_match, async_scan_and_match
 
 
-def _parse_pipe(s):
-    """把 "KEY|VALUE|KEY|VALUE|..." 解析成 {KEY: VALUE}。"""
-    out = {}
-    if not s:
-        return out
-    parts = s.split("|")
-    for i in range(0, len(parts) - 1, 2):
-        out[parts[i]] = parts[i + 1]
-    return out
+COLLECT_SECONDS = 3
+
+
+class EegResult:
+    """统计 NTF_EEG 数据流的批数与样本数。"""
+
+    def __init__(self):
+        self.batches = 0
+        self.eeg_samples = 0
+
+
+def make_eeg_on_data(result):
+    def on_data(sensor, data):
+        items = data if isinstance(data, list) else [data]
+        for d in items:
+            if d.getDataType() != DataType.NTF_EEG:
+                continue
+            result.batches += 1
+            cs = getattr(d, 'channelSamples', None)
+            n = 0
+            if cs:
+                try:
+                    n = sum(len(ch) for ch in cs)
+                except TypeError:
+                    n = len(cs)
+            result.eeg_samples += n
+    return on_data
+
+
+async def _start_collect_stop(sensor, seconds):
+    """起流 -> 采集 seconds 秒 -> 停流，返回 NTF_EEG 样本数（起流失败返回 -1）。"""
+    result = EegResult()
+    sensor.onDataCallback = make_eeg_on_data(result)
+    start_ok = False
+    try:
+        start_ok = await sensor.asyncStartDataNotification()
+    except Exception as e:
+        print(f"[起流] asyncStartDataNotification 抛异常 {type(e).__name__}: {e}", flush=True)
+    if start_ok is not True:
+        print(f"[起流] asyncStartDataNotification 返回 {start_ok!r}", flush=True)
+        sensor.onDataCallback = None
+        return -1
+    await asyncio.sleep(seconds)
+    try:
+        await sensor.asyncStopDataNotification()
+    except Exception as e:
+        print(f"[停流] asyncStopDataNotification 抛异常 {type(e).__name__}: {e}", flush=True)
+    sensor.onDataCallback = None
+    return result.eeg_samples
 
 
 async def main_async():
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
-    print("ASYNC-FUNC-005 asyncSetParam 设置参数成功，返回 OK，同步 getParam 可验证", flush=True)
+    print("ASYNC-FUNC-005 asyncSetParam 设置 NTF_EEG 生效性（起流验证）", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
@@ -159,19 +201,12 @@ async def main_async():
     record(results, "asyncSetParam('NTF_EEG', 'ON') 返回 'OK'", r_on == "OK",
            "asyncSetParam 返回 'OK'", f"asyncSetParam() -> {r_on!r}")
 
-    # 同步 getParam 验证 ON
-    print("\n[同步验证-ON] getParam('NTF') ...", flush=True)
-    try:
-        ntf_str_on = sensor.getParam("NTF")
-    except Exception as e:
-        ntf_str_on = ""
-        print(f"[同步验证-ON] 抛异常 {type(e).__name__}: {e}", flush=True)
-    ntf_on = _parse_pipe(ntf_str_on)
-    v_on = ntf_on.get("NTF_EEG", "<缺失>")
-    print(f"[同步验证-ON] getParam('NTF') 原始字符串: {ntf_str_on!r}", flush=True)
-    print(f"[同步验证-ON] getParam('NTF') 中 NTF_EEG = {v_on}", flush=True)
-    record(results, "getParam('NTF') 中 NTF_EEG 为 ON", v_on == "ON",
-           "NTF_EEG == 'ON'", f"NTF_EEG = {v_on!r}")
+    # 起流验证 ON：设置 ON 后应能收到 EEG 数据
+    print(f"\n[起流验证-ON] 起流采集 {COLLECT_SECONDS}s 验证 NTF_EEG=ON 生效 ...", flush=True)
+    eeg_on = await _start_collect_stop(sensor, COLLECT_SECONDS)
+    print(f"[起流验证-ON] NTF_EEG 样本数 = {eeg_on}", flush=True)
+    record(results, "NTF_EEG=ON 起流后收到 EEG 数据", eeg_on > 0,
+           "起流后 NTF_EEG 样本数 > 0", f"NTF_EEG 样本数 = {eeg_on}")
 
     # ---- asyncSetParam OFF ----
     print("\n[异步设置-OFF] await sensor.asyncSetParam('NTF_EEG', 'OFF') ...", flush=True)
@@ -184,41 +219,29 @@ async def main_async():
     record(results, "asyncSetParam('NTF_EEG', 'OFF') 返回 'OK'", r_off == "OK",
            "asyncSetParam 返回 'OK'", f"asyncSetParam() -> {r_off!r}")
 
-    # 同步 getParam 验证 OFF
-    print("\n[同步验证-OFF] getParam('NTF') ...", flush=True)
-    try:
-        ntf_str_off = sensor.getParam("NTF")
-    except Exception as e:
-        ntf_str_off = ""
-        print(f"[同步验证-OFF] 抛异常 {type(e).__name__}: {e}", flush=True)
-    ntf_off = _parse_pipe(ntf_str_off)
-    v_off = ntf_off.get("NTF_EEG", "<缺失>")
-    print(f"[同步验证-OFF] getParam('NTF') 原始字符串: {ntf_str_off!r}", flush=True)
-    print(f"[同步验证-OFF] getParam('NTF') 中 NTF_EEG = {v_off}", flush=True)
-    record(results, "getParam('NTF') 中 NTF_EEG 为 OFF（不在通知掩码中）", v_off != "ON",
-           "NTF_EEG 不在通知掩码中（OFF 后 key 被移除）", f"NTF_EEG = {v_off!r}")
+    # 起流验证 OFF：设置 OFF 后应无 EEG 数据
+    print(f"\n[起流验证-OFF] 起流采集 {COLLECT_SECONDS}s 验证 NTF_EEG=OFF 生效 ...", flush=True)
+    eeg_off = await _start_collect_stop(sensor, COLLECT_SECONDS)
+    print(f"[起流验证-OFF] NTF_EEG 样本数 = {eeg_off}", flush=True)
+    record(results, "NTF_EEG=OFF 起流后无 EEG 数据", eeg_off == 0,
+           "起流后 NTF_EEG 样本数 == 0", f"NTF_EEG 样本数 = {eeg_off}")
 
-    # ---- 同步 setParam 对比验证 ----
-    print("\n[同步对比] 用同步 setParam 重新设置 NTF_EEG=ON 并验证 ...", flush=True)
+    # ---- 再次设置 ON 并起流验证：OFF -> ON 可逆 ----
+    print("\n[再次设置-ON] await sensor.asyncSetParam('NTF_EEG', 'ON') ...", flush=True)
     try:
-        r_sync = sensor.setParam("NTF_EEG", "ON")
-        print(f"[同步对比] setParam('NTF_EEG', 'ON') -> {r_sync!r}", flush=True)
+        r_sync = await sensor.asyncSetParam("NTF_EEG", "ON")
     except Exception as e:
         r_sync = f"抛异常 {type(e).__name__}: {e}"
-        print(f"[同步对比] 抛异常 {type(e).__name__}: {e}", flush=True)
-    record(results, "同步 setParam('NTF_EEG', 'ON') 返回 'OK'", r_sync == "OK",
-           "setParam 返回 'OK'", f"setParam() -> {r_sync!r}")
+        print(f"[再次设置-ON] 抛异常 {type(e).__name__}: {e}", flush=True)
+    print(f"[再次设置-ON] sensor.asyncSetParam('NTF_EEG', 'ON') -> {r_sync!r}", flush=True)
+    record(results, "asyncSetParam('NTF_EEG', 'ON') 再次设置返回 'OK'", r_sync == "OK",
+           "asyncSetParam 返回 'OK'", f"asyncSetParam() -> {r_sync!r}")
 
-    try:
-        ntf_sync = sensor.getParam("NTF")
-    except Exception as e:
-        ntf_sync = ""
-    parsed_sync = _parse_pipe(ntf_sync)
-    v_sync = parsed_sync.get("NTF_EEG", "<缺失>")
-    print(f"[同步对比] getParam('NTF') 原始字符串: {ntf_sync!r}", flush=True)
-    print(f"[同步对比] getParam('NTF') 中 NTF_EEG = {v_sync}", flush=True)
-    record(results, "同步 setParam 后 getParam('NTF') 中 NTF_EEG 为 ON", v_sync == "ON",
-           "NTF_EEG == 'ON'", f"NTF_EEG = {v_sync!r}")
+    print(f"\n[起流验证-再次ON] 起流采集 {COLLECT_SECONDS}s 验证 OFF->ON 可逆 ...", flush=True)
+    eeg_on2 = await _start_collect_stop(sensor, COLLECT_SECONDS)
+    print(f"[起流验证-再次ON] NTF_EEG 样本数 = {eeg_on2}", flush=True)
+    record(results, "NTF_EEG 再次 ON 后收到 EEG 数据", eeg_on2 > 0,
+           "起流后 NTF_EEG 样本数 > 0", f"NTF_EEG 样本数 = {eeg_on2}")
 
     # 清理
     try:

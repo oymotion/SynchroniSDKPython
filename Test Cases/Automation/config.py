@@ -23,7 +23,7 @@ POWER_REFRESH_INTERVAL_MS = 1000    # init(..., powerRefreshInterval)
 MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 
 # ---- 当前目标设备（逗号分隔，脚本统一从 common.py 读）----
-TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"
+TARGET_IDENTITY = "6C6B"            # 多设备如 "80F9,6C6B"
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
@@ -61,5 +61,10 @@ DEVICES = [
         "name_prefix": "gForceUltra",
         "mac": "BC:93:2A:3F:80:F8",
         "identity": "80F8",
+    },
+    {
+        "name_prefix": "Cerelax",
+        "mac": "BC:93:2A:3F:85:0B",
+        "identity": "850B",
     },
 ]
