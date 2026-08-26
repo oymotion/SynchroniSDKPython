@@ -117,6 +117,7 @@
 | SensorController | getConnectedSensors/Devices | CTRL-FUNC-009 | — |
 | SensorController | multiStart/multiStop | MULTI-FUNC-001/002 | MULTI-BND-001、MULTI-ROB-001 |
 | SensorController | replayBinFile/pause/resume/stop | BIN-FUNC-004/006 | BIN-FUNC-007、BIN-ROB-002 |
+| SensorController | multiReplayBinFile | BIN-FUNC-011 | BIN-BND-003、BIN-ROB-003 |
 | SensorController | parseBinToCsv/getBinFileInfo | BIN-FUNC-002/008 | BIN-FUNC-003、BIN-BND-002 |
 | SensorController | terminate | CTRL-FUNC-013 | — |
 | SensorProfile | connect/disconnect | DEV-SM-001/004 | DEV-SM-002、DEV-SM-015/016 |

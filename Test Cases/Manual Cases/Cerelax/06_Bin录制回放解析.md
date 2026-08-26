@@ -139,3 +139,33 @@
 - **可自动化**：auto
 - **人工介入**：无
 - **测试结果**：待测试
+
+### BIN-FUNC-011 multiReplayBinFile 多文件同步回放
+- **优先级**：P0
+- **测试目的**：验证 0.9.7 新增的 `multiReplayBinFile` 多 bin 文件按共享时钟对齐同步回放。
+- **流程与逻辑**：准备 ≥2 个不同 MAC 的有效 bin 文件；`multiReplayBinFile(file_paths, sensors=None, realtime=True)`；统计各成员 `onDataCallback` 批数与 DataType。
+- **预期结果**：返回列表长度等于输入文件数，每个成员返回对应 `SensorProfile`（或 None 表示该成员失败）；各成员均产生回放数据；DataType 覆盖各自 live 类型；全组以最早首条数据记录为 t=0，保留录制时的相对偏移（各成员 `startTimeStamp` 相对关系与录制时一致）。
+- **有效性说明**：多设备/多段 bin 的同步回放是 0.9.7 新能力。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：待测试
+
+### BIN-BND-003 multiReplayBinFile 无效/重复/不足输入
+- **优先级**：P1
+- **测试目的**：验证多文件回放的入参容错。
+- **流程与逻辑**：`multiReplayBinFile([])`；`multiReplayBinFile([单文件])`；`multiReplayBinFile(含无效 bin 的列表)`；`multiReplayBinFile(含重复 device_mac 的列表)`。
+- **预期结果**：空列表/单文件被拒绝（返回空列表或提示需 ≥2 个有效文件）；无效 bin 成员返回 None 不崩溃；重复 MAC 按 SDK 语义处理（跳过或拒绝），其余成员正常回放，不抛异常。
+- **有效性说明**：多文件接口容错，防止无效成员拖垮整组。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：待测试
+
+### BIN-ROB-003 multiReplayBinFile 组级 pause/resume/stop 幂等
+- **优先级**：P1
+- **测试目的**：验证多文件回放的组级控制与幂等。
+- **流程与逻辑**：多文件回放中对任一成员调用 `pauseBinReplay`/`resumeBinReplay`，全组暂停/恢复；`stopBinReplay` 逐成员停止；停止后重复 `stopBinReplay`。
+- **预期结果**：pause 任一成员整组暂停（组时钟语义）；resume 整组恢复；stop 对全部成员生效；重复控制不崩溃、不抛异常。
+- **有效性说明**：多文件回放的组控制语义（0.9.7 引入）。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：待测试

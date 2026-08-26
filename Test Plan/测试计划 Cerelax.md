@@ -173,7 +173,7 @@ Cerelax 核心关注：`NTF_EEG`（2 通道）、`NTF_PPG`、`NTF_IMU`、`NTF_IM
 | DEV-SM-007 | `BLEDevice` 的 Name/Address/RSSI 与扫描结果一致 | P1 | 正向 | auto |
 | DEV-SM-008 | `autoReconnect=True`（默认）异常断链后自动 `connect→init→恢复 setParam→startDataNotification` | P0 | 异常恢复 | semi-auto |
 | DEV-SM-009 | `autoReconnect=False` 异常断链后不自动重连 | P1 | 异常恢复 | semi-auto |
-| DEV-SM-010 | `onAutoReconnect(restore=True)` 自定义恢复路径生效，返回 True 跳过默认流程 | P1 | 异常恢复 | semi-auto |
+| DEV-SM-010 | `onAutoReconnect(restore=True)` 自定义恢复路径生效，`answer(True)` 接管并跳过默认流程 | P1 | 异常恢复 | semi-auto |
 | DEV-SM-011 | 多台设备同时 `connect()`，互不干扰（并发） | P0 | 组合 | auto |
 | DEV-SM-012 | 目标设备突然断电/超范围：`onStateChanged(Disconnected)` 与 `onErrorCallback` 触发 | P0 | 异常恢复 | semi-auto |
 | DEV-SM-013 | `isReady` 属性等于 `deviceState == DeviceStateEx.Ready` | P1 | 正向 | auto |
@@ -261,10 +261,13 @@ Cerelax 核心关注：`NTF_EEG`（2 通道）、`NTF_PPG`、`NTF_IMU`、`NTF_IM
 | BIN-FUNC-008 | `parseBinToCsv` 生成 CSV，含 `raw/cmd_send/cmd_recv/event/parsed` 行 | P1 | 正向 | auto |
 | BIN-FUNC-009 | 回放还原的 `startTimeStamp/delay` 与实收值一致 | P1 | 正向 | auto |
 | BIN-FUNC-010 | bin 逐帧分析：各 DataType package counts 与 live 交叉验证（区分固件未发 vs SDK 未解析） | P0 | 正向 | auto |
+| BIN-FUNC-011 | `multiReplayBinFile` 多 bin 文件按共享时钟对齐同步回放 | P0 | 正向 | auto |
 | BIN-BND-001 | 默认（未设 `DEBUG_BLE_DATA_PATH`）时不持久落盘，临时文件断开后删除 | P1 | 逆向 | auto |
 | BIN-ROB-001 | 磁盘不足（或只读模拟写盘失败）时跳过/停止录制且不影响实时流 | P2 | 异常恢复 | auto |
 | BIN-BND-002 | `replayBinFile`/`parseBinToCsv`/`getBinFileInfo` 空串/None/无效路径返回 None/False 且不崩溃 | P1 | 边界 | auto |
+| BIN-BND-003 | `multiReplayBinFile` 无效/重复/不足输入（空列表、单文件、重复 device_mac） | P1 | 边界 | auto |
 | BIN-ROB-002 | 回放控制重复调用幂等 | P1 | 异常恢复 | auto |
+| BIN-ROB-003 | `multiReplayBinFile` 组级 pause/resume/stop 幂等 | P1 | 异常恢复 | auto |
 
 ### 5.7 电量 / 日志 / 调试
 

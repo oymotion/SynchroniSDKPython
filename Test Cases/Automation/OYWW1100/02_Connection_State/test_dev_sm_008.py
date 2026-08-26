@@ -122,10 +122,10 @@ def main():
         errors.append(reason)
         print(f"  [SensorProfile.onErrorCallback] {s.BLEDevice.Name}: {reason!r}", flush=True)
 
-    def on_reconnect(s, restore):
+    def on_reconnect(s, restore, answer):
         reconnects.append(restore)
         print(f"  [SensorProfile.onAutoReconnect] {s.BLEDevice.Name} restore={restore}", flush=True)
-        return False  # 回退默认恢复流程（connect -> init -> replay setParam -> startDataNotification）
+        answer(False)  # 回退默认恢复流程（connect -> init -> replay setParam -> startDataNotification）
 
     sensor.onStateChanged = on_state
     sensor.onErrorCallback = on_error
