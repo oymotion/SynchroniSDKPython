@@ -180,6 +180,9 @@ Cerelax 核心关注：`NTF_EEG`（2 通道）、`NTF_PPG`、`NTF_IMU`、`NTF_IM
 | DEV-SM-014 | `onDeviceInfoUpdate` 在链路参数/采样率变更时触发，`DeviceInfo` 就地更新 | P1 | 正向 | auto |
 | DEV-SM-015 | `connect` 重复调用幂等，不产生重复连接 | P1 | 异常恢复 | auto |
 | DEV-SM-016 | `disconnect` 重复调用幂等，最终 `Disconnected` | P1 | 异常恢复 | auto |
+| DEV-SM-017 | BLE MTU 协商前后数据分包正确（§七 BLE 专项） | P1 | 正向 | semi-auto |
+| DEV-SM-018 | 配对/bond 信息持久与免配对重连（§七 BLE 专项） | P1 | 正向 | semi-auto |
+| DEV-SM-019 | 广播间隔与重连退避符合预期（§七 BLE 专项） | P1 | 正向 | semi-auto |
 
 ### 5.3 数据流（EEG 2 通道 + PPG/IMU/Impedance 为核心）
 

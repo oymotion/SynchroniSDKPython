@@ -82,3 +82,80 @@
 - 失败保留 SDK 日志与 `.bin` 用于复现。
 - 缺设备（如多设备同步需 ≥2 台）时整体"跳过"，不判失败。
 - 所有能力字段（`ChannelCount`/`SampleRate`）以 `getDeviceInfo()` 运行时结果为准，不硬编码假设。
+
+## 用例优先级与标签
+
+每个用例均有 `优先级` 字段（P0/P1/P2），与测试计划一致：
+
+| 优先级 | 含义 | 通过率 |
+|--------|------|--------|
+| P0 | 核心功能 / 状态机主路径 / 安全 | 100% |
+| P1 | 一般功能 / 边界 / 异常恢复 / 性能 | ≥95% |
+| P2 | 低优先 / 观测类 | ≥90% |
+
+用例标签（§八 覆盖率追踪）由现有字段派生，避免重复维护：
+
+| 标签 | 派生规则 |
+|------|----------|
+| `@smoke` | 优先级 = P0 |
+| `@regression` | 全部用例 |
+| `@connection` | CTRL-* / DEV-SM-* / HW-MAN-001~003 |
+| `@data-parse` | DATA-* / BIN-* / MISC-002~006 |
+| `@param` | PARAM-* |
+| `@state` | DEV-SM-* |
+| `@semi-auto` / `@manual` | 对应 `可自动化` 字段 |
+
+## 接口 → 用例映射（覆盖率追踪）
+
+每个接口至少 1 个正向 + 1 个异常/边界用例（§八.2）。主要接口映射如下（完整以测试计划 §2.1 为准）：
+
+| 类 | 接口 | 正向用例 | 异常/边界用例 |
+|----|------|----------|---------------|
+| SensorController | isEnable | CTRL-FUNC-002 | CTRL-FUNC-001 |
+| SensorController | startScan/stopScan/scan | CTRL-FUNC-003/004/006 | CTRL-BND-001、CTRL-ROB-001/002 |
+| SensorController | requireSensor/getSensor | CTRL-FUNC-007/008 | CTRL-BND-002 |
+| SensorController | getConnectedSensors/Devices | CTRL-FUNC-009 | — |
+| SensorController | multiStart/multiStop | MULTI-FUNC-001/002 | MULTI-BND-001、MULTI-ROB-001 |
+| SensorController | replayBinFile/pause/resume/stop | BIN-FUNC-004/006 | BIN-FUNC-007、BIN-ROB-002 |
+| SensorController | parseBinToCsv/getBinFileInfo | BIN-FUNC-002/008 | BIN-FUNC-003、BIN-BND-002 |
+| SensorController | terminate | CTRL-FUNC-013 | — |
+| SensorProfile | connect/disconnect | DEV-SM-001/004 | DEV-SM-002、DEV-SM-015/016 |
+| SensorProfile | init | DATA-FUNC-001 | DATA-FUNC-002、DATA-BND-001/002、DATA-ROB-001 |
+| SensorProfile | start/stopDataNotification | DATA-FUNC-003/004 | DATA-FUNC-002、DATA-ROB-002 |
+| SensorProfile | setParam/getParam | PARAM-FUNC-001/002/004/006 | PARAM-FUNC-005/008、PARAM-BND-001/002 |
+| SensorProfile | getBatteryLevel/onPowerChanged | BATT-FUNC-001/002 | BATT-FUNC-004（失效模式） |
+| SensorProfile | async 变体 | ASYNC-FUNC-001~012 | ASYNC-FUNC-010（混用限制） |
+| SensorData | getSampleRate/getChannelCount 等 | DATA-FUNC-006 | DATA-PERF-003（标称值校验） |
+| SensorData | clone/clear/reset/to_flatbuffers | DATA-FUNC-012、MISC-003~005 | — |
+
+> 未映射到用例的接口（如底层序列化签名待确认项）显式标"未覆盖"，待 README 定案后补齐。
+
+## 超时 / 轮询 / 重试约定（§四）
+
+自动化脚本落地时遵循，手工用例的"等待"类步骤也按此判定：
+
+- **轮询等待**代替固定 sleep：间隔默认 0.2s；扫描发现上限 10s、建立连接上限 15s、参数下发回包上限 5s；超时判 FAIL 并记录"已等待 Xs 未收到回调"。
+- **重试**：仅环境性偶发（单次 BLE 掉线）允许重试，上限 2 次并记录；断言类失败不重试；重试后仍失败标 flaky 单独排查。
+- **硬失败 vs 环境异常分流**：断言不通过记 FAIL；设备未响应/链路断开先复测，仍异常判环境故障退出，不误记 SDK 缺陷。
+
+## 环境与依赖固化（版本矩阵，§六）
+
+报告与结论须显式记录，脱离环境谈结论无效：
+
+| 项 | 必填内容 |
+|----|----------|
+| SDK 版本 | `getVersion()` 实测值 |
+| Python / OS | 版本号 |
+| BLE 适配器 | 型号 + 驱动版本（不同芯片厂 BLE 栈行为有差异，跨适配器结果不可混比） |
+| 设备 | 型号、固件版本、电量水平 |
+| 配对状态 | 是否已 bond |
+
+## 参数测试方法论（§二）
+
+数值型参数统一用 6 点边界法覆盖等价类与边界：合法值域内取代表值（等价类）+ 边界及边界 ±1；非法/异常值另测越界、空值、错误类型，验证被正确拒绝而非静默接受。已落地的边界用例见 `CTRL-BND-001`、`DATA-BND-001/002` 等。
+
+## 缺陷归因与上报（§十一）
+
+- 报 bug 前自检：蓝牙开关、dongle 识别、驱动、设备电量、bond 状态、SDK/Python 版本。
+- 设备型号/能力优先排查：先查文档有无型号要求，再判断是否设备能力问题，避免把"设备不支持"误报"SDK 缺陷"。
+- 上报至少含：用例名、环境矩阵、断言输出、完整 traceback、最小复现步骤。
