@@ -7,7 +7,7 @@
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) getParam("EEG_SAMPLE_RATE_LIST") 获取可选值列表
-  3) setParam("EEG_SAMPLE_RATE", 列表外值) 应返回 Error
+  3) setParam("EEG_SAMPLE_RATE", "500") 应返回 Error（500 为已知非法值）
   4) setParam("EEG_SAMPLE_RATE", 空串) 应返回 Error
 
 前置条件：
@@ -148,8 +148,8 @@ def main():
 
     # 生成不在列表中的测试值
     invalid_values = []
-    # 找一个不在列表中的数值
-    for candidate in ["50", "9999", "0", "12345"]:
+    # 找一个不在列表中的数值（500 为已知非法值，优先验证）
+    for candidate in ["500", "50", "9999", "0", "12345"]:
         if candidate not in supported:
             invalid_values.append(candidate)
             break

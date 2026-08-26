@@ -116,3 +116,12 @@
 - **可自动化**：auto
 - **人工介入**：无
 - **测试结果**：待测试
+
+### BIN-FUNC-010 bin 逐帧分析：各 DataType package counts 与 live 交叉验证
+- **测试目的**：对录制的 bin 做原始帧逐类统计，定位"某 DataType 无数据"是固件未发送还是 SDK 未解析/未录制。
+- **流程与逻辑**：`DEBUG_BLE_DATA_PATH=True` 起流录制 → 断开后用 [bin_rate_check.py](../../../../../Bin%20Analysis/bin_rate_check.py)（方法见 [BIN_ANALYSIS.md](../../../../../Bin%20Analysis/BIN_ANALYSIS.md)）解析 bin → 统计每类 DataType 的原始帧数（package counts）→ 与 live `onDataCallback` 实际收到的 DataType 集合做交叉验证。
+- **预期结果**：`getDeviceInfo()` 中 `ChannelCount>0` 的模态，其对应 DataType 在 bin 中原始帧数 > 0；live 收到的 DataType 集合 ⊆ bin 记录的 DataType 集合（bin 为 BLE 包层全量，可包含 live 未交付的类型）；若某 `ChannelCount>0` 模态 bin 中帧数为 0，判定为"固件未发送"而非 SDK 解析问题。
+- **有效性说明**：bin 是 BLE 包层地面真值，可区分"固件没发"与"SDK 没交付/没录制"，是 Impedance/IMU 等能力缺失问题的定位依据。
+- **可自动化**：auto
+- **人工介入**：无
+- **测试结果**：待测试

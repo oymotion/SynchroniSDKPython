@@ -10,7 +10,7 @@
 | 广播名前缀 | 待确认 |
 | 类型归属 | 头环 / EEG 设备 |
 | 核心能力 | NTF_EEG（2 通道脑电）、NTF_PPG、NTF_IMU、NTF_IMPEDANCE（电极接触检测） |
-| 采样率 | EEG `250\|500\|1000`；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
+| 采样率 | EEG `250`（唯一）；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
 | SDK 版本 | 0.9.1 |
 
 ## 能力假设（连接后用 getDeviceInfo() 确认）
@@ -35,11 +35,11 @@
 | 磁角度 MAG_ANGLE | `MagAngleChannelCount > 0` | 待确认 | 待确认 |
 
 > 与 OB6000C 的关键差异：Cerelax 为 **2 通道 EEG 头环**（OB6000C 为 32 通道），并**新增 PPG / IMU / Impedance 电极接触检测**；不支持 ECG / EMG / GEST / BRTH。
-> 采样率有三套（EEG / IMU / PPG），但 SDK 的 `setParam` 仅提供 `EEG_SAMPLE_RATE` 设置接口；IMU / PPG 采样率**无设置接口**，仅可读 `getDeviceInfo()` 的只读字段（`ImuSampleRate` / `PpgSampleRate`）。
+> 采样率有三套（EEG / IMU / PPG）。当前 SDK 版本的 `setParam` 仅提供 `EEG_SAMPLE_RATE` 设置接口；IMU / PPG 采样率设置（`IMU_SAMPLE_RATE` / `PPG_SAMPLE_RATE`）**为规划中的功能，当前版本尚未提供**，仅可读 `getDeviceInfo()` 的只读字段（`ImuSampleRate` / `PpgSampleRate`）。相关设置用例已先行登记（PARAM-FUNC-012/013、DATA-FUNC-014），待 SDK 实现后执行。
 
 ## 环境与前置条件
 
-- Python 3.10~3.14，`sensor-sdk==0.9.1`（`pip install --upgrade sensor-sdk`）。
+- Python 3.10~3.14，`sensor-sdk==0.9.6`（`pip install --upgrade sensor-sdk`）。
 - 蓝牙开启（bleak 后端）或 dongle 已绑定（bumble 后端，`checkSetupDongle()` 返回 `OK`）。
 - 设备上电、在扫描范围内。
 - 每个脚本结束调用 `SensorControllerInstance.terminate()`；Ctrl+C 异常路径也需调用。
@@ -53,7 +53,7 @@
 | [01_控制器与扫描.md](./01_控制器与扫描.md) | `CTRL-*`：扫描、requireSensor、后端、版本、终止 |
 | [02_连接与状态机.md](./02_连接与状态机.md) | `DEV-SM-*`：连接、断连、重连、状态迁移 |
 | [03_数据流.md](./03_数据流.md) | `DATA-*`：起流、样本访问、EEG/PPG/IMU/Impedance |
-| [04_参数.md](./04_参数.md) | `PARAM-*`：setParam/getParam、EEG_SAMPLE_RATE |
+| [04_参数.md](./04_参数.md) | `PARAM-*`：setParam/getParam、EEG/IMU/PPG_SAMPLE_RATE |
 | [05_多设备同步.md](./05_多设备同步.md) | `MULTI-*`：同步起流/停流（需 ≥2 台） |
 | [06_Bin录制回放解析.md](./06_Bin录制回放解析.md) | `BIN-*`：录制/回放/CSV |
 | [07_电量日志调试.md](./07_电量日志调试.md) | `BATT-*` / `LOG-*` |
