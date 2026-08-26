@@ -34,7 +34,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5   # 秒，工作线程 FFT 频谱的计算间隔
-DEMO_VERSION               = "0.0.8"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
+DEMO_VERSION               = "0.0.9"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 
@@ -828,9 +828,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     device_disconnected_sig = QtCore.pyqtSignal(str)         # address
     auto_reconnect_sig = QtCore.pyqtSignal(str, bool)        # (address, restore)
     replay_done_sig = QtCore.pyqtSignal(str)
+    replay_member_done_sig = QtCore.pyqtSignal(object)       # (sensor) 多文件回放单个成员结束
     analyze_done_sig = QtCore.pyqtSignal(str, str)
     dongle_check_sig = QtCore.pyqtSignal(str)
     fft_done_sig = QtCore.pyqtSignal(int, object, object)   # (data_type, freqs, mags)，工作线程→UI 线程
+    bio_fft_done_sig = QtCore.pyqtSignal(int, object, object)   # 右侧 EEG/EMG 每通道 FFT：(data_type, freqs, mags)
 
     def __init__(self):
         super().__init__()
@@ -871,6 +873,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._last_data_log_paths: dict = {}
         self._replay_thread = None
         self._replay_sensor = None
+        # 多文件同步回放的全部成员（单文件回放时为空，仅 _replay_sensor）
+        self._replay_sensors = []
         # 回放进行中标志：由 SDK 的 onDataTransferStateChange 事件驱动
         # （数据流真正开始/结束），取代回放线程存活判断
         self._replay_active = False
@@ -883,6 +887,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._fft_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="FFT")
         self._fft_pending = False
         self._fft_last_submit = 0.0
+
+        # 右侧 EEG/EMG 每通道 FFT（各通道行左 50% 频谱 + 右 50% 时域波形）：
+        # axes_bio_fft 与 axes_eeg 等长（无频谱的行为 None），bio_fft_lines 同理；
+        # 与 2D FFT 共用同一个单工作线程执行器，_bio_fft_pending 独立防堆积
+        self.axes_bio_fft = []
+        self.bio_fft_lines = []
+        self._bio_fft_pending = False
+        self._bio_fft_last_submit = 0.0
+        self._eeg_axes_signature = None   # (行数, fft 行号元组或 None)，布局不变时不重建子图
 
         # 实时频段滤波选中项（Live Filter 单选框）：(lo, hi) 或 None；
         # 经 _on_data 懒同步到各设备状态的回调线程滤波路径
@@ -922,9 +935,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_disconnected_sig.connect(self._on_device_disconnected)
         self.auto_reconnect_sig.connect(self._press_connect_for_address)
         self.replay_done_sig.connect(self._on_replay_done)
+        self.replay_member_done_sig.connect(self._finish_replay_member)
         self.analyze_done_sig.connect(self._on_analyze_done)
         self.dongle_check_sig.connect(self._on_dongle_check_result)
         self.fft_done_sig.connect(self._on_fft_done)
+        self.bio_fft_done_sig.connect(self._on_bio_fft_done)
 
         if not self.sensor_controller.hasDeviceFoundCallback:
             self.sensor_controller.onDeviceFoundCallback = self._on_device_found
@@ -988,6 +1003,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_multi_start.clicked.connect(self._multi_start)
         self.btn_multi_start.setEnabled(False)
 
+        self.btn_multi_replay = QtWidgets.QPushButton("Multi Replay Bin")
+        self.btn_multi_replay.clicked.connect(self._multi_replay_bin)
+
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
 
@@ -1036,6 +1054,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
         device_header_layout.addWidget(self.btn_multi_start)
+        device_header_layout.addWidget(self.btn_multi_replay)
         device_header_layout.addWidget(self.btn_check_dongle)
         device_layout.addLayout(device_header_layout)
         device_layout.addWidget(self.device_list)
@@ -1204,6 +1223,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self.figure_eeg, self.axes_eeg = plt.subplots(EEG_AXIS_COUNT, 1, sharex=True, figsize=(8, 12))
         self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4)
+        self.axes_bio_fft = [None] * EEG_AXIS_COUNT
+        self._eeg_axes_signature = (EEG_AXIS_COUNT, None)
         self.canvas_eeg = FigureCanvas(self.figure_eeg)
         self.bio_title_label = QtWidgets.QLabel("EMG / EEG Waveform")
         eeg_layout.addWidget(self.bio_title_label)
@@ -1587,8 +1608,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.btn_stop_scan.setEnabled(False)
             self.btn_connect.setEnabled(False)
             self.btn_disconnect.setEnabled(False)
+            self.btn_multi_start.setEnabled(False)
+            self.btn_multi_replay.setEnabled(False)
         else:
             self._update_button_states()
+            self.btn_multi_replay.setEnabled(True)
         self.btn_scan.setEnabled(not replaying)
         self.device_list.setEnabled(not replaying)
         self._debug_log_checkbox.setEnabled(not replaying)
@@ -1646,6 +1670,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self._replay_sensor = sensor
+        # 单文件回放不属于任何组：清空组成员表，
+        # transfer OFF 事件走单回放分支直接复位 _replay_active
+        self._replay_sensors = []
 
         # 回放传感器作为一台虚拟设备进入 device_states：
         # _on_data 按地址路由到它的 DeviceDataState，显示流程与实时设备一致
@@ -1670,6 +1697,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # onDataTransferStateChange 事件与 _on_replay_done 维护
         self._replay_active = True
         self.btn_replay.setEnabled(False)
+        self.btn_multi_replay.setEnabled(False)
         self.btn_replay_pause.setEnabled(True)
         self.btn_replay_pause.setText("Pause Replay")
         self.btn_replay_stop.setEnabled(True)
@@ -1691,26 +1719,168 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinReplay")
         self._replay_thread.start()
 
+    def _multi_replay_bin(self):
+        """选择多个 bin 文件，按共享时钟对齐同步回放（SDK multiReplayBinFile）：
+        全组最早首条数据记录为 t=0，保留采集时的相对偏移；暂停任一成员整组暂停。"""
+        if self.device_states:
+            self.status_label.setText("Please disconnect all devices before replaying bin files")
+            return
+        if self._replay_active:
+            return
+
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select Bin Files (Multi Replay)", start_dir, "Bin Files (*.bin)"
+        )
+        if not paths:
+            return
+        self._app_log(f"User: multi replay bin files: {paths}")
+
+        members = []  # (path, sensor, state)
+        seen_macs = set()
+        for path in paths:
+            config = self.sensor_controller.getBinFileInfo(path)
+            if config is None:
+                self._app_log(f"App: invalid bin file (no config record): {path}", "W")
+                continue
+            mac = config.get("device_mac")
+            if not mac:
+                self._app_log(f"App: invalid bin file (config missing device_mac): {path}", "W")
+                continue
+            if mac in seen_macs:
+                self._app_log(f"App: duplicate device mac skipped: {mac}", "W")
+                continue
+            seen_macs.add(mac)
+            name = config.get("device_name") or ""
+
+            # 用 bin 配置记录中的设备信息初始化显示缓冲区
+            info = DeviceInfo()
+            for key, value in (config.get("device_info") or {}).items():
+                if hasattr(info, key):
+                    try:
+                        setattr(info, key, value)
+                    except Exception:
+                        pass
+
+            sensor = self.sensor_controller.requireSensor(BLEDevice(name, mac, 0))
+            if sensor is None:
+                self._app_log(f"App: failed to create SensorProfile for {mac}", "E")
+                continue
+            sensor.onDataCallback = self._on_data
+            sensor.onErrorCallback = self._on_error
+            sensor.onDeviceInfoUpdate = self._on_device_info_update
+            sensor.onDataTransferStateChange = self._on_replay_transfer_state
+            sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
+
+            state = DeviceDataState(sensor)
+            state.info = info
+            state.init_buffers(info, EEG_AXIS_COUNT)
+            duration = config.get("replay_duration", 0.0)
+            state.status_text = (
+                f"Replaying: {Path(path).name} (duration {duration:.1f}s, multi-sync) ...")
+            members.append((path, sensor, state))
+        if len(members) < 2:
+            self.status_label.setText("Multi replay needs at least 2 valid bin files")
+            return
+
+        # 回放成员作为虚拟设备进入 device_states：_on_data 按地址路由到各自的
+        # DeviceDataState，显示流程与实时设备一致
+        self._replay_sensors = [sensor for _, sensor, _ in members]
+        # 组回放没有“主”成员：Pause/Stop 对全部成员下发（组时钟语义下幂等），
+        # 成员级收尾按各自的 transfer OFF 事件逐个进行
+        self._replay_sensor = None
+        for _, sensor, state in members:
+            self.device_states[sensor.BLEDevice.Address] = state
+            if state.info.EegSampleRate > 0:
+                state.sample_rate_state = ([], int(state.info.EegSampleRate))
+        self.current_sensor = members[0][1]
+        self._refresh_display_for_state(members[0][2])
+        if members[0][2].info.EegSampleRate > 0:
+            self._set_sample_rate_checked(int(members[0][2].info.EegSampleRate))
+
+        self._replay_paused = False
+        self._replay_stop_requested = False
+        # 先在点击路径上置位，挡住事件到达前的重复点击；之后由
+        # onDataTransferStateChange 事件与 _on_replay_done 维护
+        self._replay_active = True
+        self.btn_replay.setEnabled(False)
+        self.btn_multi_replay.setEnabled(False)
+        self.btn_replay_pause.setEnabled(True)
+        self.btn_replay_pause.setText("Pause Replay")
+        self.btn_replay_stop.setEnabled(True)
+        self._set_replay_mode_ui(True)
+
+        member_paths = [p for p, _, _ in members]
+        member_sensors = [s for _, s, _ in members]
+
+        def _do_replay():
+            try:
+                results = self.sensor_controller.multiReplayBinFile(
+                    member_paths, sensors=member_sensors, realtime=True)
+                ok_count = sum(1 for r in results if r is not None)
+                if self._replay_stop_requested:
+                    self.replay_done_sig.emit("Multi replay stopped")
+                elif ok_count == 0:
+                    self.replay_done_sig.emit("Multi replay failed to start")
+                else:
+                    self.replay_done_sig.emit(
+                        f"Multi replay finished: {ok_count}/{len(results)} device(s) ok")
+            except Exception as e:
+                self.replay_done_sig.emit(f"Multi replay error: {e}")
+
+        self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinMultiReplay")
+        self._replay_thread.start()
+
     def _on_replay_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
-        """回放会话的数据流开关事件（SDK 回调线程）：回放数据真正开始/结束时
-        更新 _replay_active；回放结束后的 UI 收尾仍由 replay_done_sig 携带结果消息完成。"""
-        self._replay_active = is_transferring
+        """回放会话的数据流开关事件（SDK 回调线程，对齐 C++ demo_multi）：
+        开始只刷新 _replay_active；结束时多文件回放按成员逐个收尾
+        （_finish_replay_member），单文件回放直接复位 _replay_active——
+        最终结果消息统一由回放线程的 replay_done_sig 携带。"""
+        if is_transferring:
+            self._replay_active = True
         self._app_log(
             f"App: replay data transfer {'started' if is_transferring else 'stopped'}",
             sensor=sensor)
+        if not is_transferring:
+            if self._replay_sensors:
+                self.replay_member_done_sig.emit(sensor)
+            else:
+                self._replay_active = False
+
+    def _finish_replay_member(self, sensor: SensorProfile):
+        """多文件回放的单个成员结束（UI 线程）：立即移除它的虚拟设备状态，
+        显示切到剩余成员；全部成员结束后复位 _replay_active，
+        最终收尾仍由回放线程的 replay_done_sig 完成。"""
+        if sensor not in self._replay_sensors:
+            return
+        mac = sensor.BLEDevice.Address
+        self._replay_sensors.remove(sensor)
+        self.device_states.pop(mac, None)
+        if self.current_sensor is sensor:
+            self.current_sensor = self._replay_sensors[0] if self._replay_sensors else None
+            next_state = None
+            if self.current_sensor is not None:
+                next_state = self.device_states.get(self.current_sensor.BLEDevice.Address)
+            self._refresh_display_for_state(next_state)
+        if not self._replay_sensors:
+            self._replay_active = False
 
     def _toggle_replay_pause(self):
-        """暂停/恢复当前回放。"""
-        sensor = self._replay_sensor
-        if sensor is None:
+        """暂停/恢复当前回放（多文件回放对每个成员下发——组时钟语义下幂等）。"""
+        sensors = list(self._replay_sensors) if self._replay_sensors else (
+            [self._replay_sensor] if self._replay_sensor is not None else [])
+        if not sensors:
             return
         action = "resume" if self._replay_paused else "pause"
-        if self._replay_paused:
-            result = self.sensor_controller.resumeBinReplay(sensor)
-        else:
-            result = self.sensor_controller.pauseBinReplay(sensor)
-        self._app_log(f"User: {action} replay -> {result}",
-                      "I" if result == "OK" else "W", sensor)
+        result = "OK"
+        for sensor in sensors:
+            if self._replay_paused:
+                result = self.sensor_controller.resumeBinReplay(sensor)
+            else:
+                result = self.sensor_controller.pauseBinReplay(sensor)
+            self._app_log(f"User: {action} replay -> {result}",
+                          "I" if result == "OK" else "W", sensor)
         if result != "OK":
             self.status_label.setText(f"Replay pause/resume failed: {result}")
             return
@@ -1723,32 +1893,42 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.status_label.setText("Replaying ...")
 
     def _stop_replay(self):
-        """停止当前回放。"""
-        sensor = self._replay_sensor
-        if sensor is None:
+        """停止当前回放（多文件回放时逐个停止所有成员）。"""
+        sensors = list(self._replay_sensors) if self._replay_sensors else (
+            [self._replay_sensor] if self._replay_sensor is not None else [])
+        if not sensors:
             return
         self._replay_stop_requested = True
         self.btn_replay_stop.setEnabled(False)
         self.btn_replay_pause.setEnabled(False)
-        result = self.sensor_controller.stopBinReplay(sensor)
-        self._app_log(f"User: stop replay -> {result}",
-                      "I" if result == "OK" else "W", sensor)
-        if result != "OK":
-            self.status_label.setText(f"Stop replay failed: {result}")
+        results = []
+        for sensor in sensors:
+            result = self.sensor_controller.stopBinReplay(sensor)
+            results.append(result)
+            self._app_log(f"User: stop replay -> {result}",
+                          "I" if result == "OK" else "W", sensor)
+        if all(r != "OK" for r in results):
+            self.status_label.setText(f"Stop replay failed: {results[0]}")
             return
         self.status_label.setText("Stopping replay ...")
 
     def _on_replay_done(self, message: str):
         self._app_log(f"App: replay done: {message}")
-        # 回放结束：移除回放用的虚拟设备状态，恢复实时设备控件
-        sensor = self._replay_sensor
-        if sensor is not None:
+        # 回放结束：移除回放用的虚拟设备状态（成员级收尾可能已移除一部分），
+        # 恢复实时设备控件
+        sensors = list(self._replay_sensors)
+        if self._replay_sensor is not None and self._replay_sensor not in sensors:
+            sensors.append(self._replay_sensor)
+        for sensor in sensors:
             self.device_states.pop(sensor.BLEDevice.Address, None)
             if self.current_sensor is sensor:
                 self.current_sensor = None
+        self._replay_sensors = []
+        self._replay_sensor = None
         self._refresh_display_for_state(None)
         self.status_label.setText(message)
         self.btn_replay.setEnabled(True)
+        self.btn_multi_replay.setEnabled(True)
         self.btn_replay_pause.setEnabled(False)
         self.btn_replay_pause.setText("Pause Replay")
         self.btn_replay_stop.setEnabled(False)
@@ -2044,6 +2224,54 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.ax_fft.autoscale_view(scalex=False)
         self.canvas_2d.draw_idle()
 
+    def _submit_bio_fft(self, dt, sample_rate: int, buf_snapshot):
+        """右侧 EEG/EMG 每通道频谱：把已按时间序重排的缓冲快照打包成闭包
+        提交到工作线程（与 2D FFT 共用同一个单线程执行器，任务串行执行），
+        计算不占用 UI 线程；结果经 bio_fft_done_sig 回 UI 线程。"""
+        self._bio_fft_pending = True
+
+        def _compute_bio_fft():
+            try:
+                # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
+                window = np.hanning(buf_snapshot.shape[1])
+                windowed = buf_snapshot * window
+                mags = np.abs(np.fft.rfft(windowed, axis=1)) / max(window.sum(), 1e-12) * 2
+                freqs = np.fft.rfftfreq(buf_snapshot.shape[1], d=1.0 / sample_rate)
+                self.bio_fft_done_sig.emit(int(dt), freqs, mags)
+            except Exception as e:
+                print(f"[FFT] bio compute error: {e}")
+            finally:
+                self._bio_fft_pending = False
+
+        try:
+            self._fft_executor.submit(_compute_bio_fft)
+        except RuntimeError:
+            # 窗口关闭后执行器已 shutdown，退出途中的最后一次定时器触发
+            self._bio_fft_pending = False
+
+    def _on_bio_fft_done(self, dt_value: int, freqs, mags):
+        """工作线程 EEG/EMG FFT 结果（经 bio_fft_done_sig 回到 UI 线程）：
+        逐通道刷新各行左侧的频谱子图。结果到达期间显示模式可能已切换
+        （EMG↔EEG↔PPG、翻页），类型或行数不匹配的结果直接丢弃。"""
+        state = self._current_state()
+        expected = (DataType.NTF_EMG if state is not None and state.bio_kind == "emg"
+                    else DataType.NTF_EEG)
+        if dt_value != int(expected) or not self.bio_fft_lines:
+            return
+        updated = False
+        for row, line in enumerate(self.bio_fft_lines):
+            if line is None or row >= mags.shape[0]:
+                continue
+            line.set_data(freqs, mags[row])
+            ax = line.axes
+            if freqs.size:
+                ax.set_xlim(0, freqs[-1])
+            ax.relim()
+            ax.autoscale_view(scalex=False)
+            updated = True
+        if updated:
+            self.canvas_eeg.draw_idle()
+
     # ── Right-side EMG / EEG (+ ECG + BRTH) Waveform ──────────────────────────
 
     def _eeg_page_count(self) -> int:
@@ -2096,17 +2324,43 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._update_page_label()
             self._update_page_buttons()
 
-    def _reset_eeg_axes(self, count: int):
-        """按显示模式重建右侧共享图表的子图（EEG/EMG 模式 8 个，PPG 模式 6 个）；
-        子图数量与当前一致时不做任何事，否则清空 figure 重新创建。"""
-        if len(self.axes_eeg) == count:
+    def _reset_eeg_axes(self, count: int, fft_rows=None):
+        """按显示模式重建右侧共享图表的子图。
+        fft_rows 为 None（PPG 模式）：单列布局，每行一个通宽波形子图；
+        否则 fft_rows 为「左 FFT 频谱 + 右时域波形」各 50% 宽度的行号集合
+        （EEG/EMG 模式的通道行），其余行（ECG/BRTH/未用）为通宽波形。
+        布局签名与当前一致时不做任何事，否则清空 figure 重新创建。"""
+        signature = (count, None if fft_rows is None else tuple(sorted(fft_rows)))
+        if self._eeg_axes_signature == signature:
             return
+        self._eeg_axes_signature = signature
         self.figure_eeg.clf()
-        axes = [self.figure_eeg.add_subplot(count, 1, 1)]
-        for i in range(1, count):
-            axes.append(self.figure_eeg.add_subplot(count, 1, i + 1, sharex=axes[0]))
-        self.axes_eeg = axes
-        self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4)
+        self.bio_fft_lines = []
+        if fft_rows is None:
+            axes = [self.figure_eeg.add_subplot(count, 1, 1)]
+            for i in range(1, count):
+                axes.append(self.figure_eeg.add_subplot(count, 1, i + 1, sharex=axes[0]))
+            self.axes_eeg = axes
+            self.axes_bio_fft = [None] * count
+        else:
+            grid = self.figure_eeg.add_gridspec(count, 2, width_ratios=[1, 1])
+            axes = []
+            fft_axes = []
+            first_wave = None
+            for i in range(count):
+                if i in fft_rows:
+                    fax = self.figure_eeg.add_subplot(grid[i, 0])
+                    wax = self.figure_eeg.add_subplot(grid[i, 1], sharex=first_wave)
+                else:
+                    fax = None
+                    wax = self.figure_eeg.add_subplot(grid[i, :], sharex=first_wave)
+                if first_wave is None:
+                    first_wave = wax
+                axes.append(wax)
+                fft_axes.append(fax)
+            self.axes_eeg = axes
+            self.axes_bio_fft = fft_axes
+        self.figure_eeg.subplots_adjust(left=0.05, right=0.9, hspace=0.4, wspace=0.25)
 
     def _rebuild_eeg_plot(self):
         state = self._current_state()
@@ -2116,7 +2370,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if state is not None and state.bio_kind == "emg":
             self._rebuild_emg_plot(state)
             return
-        self._reset_eeg_axes(EEG_AXIS_COUNT)
         eeg_available = False
         ecg_available = False
         brth_available = False
@@ -2156,6 +2409,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 state.eeg_buffer_lock.unlock()
 
         if not eeg_available:
+            self._reset_eeg_axes(EEG_AXIS_COUNT, set())
+            self.bio_fft_lines = []
             for ax in self.axes_eeg:
                 ax.cla()
                 ax.set_visible(True)
@@ -2194,6 +2449,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
+        # EEG 通道行：左 50% FFT 频谱 + 右 50% 时域波形；ECG/BRTH/未用行通宽
+        self._reset_eeg_axes(EEG_AXIS_COUNT, set(range(page_eeg_count)))
+        self.bio_fft_lines = [None] * len(self.axes_eeg)
+
         brth_axis_index = len(self.axes_eeg) - 1 if brth_available else None
         ecg_axis_index = len(self.axes_eeg) - 1 - int(brth_available) if ecg_available else None
 
@@ -2218,6 +2477,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
+                # 左半：该通道的 FFT 频谱子图（数据由工作线程结果异步填充）
+                fax = self.axes_bio_fft[ch]
+                if fax is not None:
+                    fax.cla()
+                    (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                    self.bio_fft_lines[ch] = fft_line
+                    fax.tick_params(axis='both', labelsize=7)
+                    fax.set_ylabel(f"EEG-{eeg_ch + 1}", fontsize=8, color=color,
+                                   rotation=0, va='center', ha='right', labelpad=10)
+                    for spine in fax.spines.values():
+                        spine.set_color(color)
             elif ch == ecg_axis_index and ecg_available:
                 color = plt.cm.tab10(7)
                 y_data = np.roll(ecg_buffer_copy[0], -ecg_buffer_index)
@@ -2248,13 +2518,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.set_visible(False)
 
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
+        fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
+        if fft_axes_used:
+            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
 
     def _rebuild_emg_plot(self, state: DeviceDataState):
-        """EMG 设备的右侧显示区：复用 EEG 的 8 个子图，显示 EMG 通道（不分页）。"""
-        self._reset_eeg_axes(EEG_AXIS_COUNT)
+        """EMG 设备的右侧显示区：复用 EEG 的 8 行子图区，显示 EMG 通道（不分页），
+        每个通道行左 50% 为 FFT 频谱、右 50% 为时域波形。"""
         emg_available = False
         emg_buffer_copy = None
         emg_idx_buf_copy = None
@@ -2282,6 +2555,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
 
         if not emg_available:
+            self._reset_eeg_axes(EEG_AXIS_COUNT, set())
+            self.bio_fft_lines = []
             for ax in self.axes_eeg:
                 ax.cla()
                 ax.set_visible(True)
@@ -2298,7 +2573,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
 
         if display_channels == 0:
-            display_channels = min(emg_buffer_copy.shape[0], len(self.axes_eeg))
+            display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT)
+
+        # 每个 EMG 通道行：左 50% FFT 频谱 + 右 50% 时域波形
+        self._reset_eeg_axes(EEG_AXIS_COUNT, set(range(display_channels)))
+        self.bio_fft_lines = [None] * len(self.axes_eeg)
 
         self.emg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, emg_buffer_copy.shape[1])
@@ -2317,17 +2596,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
+                # 左半：该通道的 FFT 频谱子图（数据由工作线程结果异步填充）
+                fax = self.axes_bio_fft[ch]
+                if fax is not None:
+                    fax.cla()
+                    (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                    self.bio_fft_lines[ch] = fft_line
+                    fax.tick_params(axis='both', labelsize=7)
+                    fax.set_ylabel(f"EMG-{ch + 1}", fontsize=8, color=color,
+                                   rotation=0, va='center', ha='right', labelpad=10)
+                    for spine in fax.spines.values():
+                        spine.set_color(color)
             else:
                 ax.set_visible(False)
 
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
+        fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
+        if fft_axes_used:
+            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
 
     def _rebuild_ppg_plot(self, state: DeviceDataState):
         """PPG 设备的右侧显示区：6 个子图（2×EEG fp1/fp2 + 2×PPG red/ir + 2×SpO2）。"""
-        self._reset_eeg_axes(PPG_AXIS_COUNT)
+        self._reset_eeg_axes(PPG_AXIS_COUNT, None)
         buffers_copy = {}
         idx_buffers_copy = {}
         has_any_data = False
@@ -2350,6 +2643,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.ecg_line = None
         self.brth_line = None
         self.emg_lines = []
+        self.bio_fft_lines = []
         self._eeg_display_channels = 0
 
         if not has_any_data:
@@ -2721,6 +3015,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         )
                         ax.yaxis.set_label_position("right")
 
+                # 每通道 FFT：本页通道重排后的快照提交工作线程，结果经信号异步回填
+                now_fft = time.time()
+                if (not self._bio_fft_pending
+                        and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    sr = state.eeg_sample_rate or state.nominal_rates.get(DataType.NTF_EEG) or 0
+                    if sr > 0 and self._eeg_display_channels > 0:
+                        snapshot = np.roll(
+                            eeg_buffer_copy[start_ch:start_ch + self._eeg_display_channels],
+                            -eeg_buffer_index, axis=1)
+                        self._bio_fft_last_submit = now_fft
+                        self._submit_bio_fft(DataType.NTF_EEG, sr, snapshot)
+
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EEG] = current_last_idx
 
@@ -2827,6 +3133,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         )
                         ax.yaxis.set_label_position("right")
 
+                # 每通道 FFT：显示通道重排后的快照提交工作线程，结果经信号异步回填
+                now_fft = time.time()
+                if (not self._bio_fft_pending
+                        and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    sr = state.emg_sample_rate or state.nominal_rates.get(DataType.NTF_EMG) or 0
+                    if sr > 0:
+                        snapshot = np.roll(
+                            emg_buffer_copy[:len(self.emg_lines)],
+                            -emg_buffer_index, axis=1)
+                        self._bio_fft_last_submit = now_fft
+                        self._submit_bio_fft(DataType.NTF_EMG, sr, snapshot)
+
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EMG] = current_last_idx
 
@@ -2864,14 +3182,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if state == DeviceStateEx.Disconnected:
             self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
-    def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool) -> bool:
+    def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer) -> None:
         """onAutoReconnect 回调（SDK 恢复线程）：自动重连找回设备时，
         等效于按下 Connect 按钮——转到 UI 线程执行完整连接流程。
         restore=True 时流程结束后回放上次会话的参数（保留和恢复原有设置）。
-        返回 True 表示由本流程接管（SDK 不再执行默认的参数回放恢复）。"""
+        异步应答 answer(True) 表示由本流程接管（SDK 不再执行默认的参数回放恢复）。"""
         sensor.log(f"App: auto reconnect callback received, restore={restore}")
         self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
-        return True
+        answer(True)
 
     def _press_connect_for_address(self, addr: str, restore: bool = True):
         """在设备列表中选中该地址，并执行与按下 Connect 按钮完全相同的流程。
