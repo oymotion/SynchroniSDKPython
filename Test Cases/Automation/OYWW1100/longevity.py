@@ -69,21 +69,34 @@ class DataCounter:
     def __init__(self):
         self.batches = 0
         self.samples = 0
+        self.calls = 0          # onDataCallback 被调用的次数（诊断：区分“没回调”还是“空回调”）
         self.lock = threading.Lock()
 
     def __call__(self, sensor, data):
         items = data if isinstance(data, list) else [data]
         with self.lock:
+            self.calls += 1
             self.batches += len(items)
             for it in items:
                 try:
-                    self.samples += it.getSampleCount() or 0
+                    cs = it.channelSamples
                 except Exception:
-                    pass
+                    continue
+                if not cs:
+                    continue
+                n = 0
+                try:
+                    n = sum(len(ch) for ch in cs)
+                except Exception:
+                    try:
+                        n = len(cs)
+                    except Exception:
+                        n = 0
+                self.samples += n
 
     def snapshot(self):
         with self.lock:
-            return self.batches, self.samples
+            return self.batches, self.samples, self.calls
 
 def _teardown(ctrl, sensor, log_dir, bins_before, stream_seconds=None):
     """统一收尾：尝试停流/断开、导出并校验 bin、打印 log 目录，并清理资源。
@@ -371,7 +384,7 @@ def main():
                 exit_reason = f"设备状态异常（deviceState={sensor.deviceState}）"
                 break
 
-            batches, samples = counter.snapshot()
+            batches, samples, calls = counter.snapshot()
 
             # 退出条件 4：数据停滞（连续 STALL_CHECK_CYCLES 个周期 batches 无增长）
             if last_batches is not None and batches == last_batches:
@@ -384,7 +397,7 @@ def main():
                 stall_cycles = 0
             last_batches = batches
 
-            print(f"[状态] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本", flush=True)
+            print(f"[状态] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本  回调={calls}次", flush=True)
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         exit_reason = "用户手动中断（Ctrl+C）"
