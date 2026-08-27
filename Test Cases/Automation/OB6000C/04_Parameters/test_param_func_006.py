@@ -6,9 +6,9 @@
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) getParam("EEG_SAMPLE_RATE") 返回当前采样率
-  3) getParam("EEG_SAMPLE_RATE_LIST") 返回管道分隔的可选值列表
-  4) 验证返回值格式合法
+  2) getParam("EEG_SAMPLE_RATE") 应返回 "250"（OB6000C 固定 250）
+  3) getParam("EEG_SAMPLE_RATE_LIST") 应返回 "250"（仅一个值）
+  4) setParam("EEG_SAMPLE_RATE", "500") 应返回 Error（不支持）
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -121,17 +121,7 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # 能力判定
-    info = sensor.getDeviceInfo()
-    if info is not None:
-        try:
-            eeg_ch = int(getattr(info, 'EegChannelCount', 0) or 0)
-            print(f"[能力] EegChannelCount = {eeg_ch}", flush=True)
-        except Exception as e:
-            eeg_ch = 0
-            print(f"[能力] 读取 EegChannelCount 异常: {e}", flush=True)
-
-    # ---- getParam("EEG_SAMPLE_RATE") ----
+    # ---- getParam("EEG_SAMPLE_RATE")：OB6000C 固定 250 ----
     print("\n[getParam] EEG_SAMPLE_RATE ...", flush=True)
     try:
         current_rate = sensor.getParam("EEG_SAMPLE_RATE")
@@ -140,13 +130,13 @@ def main():
         current_rate = f"抛异常 {type(e).__name__}: {e}"
         print(f"[getParam] EEG_SAMPLE_RATE 异常: {e}", flush=True)
 
-    rate_ok = (current_rate is not None and isinstance(current_rate, str) and not current_rate.startswith("Error"))
-    record(results, "getParam('EEG_SAMPLE_RATE') 返回有效值",
-           rate_ok,
-           "getParam('EEG_SAMPLE_RATE') 返回非 Error 字符串",
+    rate_is_250 = (isinstance(current_rate, str) and current_rate.strip() == "250")
+    record(results, "getParam('EEG_SAMPLE_RATE') 返回 250",
+           rate_is_250,
+           "getParam('EEG_SAMPLE_RATE') == '250'（OB6000C 固定 250）",
            f"返回 {current_rate!r}")
 
-    # ---- getParam("EEG_SAMPLE_RATE_LIST") ----
+    # ---- getParam("EEG_SAMPLE_RATE_LIST")：固定仅 250 ----
     print("\n[getParam] EEG_SAMPLE_RATE_LIST ...", flush=True)
     try:
         rate_list_str = sensor.getParam("EEG_SAMPLE_RATE_LIST")
@@ -155,36 +145,31 @@ def main():
         rate_list_str = f"抛异常 {type(e).__name__}: {e}"
         print(f"[getParam] EEG_SAMPLE_RATE_LIST 异常: {e}", flush=True)
 
-    # 验证格式：管道分隔的数字列表
-    list_ok = False
-    if isinstance(rate_list_str, str) and not rate_list_str.startswith("Error"):
+    list_is_250 = False
+    if isinstance(rate_list_str, str):
         rates = [r.strip() for r in rate_list_str.split("|") if r.strip()]
-        if rates:
-            try:
-                _ = [int(r) for r in rates]
-                list_ok = True
-                print(f"[getParam] EEG_SAMPLE_RATE_LIST 解析为: {rates}", flush=True)
-            except ValueError:
-                print(f"[getParam] EEG_SAMPLE_RATE_LIST 包含非数字值: {rates}", flush=True)
-        else:
-            print(f"[getParam] EEG_SAMPLE_RATE_LIST 为空列表", flush=True)
-    else:
-        print(f"[getParam] EEG_SAMPLE_RATE_LIST 返回 Error 或异常: {rate_list_str!r}", flush=True)
-
-    record(results, "getParam('EEG_SAMPLE_RATE_LIST') 返回管道分隔的有效值列表",
-           list_ok,
-           "getParam('EEG_SAMPLE_RATE_LIST') 返回如 '250|500|1000' 的管道分隔数字列表",
+        list_is_250 = (rates == ["250"])
+        print(f"[getParam] EEG_SAMPLE_RATE_LIST 解析为: {rates}", flush=True)
+    record(results, "getParam('EEG_SAMPLE_RATE_LIST') 返回仅 250",
+           list_is_250,
+           "getParam('EEG_SAMPLE_RATE_LIST') == '250'（OB6000C 固定 250）",
            f"返回 {rate_list_str!r}")
 
-    # 验证当前采样率在列表中
-    if rate_ok and list_ok and isinstance(current_rate, str):
-        supported = set(r.strip() for r in rate_list_str.split("|") if r.strip())
-        in_list = current_rate in supported
-        print(f"\n[验证] 当前 EEG_SAMPLE_RATE={current_rate} 是否在支持列表中: {in_list}", flush=True)
-        record(results, "当前 EEG_SAMPLE_RATE 在 LIST 中",
-               in_list,
-               f"当前值 {current_rate} 在 {supported} 中",
-               f"当前值={current_rate}, 列表={supported}")
+    # ---- setParam("EEG_SAMPLE_RATE", "500")：应报错 ----
+    print("\n[setParam] EEG_SAMPLE_RATE='500'（不支持值）...", flush=True)
+    try:
+        r500 = sensor.setParam("EEG_SAMPLE_RATE", "500")
+        ret500 = f"返回 {r500!r}"
+    except Exception as e:
+        r500 = f"抛异常 {type(e).__name__}: {e}"
+        ret500 = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[setParam] EEG_SAMPLE_RATE='500' -> {ret500}", flush=True)
+
+    is_error_500 = (isinstance(r500, str) and r500.startswith("Error")) or ("异常" in ret500)
+    record(results, "setParam('EEG_SAMPLE_RATE','500') 返回 Error",
+           is_error_500,
+           "setParam('EEG_SAMPLE_RATE','500') 返回 Error 或抛异常",
+           ret500)
 
     # 清理
     try:

@@ -2,12 +2,15 @@
 """压力测试：反复连接-长时间起流-断开，尝试重现设备状态异常。
 
 流程（循环 多 次，由 MAX_ROUNDS 控制）：
+  0) 测试开始时长期开启日志（setLogPath + setDebugEnabled），打印日志目录
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) 注册 onPowerChanged 回调，记录电量
-  3) startDataNotification 起流，持续 STREAM_SECONDS 秒
-  4) 每 CHECK_INTERVAL 秒输出当前电量，不因电量变化提前退出
-  5) stopDataNotification + disconnect
-  6) 若 startDataNotification 返回 False，立即停止，记录失败轮次
+  3) setParam("DEBUG_BLE_DATA_PATH", "True") 开启 bin 录制
+  4) startDataNotification 起流，持续 STREAM_SECONDS 秒
+  5) 每 CHECK_INTERVAL 秒输出当前电量，不因电量变化提前退出
+  6) stopDataNotification + 读取 bin 路径 + disconnect
+  7) 若 startDataNotification 返回 False，立即停止，记录失败轮次
+  8) 出错时打印日志目录与最近生成的 bin 文件位置，便于定位
 
 与 batt_func_002 的逻辑一致：单次长时间起流观察 onPowerChanged 回调，
 但循环多次，目的是复现"长时间起流后设备状态异常导致下次起流失败"。
@@ -20,6 +23,7 @@
 import os
 import sys
 import time
+import tempfile
 import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,16 +35,38 @@ import config
 import common
 from common import _identity_of, match_target
 
-MAX_ROUNDS = 10          # 共跑 10 轮
-STREAM_SECONDS = 100     # 每轮起流时长 100 秒
-CHECK_INTERVAL = 20      # 每 20 秒输出一次电量
+MAX_ROUNDS = 50          # 共跑 10 轮
+STREAM_SECONDS = 120     # 每轮起流时长 100 秒
+CHECK_INTERVAL = 30      # 每 20 秒输出一次电量
 
 
 def _on_error(sensor, reason):
     print(f"  [onError] {reason}", flush=True)
 
 
-def _one_round(ctrl, round_num):
+def _list_bins(log_dir):
+    """列出日志目录下所有 .bin 文件（按文件名排序）。"""
+    if not log_dir or not os.path.isdir(log_dir):
+        return []
+    out = []
+    try:
+        for fn in sorted(os.listdir(log_dir)):
+            if fn.lower().endswith(".bin"):
+                out.append(os.path.join(log_dir, fn))
+    except OSError:
+        pass
+    return out
+
+
+def _get_ble_path(sensor):
+    """读取当前 bin 录制路径（未开启/异常时返回 None）。"""
+    try:
+        return sensor.getParam("DEBUG_BLE_DATA_PATH")
+    except Exception:
+        return None
+
+
+def _one_round(ctrl, round_num, log_dir):
     """执行一次完整的连接-长时间起流-断开。返回 (ok, detail)。"""
     print(f"\n---- 第 {round_num}/{MAX_ROUNDS} 轮 ----", flush=True)
 
@@ -128,6 +154,13 @@ def _one_round(ctrl, round_num):
 
     sensor.onPowerChanged = on_power_changed
 
+    # 开启 bin 录制（每轮生成一个 bin，供出错时定位）
+    try:
+        bret = sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
+        print(f"  [bin] setParam('DEBUG_BLE_DATA_PATH','True') -> {bret!r}", flush=True)
+    except Exception as e:
+        print(f"  [bin] setParam('DEBUG_BLE_DATA_PATH','True') 抛异常: {type(e).__name__}: {e}", flush=True)
+
     # 起流
     print(f"  [起流] ...", flush=True)
     try:
@@ -169,13 +202,25 @@ def _one_round(ctrl, round_num):
     except Exception as e:
         print(f"  [停流] 抛异常: {type(e).__name__}: {e}", flush=True)
 
+    # 读取 bin 路径
+    ble_path = _get_ble_path(sensor)
+    if ble_path:
+        print(f"  [bin] 本轮 bin 路径: {ble_path}", flush=True)
+    else:
+        bins = _list_bins(log_dir)
+        if bins:
+            ble_path = bins[-1]
+            print(f"  [bin] 本轮 bin 路径（目录兜底）: {ble_path}", flush=True)
+        else:
+            print(f"  [bin] 未读到 bin 路径（目录 {log_dir} 中暂无 .bin）", flush=True)
+
     # 断开
     try:
         sensor.disconnect()
     except Exception as e:
         print(f"  [断开] 抛异常: {type(e).__name__}: {e}", flush=True)
 
-    return True, f"第 {round_num} 轮完成（{total_callbacks} 次电量回调）"
+    return True, f"第 {round_num} 轮完成（{total_callbacks} 次电量回调，bin={ble_path}）"
 
 
 def main():
@@ -200,17 +245,25 @@ def main():
         ctrl.terminate()
         return
 
+    # 长期开启日志：创建日志目录并启用 debug 日志
+    log_dir = tempfile.mkdtemp(prefix="sdklog_stress_")
+    print(f"\n[日志] 日志目录（长期开启）: {log_dir}", flush=True)
     try:
-        ctrl.setDebugEnabled(False)
-    except Exception:
-        pass
+        ctrl.setLogPath(True, log_dir)
+    except Exception as e:
+        print(f"[日志] setLogPath 异常: {type(e).__name__}: {e}", flush=True)
+    try:
+        ctrl.setDebugEnabled(True)
+        print("[日志] setDebugEnabled(True) 已开启", flush=True)
+    except Exception as e:
+        print(f"[日志] setDebugEnabled 异常: {type(e).__name__}: {e}", flush=True)
 
     start_time = time.time()
     fail_round = None
     total_rounds = 0
 
     for i in range(1, MAX_ROUNDS + 1):
-        ok, detail = _one_round(ctrl, i)
+        ok, detail = _one_round(ctrl, i, log_dir)
         total_rounds = i
 
         if ok:
@@ -218,6 +271,14 @@ def main():
             print(f"  [OK] {detail}（累计 {elapsed:.0f}s）", flush=True)
         else:
             print(f"\n[FAIL] {detail}", flush=True)
+            print(f"[定位] 日志目录: {log_dir}", flush=True)
+            bins = _list_bins(log_dir)
+            if bins:
+                print(f"[定位] 已生成 bin 文件（共 {len(bins)} 个）:", flush=True)
+                for b in bins:
+                    print(f"    {b}", flush=True)
+            else:
+                print(f"[定位] 日志目录中无 .bin 文件（本轮出错点可能在起流前）", flush=True)
             fail_round = i
             break
 
@@ -232,6 +293,7 @@ def main():
     print("=" * 60, flush=True)
     print(f"  完成轮次: {total_rounds}/{MAX_ROUNDS}", flush=True)
     print(f"  总耗时: {elapsed:.0f}s（{elapsed / 60:.1f} 分钟）", flush=True)
+    print(f"  日志目录: {log_dir}", flush=True)
 
     if fail_round is not None:
         print(f"\n  状态异常发生在第 {fail_round} 轮", flush=True)
