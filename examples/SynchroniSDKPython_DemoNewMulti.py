@@ -832,7 +832,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     analyze_done_sig = QtCore.pyqtSignal(str, str)
     dongle_check_sig = QtCore.pyqtSignal(str)
     fft_done_sig = QtCore.pyqtSignal(int, object, object)   # (data_type, freqs, mags)，工作线程→UI 线程
-    bio_fft_done_sig = QtCore.pyqtSignal(int, object, object)   # 右侧 EEG/EMG 每通道 FFT：(data_type, freqs, mags)
+    bio_fft_done_sig = QtCore.pyqtSignal(int, object, object)   # 右侧生物电每行 FFT：(data_type, {行号: freqs}, {行号: mags})
 
     def __init__(self):
         super().__init__()
@@ -888,7 +888,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._fft_pending = False
         self._fft_last_submit = 0.0
 
-        # 右侧 EEG/EMG 每通道 FFT（各通道行左 50% 频谱 + 右 50% 时域波形）：
+        # 右侧生物电每行 FFT（EEG/EMG/ECG/PPG 行：左 50% 频谱 + 右 50% 时域波形）：
         # axes_bio_fft 与 axes_eeg 等长（无频谱的行为 None），bio_fft_lines 同理；
         # 与 2D FFT 共用同一个单工作线程执行器，_bio_fft_pending 独立防堆积
         self.axes_bio_fft = []
@@ -2224,20 +2224,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.ax_fft.autoscale_view(scalex=False)
         self.canvas_2d.draw_idle()
 
-    def _submit_bio_fft(self, dt, sample_rate: int, buf_snapshot):
-        """右侧 EEG/EMG 每通道频谱：把已按时间序重排的缓冲快照打包成闭包
-        提交到工作线程（与 2D FFT 共用同一个单线程执行器，任务串行执行），
-        计算不占用 UI 线程；结果经 bio_fft_done_sig 回 UI 线程。"""
+    def _submit_bio_fft(self, dt, row_specs):
+        """右侧生物电每行频谱：row_specs 为 [(行号, 已按时间序重排的 1-D 波形快照,
+        采样率), ...]，各行采样率可不同（ECG/PPG 行与 EEG 行混排）。
+        打包成闭包提交到工作线程（与 2D FFT 共用同一个单线程执行器，任务串行执行），
+        计算不占用 UI 线程；结果（按行号索引的字典）经 bio_fft_done_sig 回 UI 线程。"""
         self._bio_fft_pending = True
 
         def _compute_bio_fft():
             try:
-                # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
-                window = np.hanning(buf_snapshot.shape[1])
-                windowed = buf_snapshot * window
-                mags = np.abs(np.fft.rfft(windowed, axis=1)) / max(window.sum(), 1e-12) * 2
-                freqs = np.fft.rfftfreq(buf_snapshot.shape[1], d=1.0 / sample_rate)
-                self.bio_fft_done_sig.emit(int(dt), freqs, mags)
+                freqs_map = {}
+                mags_map = {}
+                for row, data, sr in row_specs:
+                    if sr <= 0 or data.size == 0:
+                        continue
+                    # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
+                    window = np.hanning(data.size)
+                    windowed = data * window
+                    mags_map[row] = np.abs(np.fft.rfft(windowed)) / max(window.sum(), 1e-12) * 2
+                    freqs_map[row] = np.fft.rfftfreq(data.size, d=1.0 / sr)
+                self.bio_fft_done_sig.emit(int(dt), freqs_map, mags_map)
             except Exception as e:
                 print(f"[FFT] bio compute error: {e}")
             finally:
@@ -2249,20 +2255,28 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             # 窗口关闭后执行器已 shutdown，退出途中的最后一次定时器触发
             self._bio_fft_pending = False
 
-    def _on_bio_fft_done(self, dt_value: int, freqs, mags):
-        """工作线程 EEG/EMG FFT 结果（经 bio_fft_done_sig 回到 UI 线程）：
-        逐通道刷新各行左侧的频谱子图。结果到达期间显示模式可能已切换
-        （EMG↔EEG↔PPG、翻页），类型或行数不匹配的结果直接丢弃。"""
+    def _on_bio_fft_done(self, dt_value: int, freqs_map, mags_map):
+        """工作线程生物电 FFT 结果（经 bio_fft_done_sig 回到 UI 线程）：
+        按行号刷新各行左侧的频谱子图。结果到达期间显示模式可能已切换
+        （EMG↔EEG↔PPG、翻页），类型或行号不匹配的结果直接丢弃。"""
         state = self._current_state()
-        expected = (DataType.NTF_EMG if state is not None and state.bio_kind == "emg"
-                    else DataType.NTF_EEG)
+        expected = DataType.NTF_EEG
+        if state is not None:
+            if state.bio_kind == "emg":
+                expected = DataType.NTF_EMG
+            elif state.bio_kind == "ppg":
+                expected = DataType.NTF_PPG
         if dt_value != int(expected) or not self.bio_fft_lines:
             return
         updated = False
         for row, line in enumerate(self.bio_fft_lines):
-            if line is None or row >= mags.shape[0]:
+            if line is None:
                 continue
-            line.set_data(freqs, mags[row])
+            freqs = freqs_map.get(row)
+            mags = mags_map.get(row)
+            if freqs is None or mags is None:
+                continue
+            line.set_data(freqs, mags)
             ax = line.axes
             if freqs.size:
                 ax.set_xlim(0, freqs[-1])
@@ -2326,9 +2340,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _reset_eeg_axes(self, count: int, fft_rows=None):
         """按显示模式重建右侧共享图表的子图。
-        fft_rows 为 None（PPG 模式）：单列布局，每行一个通宽波形子图；
+        fft_rows 为 None：单列布局，每行一个通宽波形子图；
         否则 fft_rows 为「左 FFT 频谱 + 右时域波形」各 50% 宽度的行号集合
-        （EEG/EMG 模式的通道行），其余行（ECG/BRTH/未用）为通宽波形。
+        （EEG/EMG 模式的通道行、EEG 页的 ECG 行、PPG 页的 EEG/PPG 行），
+        其余行（BRTH/SpO2/未用）为通宽波形。
         布局签名与当前一致时不做任何事，否则清空 figure 重新创建。"""
         signature = (count, None if fft_rows is None else tuple(sorted(fft_rows)))
         if self._eeg_axes_signature == signature:
@@ -2449,12 +2464,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
-        # EEG 通道行：左 50% FFT 频谱 + 右 50% 时域波形；ECG/BRTH/未用行通宽
-        self._reset_eeg_axes(EEG_AXIS_COUNT, set(range(page_eeg_count)))
-        self.bio_fft_lines = [None] * len(self.axes_eeg)
+        brth_axis_index = EEG_AXIS_COUNT - 1 if brth_available else None
+        ecg_axis_index = EEG_AXIS_COUNT - 1 - int(brth_available) if ecg_available else None
 
-        brth_axis_index = len(self.axes_eeg) - 1 if brth_available else None
-        ecg_axis_index = len(self.axes_eeg) - 1 - int(brth_available) if ecg_available else None
+        # EEG 通道行与 ECG 行：左 50% FFT 频谱 + 右 50% 时域波形；BRTH/未用行通宽
+        fft_rows = set(range(page_eeg_count))
+        if ecg_axis_index is not None:
+            fft_rows.add(ecg_axis_index)
+        self._reset_eeg_axes(EEG_AXIS_COUNT, fft_rows)
+        self.bio_fft_lines = [None] * len(self.axes_eeg)
 
         self.eeg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, eeg_buffer_copy.shape[1])
@@ -2501,6 +2519,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
+                # 左半：ECG 的 FFT 频谱子图（数据由工作线程结果异步填充）
+                fax = self.axes_bio_fft[ch]
+                if fax is not None:
+                    fax.cla()
+                    (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                    self.bio_fft_lines[ch] = fft_line
+                    fax.tick_params(axis='both', labelsize=7)
+                    fax.set_ylabel("ECG", fontsize=8, color=color,
+                                   rotation=0, va='center', ha='right', labelpad=10)
+                    for spine in fax.spines.values():
+                        spine.set_color(color)
             elif ch == brth_axis_index and brth_available:
                 color = plt.cm.tab10(6)
                 y_data = np.roll(brth_buffer_copy[0], -brth_buffer_index)
@@ -2619,8 +2648,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.canvas_eeg.draw_idle()
 
     def _rebuild_ppg_plot(self, state: DeviceDataState):
-        """PPG 设备的右侧显示区：6 个子图（2×EEG fp1/fp2 + 2×PPG red/ir + 2×SpO2）。"""
-        self._reset_eeg_axes(PPG_AXIS_COUNT, None)
+        """PPG 设备的右侧显示区：6 行（2×EEG fp1/fp2 + 2×PPG red/ir + 2×SpO2），
+        EEG/PPG 行左 50% 为 FFT 频谱、右 50% 为时域波形；SpO2/heart_rate 为
+        低频派生量，保持通宽波形不做 FFT。"""
+        fft_rows = {i for i, (dt, _, _, _) in enumerate(BIO_PLOT_CONFIG)
+                    if dt in (DataType.NTF_EEG, DataType.NTF_PPG)}
+        self._reset_eeg_axes(PPG_AXIS_COUNT, fft_rows)
+        self.bio_fft_lines = [None] * len(self.axes_eeg)
         buffers_copy = {}
         idx_buffers_copy = {}
         has_any_data = False
@@ -2643,12 +2677,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.ecg_line = None
         self.brth_line = None
         self.emg_lines = []
-        self.bio_fft_lines = []
         self._eeg_display_channels = 0
 
         if not has_any_data:
             for ax in self.axes_eeg:
                 ax.cla()
+            for fax in self.axes_bio_fft:
+                if fax is not None:
+                    fax.cla()
             self.bio_title_label.setText("EEG + PPG + SpO2 Waveform")
             self.axes_eeg[0].set_title("EEG + PPG + SpO2 (Device not supported or disabled)")
             self.canvas_eeg.draw_idle()
@@ -2683,8 +2719,22 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             ax.yaxis.set_label_position("right")
             for spine in ax.spines.values():
                 spine.set_color(color)
+            # 左半：该行的 FFT 频谱子图（数据由工作线程结果异步填充）
+            fax = self.axes_bio_fft[plot_idx]
+            if fax is not None:
+                fax.cla()
+                (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                self.bio_fft_lines[plot_idx] = fft_line
+                fax.tick_params(axis='both', labelsize=7)
+                fax.set_ylabel(title, fontsize=8, color=color,
+                               rotation=0, va='center', ha='right', labelpad=10)
+                for spine in fax.spines.values():
+                    spine.set_color(color)
 
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
+        fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
+        if fft_axes_used:
+            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
@@ -2932,6 +2982,29 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 va='center', ha='left', labelpad=10
                             )
 
+                # EEG/PPG 行 FFT：重排后的快照按行（各行采样率可不同）提交
+                # 工作线程，结果经信号异步回填
+                now_fft = time.time()
+                if (not self._bio_fft_pending
+                        and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    row_specs = []
+                    for plot_idx, (dt, ch_idx, _title, _color) in enumerate(BIO_PLOT_CONFIG):
+                        if dt not in (DataType.NTF_EEG, DataType.NTF_PPG):
+                            continue
+                        buf_copy = bio_buffers_copy.get(dt)
+                        if buf_copy is None or ch_idx >= buf_copy.shape[0]:
+                            continue
+                        if (plot_idx >= len(self.bio_fft_lines)
+                                or self.bio_fft_lines[plot_idx] is None):
+                            continue
+                        sr = state.bio_sample_rates.get(dt) or state.nominal_rates.get(dt) or 0
+                        if sr <= 0:
+                            continue
+                        row_specs.append((plot_idx, buf_copy[ch_idx], sr))
+                    if row_specs:
+                        self._bio_fft_last_submit = now_fft
+                        self._submit_bio_fft(DataType.NTF_PPG, row_specs)
+
                 if any_updated:
                     self.canvas_eeg.draw_idle()
                     for dt, idx_buf in bio_idx_buffers_copy.items():
@@ -3015,17 +3088,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         )
                         ax.yaxis.set_label_position("right")
 
-                # 每通道 FFT：本页通道重排后的快照提交工作线程，结果经信号异步回填
+                # 每行 FFT（EEG 本页通道 + ECG 行）：重排后的快照提交工作线程，
+                # 结果经信号异步回填
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    row_specs = []
                     sr = state.eeg_sample_rate or state.nominal_rates.get(DataType.NTF_EEG) or 0
                     if sr > 0 and self._eeg_display_channels > 0:
                         snapshot = np.roll(
                             eeg_buffer_copy[start_ch:start_ch + self._eeg_display_channels],
                             -eeg_buffer_index, axis=1)
+                        for row in range(snapshot.shape[0]):
+                            row_specs.append((row, snapshot[row], sr))
+                    if (ecg_axis_index is not None and ecg_buffer_copy is not None
+                            and self.ecg_line is not None):
+                        sr_ecg = (state.ecg_sample_rate
+                                  or state.nominal_rates.get(DataType.NTF_ECG) or 0)
+                        if sr_ecg > 0:
+                            row_specs.append((
+                                ecg_axis_index,
+                                np.roll(ecg_buffer_copy[0], -ecg_buffer_index),
+                                sr_ecg))
+                    if row_specs:
                         self._bio_fft_last_submit = now_fft
-                        self._submit_bio_fft(DataType.NTF_EEG, sr, snapshot)
+                        self._submit_bio_fft(DataType.NTF_EEG, row_specs)
 
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EEG] = current_last_idx
@@ -3138,12 +3225,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
                     sr = state.emg_sample_rate or state.nominal_rates.get(DataType.NTF_EMG) or 0
-                    if sr > 0:
+                    if sr > 0 and self.emg_lines:
                         snapshot = np.roll(
                             emg_buffer_copy[:len(self.emg_lines)],
                             -emg_buffer_index, axis=1)
+                        row_specs = [(row, snapshot[row], sr) for row in range(snapshot.shape[0])]
                         self._bio_fft_last_submit = now_fft
-                        self._submit_bio_fft(DataType.NTF_EMG, sr, snapshot)
+                        self._submit_bio_fft(DataType.NTF_EMG, row_specs)
 
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EMG] = current_last_idx
