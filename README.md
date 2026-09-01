@@ -24,14 +24,13 @@ pip install sensor-sdk
 
 ### USB Bluetooth dongle (bumble backend)
 
-When a USB Bluetooth HCI dongle is plugged in and usable by libusb (e.g. Actions `10d7:b012` or `33fa:0012`; several dongles can be used at once, each serving one connection), the SDK automatically drives it directly with a [bumble](https://github.com/google/bumble) host-mode backend instead of the OS Bluetooth stack — no Bluetooth permission prompt, works even when the internal Bluetooth is off, and allows larger ATT MTU. The [bleak-bumble](https://github.com/ekspla/bleak-bumble_dev_host_mode) backend is vendored into the SDK (`sensor/bleak_bumble/`, MIT license), and the bumble stack + libusb are declared as regular dependencies — a plain `pip install sensor-sdk` is all that is needed.
+When a compatible USB Bluetooth dongle is plugged in and usable, the SDK automatically drives it directly with a host-mode backend instead of the OS Bluetooth stack — no Bluetooth permission prompt, and it works even when the internal Bluetooth is off. A plain `pip install sensor-sdk` installs everything needed.
 
 Behavior and controls:
 
-- With the dependencies installed and a usable dongle present, the backend is selected automatically on all platforms when the SDK starts (native `bleak` is used otherwise). "Usable" means libusb can open the device: on Windows the dongle must be bound to the WinUSB driver, on Linux the user needs udev permission, on macOS USB access is driverless. Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
-- `SensorController.checkSetupDongle()` checks dongle readiness and, when no dongle is usable, runs the bundled setup script with elevation — UAC prompt on Windows (binds the WinUSB driver), `sudo` on Linux (installs udev rules; the password goes through the controlling terminal, or when there is none — e.g. a GUI app launched without a terminal — a terminal-emulator window is spawned to run the script, falling back to `pkexec`; a replug may still be required afterwards) — then re-checks and returns `"OK: N"` (N = number of usable dongles detected) on success or an `"Error: ..."` string with the system error detail on failure. macOS needs no setup and is check-only. The call blocks while waiting for the elevation prompt. The same logic also lives in `sensor_utils.checkSetupDongle()`, exported at package top level as `sensor.checkSetupDongle()` for use without a controller instance. The same scripts (`setup_dongle_winusb.ps1`, `setup_dongle_udev.sh` and their driver/rules files) ship inside the wheel under `sensor/tools/` and can also be run manually.
-- `SENSOR_SDK_BLE_BACKEND=bleak` forces the native backend; `SENSOR_SDK_BLE_BACKEND=bumble` forces the dongle backend on any platform; `SENSOR_SDK_BUMBLE_TRANSPORT` overrides the bumble transport spec (e.g. `usb:0`).
-- With the bumble backend, each dongle serves one connection at a time: scanning uses a free dongle and is skipped while all dongles are connected; connections fail fast when no dongle is free. Connection timeout is raised to 25s automatically.
+- With a usable dongle present, the backend is selected automatically when the SDK starts (the native OS stack is used otherwise). Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
+- `SensorController.checkSetupDongle()` checks dongle readiness and, when no dongle is usable, runs the bundled one-time setup (driver binding on Windows, permission setup on Linux, with an elevation prompt) and re-checks. It returns `"OK"` on success or an `"Error: ..."` string on failure, and blocks while waiting for the elevation prompt. macOS needs no setup. The same helper is also exported at package top level as `sensor.checkSetupDongle()`.
+- `SENSOR_SDK_BLE_BACKEND=bleak` forces the native backend; `SENSOR_SDK_BLE_BACKEND=bumble` forces the dongle backend.
 
 ## 1. Permission
 
@@ -181,21 +180,17 @@ sensorProfile = SensorControllerInstance.requireSensor(bleDevice)
 # register callbacks
 def on_state_changed(sensor: SensorProfile, newState: DeviceStateEx):
     # device state transitions (Connecting/Connected/Ready/Disconnected/...)
-    # called synchronously on the SDK state machine; return quickly
     # please do logic when device disconnected unexpected
     pass
 
 def on_error_callback(sensor: SensorProfile, reason: str):
-    # called when error occurs (dongle unplugged, reconnect budget exhausted, ...)
+    # called when error occurs
     pass
 
 def on_power_changed(sensor: SensorProfile, power: int):
     # callback for get battery level of device, power from 0 - 100
     # (invalid -1 readings are never reported here; getBatteryLevel() may
     # still return -1 when no valid reading is available yet)
-    # the reported value is stabilized with a hysteresis band (±2%): it only
-    # changes when a new reading differs from the current value by 2 or more,
-    # so ±1 jitter is filtered while real drain/charge trends are still tracked
     pass
 
 def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
@@ -211,12 +206,7 @@ sensorProfile.onPowerChanged = on_power_changed
 sensorProfile.onDataCallback = on_data_callback
 ```
 
-Callback threading model:
-
-- `onDataCallback` runs on a dedicated single-worker thread pool per profile, so batches are delivered strictly in arrival order.
-- `onPowerChanged` and `onErrorCallback` share a multi-worker thread pool.
-- `onStateChanged` is invoked synchronously.
-- Keep callbacks short or thread-safe; update UI through your framework's main-thread mechanism (e.g. Qt signals).
+Callbacks run on SDK background threads: keep them short or thread-safe, and update UI through your framework's main-thread mechanism (e.g. Qt signals).
 
 A fifth callback, `onAutoReconnect`, customizes stream recovery after an abnormal disconnect — see section 15.1.
 
@@ -274,7 +264,7 @@ bleDevice = sensorProfile.BLEDevice
 
 ### 15.1 Auto reconnect and resume data stream
 
-Use `property autoReconnect: bool` (default `True`) to control automatic recovery. While `True` and the device is streaming, an abnormal disconnect — remote link loss or a long no-data (half-dead link) disconnect — is followed by automatic reconnect → `init()` with the previous init arguments → re-applying the `setParam` parameters from the previous streaming session (in the order they were set) → `startDataNotification()`. Recovery retries on the next successful reconnect if a step fails. Explicit user calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel the pending resume, and setting `autoReconnect = False` disables the behavior entirely.
+Use `property autoReconnect: bool` (default `True`) to control automatic recovery. While `True` and the device is streaming, an abnormal disconnect is followed by automatic reconnect → `init()` with the previous init arguments → re-applying the `setParam` parameters from the previous streaming session → `startDataNotification()`. Recovery retries on the next successful reconnect if a step fails. Explicit user calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel the pending resume, and setting `autoReconnect = False` disables the behavior entirely.
 
 ```python
 sensorProfile.autoReconnect = True   # default; set False to opt out
@@ -283,21 +273,21 @@ sensorProfile.autoReconnect = True   # default; set False to opt out
 **Custom recovery via `onAutoReconnect`** (default `None`): when the auto-reconnect finds the disconnected device again (back in `Ready`, about to resume), this callback is invoked instead of the default flow.
 
 ```python
-def on_reconnect(sensor, restore: bool) -> bool:
-    # restore=True  -> a previous session exists (init args + setParam values can be
-    #                  preserved and restored); restore=False -> fresh-init case
-    # return True   -> the app handled recovery itself (fresh init or custom flow);
-    #                  the SDK skips the default recovery
-    # return False  -> fall back to the default flow (connect -> init -> replay
-    #                  setParam values -> startDataNotification)
+def on_reconnect(sensor, restore: bool, answer) -> None:
+    # restore=True   -> a previous session exists (init args + setParam values can be
+    #                   preserved and restored); restore=False -> fresh-init case
+    # answer(True)   -> the app handled recovery itself (fresh init or custom flow);
+    #                   the SDK skips the default recovery
+    # answer(False)  -> fall back to the default flow (connect -> init -> replay
+    #                   setParam values -> startDataNotification)
     sensor.init(32, 60000)
     sensor.startDataNotification()
-    return True
+    answer(True)   # answer exactly once, from any thread, at any later time
 
 sensorProfile.onAutoReconnect = on_reconnect
 ```
 
-Callback exceptions are logged and treated as `False` (fall back). The callback runs on the SDK recovery thread, so blocking calls (`init()`, `setParam()`, `startDataNotification()`) are allowed inside it.
+The answer is **asynchronous**: the callback receives an `answer(handled)` callable and must invoke it exactly once — it may return immediately and answer later from any thread (e.g. after UI-thread work). If no answer arrives in time the SDK falls back to the default recovery. Callback exceptions are logged and treated as `answer(False)`. Blocking calls (`init()`, `setParam()`, `startDataNotification()`) are allowed inside the callback. The legacy two-argument form `callback(sensor, restore) -> bool` is still accepted; its return value is treated as the answer.
 
 ### 16. Get device info of SensorProfile
 
@@ -315,15 +305,14 @@ Please call after device in 'Ready' state and `init()` has succeeded, returns No
 #   plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate: the maximum
 #   sample rate reported by the device capability query (0 = not reported).
 #   plus ImuChannelCount / ImuSampleRate: the aggregated NTF_IMU stream
-#   (new-EMG devices only; 0 = no aggregated stream, use the four separate
-#   ACC/GYRO/EULER/QUAT streams instead).
+#   (0 = no aggregated stream, use the four separate ACC/GYRO/EULER/QUAT
+#   streams instead).
 #   plus ConnectionIntervalMs / PeripheralLatency / SupervisionTimeoutMs:
-#   the negotiated BLE link parameters (bumble USB-dongle backend only;
-#   0 / -1 / 0 = unknown).
+#   the negotiated BLE link parameters (0 / -1 / 0 = unknown).
 # e.g. deviceInfo.EmgChannelCount, deviceInfo.EegSampleRate
 ```
 
-Use `onDeviceInfoUpdate` to get notified when the DeviceInfo changes after init — e.g. the link parameters are updated by the peripheral shortly after connect (bumble backend), or `EEG_SAMPLE_RATE` changes the reported rates. The profile patches its cached DeviceInfo in place before firing the callback.
+Use `onDeviceInfoUpdate` to get notified when the DeviceInfo changes after init — e.g. the link parameters are updated by the peripheral shortly after connect, or `EEG_SAMPLE_RATE` changes the reported rates.
 
 ```python
 def on_device_info_update(sensor: SensorProfile, info: DeviceInfo):
@@ -369,9 +358,9 @@ success = sensorProfile.startDataNotification()
 
 Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 30.0, maxDelayDispersionMs: int = 5, maxAttempts: int = 3) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting.
 
-On the bumble (USB dongle) backend, the start-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription` command write on RFSTAR devices) wait on a shared `SyncWriteGate` at the bumble send layer and are released together, so all dongles emit the start command at virtually the same time. On the native bleak backend the starts are simply issued concurrently (no low-level alignment).
+On the dongle backend the start commands of all devices are released at virtually the same time; on the native backend the starts are simply issued concurrently.
 
-After each start round the SDK validates the dispersion (max − min) of the devices' first-packet delays; if it exceeds `maxDelayDispersionMs` (default 5 ms; pass `-1` to skip the dispersion check entirely — devices only need to start and produce a first packet), any device produces no first packet within 2 s, or any start fails, all devices are stopped and the round retries (up to `maxAttempts`, default 3). If still not within tolerance, the streams are stopped and the call reports failure.
+After each start round the SDK validates the dispersion (max − min) of the devices' first-packet delays; if it exceeds `maxDelayDispersionMs` (default 5 ms; pass `-1` to skip the dispersion check entirely — devices only need to start and produce a first packet), any device produces no first packet in time, or any start fails, all devices are stopped and the round retries (up to `maxAttempts`, default 3). If still not within tolerance, the streams are stopped and the call reports failure.
 
 ```python
 results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2])
@@ -383,7 +372,7 @@ results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2]
 
 #### 19.3 Synchronized stop on multiple devices
 
-`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the bumble backend the stop-streaming writes of all devices (the CCCD write on OYM devices, the `set_subscription(0)` command write on RFSTAR devices) wait on the same kind of shared `SyncWriteGate` and go out at virtually the same time; on the native bleak backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
+`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the dongle backend the stop commands of all devices go out at virtually the same time; on the native backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
 
 ```python
 results = SensorControllerInstance.multiStopDataNotification([sensor1, sensor2])
@@ -404,7 +393,7 @@ class DataType(Enum):
     NTF_ECG = 0x11           # unit is uV
     NTF_IMPEDANCE = 0x12     # electrode impedance
     NTF_IMU = 0x13           # aggregated IMU batch (acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12;
-                             # new-EMG devices only, see DeviceInfo.ImuChannelCount)
+                             # see DeviceInfo.ImuChannelCount)
     NTF_ADS = 0x14
     NTF_BRTH = 0x15          # respiration, unit is uV
     NTF_IMPEDANCE_EXT = 0x16
@@ -412,11 +401,11 @@ class DataType(Enum):
     NTF_PPG = 0x18           # PPG raw samples
 ```
 
-Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface mirrors the C++ SDK (`include/SensorData.hpp`):
+Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface:
 
-- metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getStartTimeSec()` (wall-clock stream-start anchor in LSL-style Unix seconds, 0.0 when unknown) / `getDelay()` / `isDataValid()` (always `True` in Python)
+- metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getStartTimeSec()` (wall-clock stream-start anchor in Unix seconds, 0.0 when unknown) / `getDelay()` / `isDataValid()`
 - whole batch: read-only `channelSamples` / `startSampleIndex` properties, `clone()` for a deep copy
-- single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` (computed: `sampleIndex * 1000 / sampleRate`, 0 when the rate is unknown) / `getAbsTimeStampInSec(ci, si)` (absolute LSL-style timestamp in seconds, 0.0 when the stream-start anchor is unknown) / `isLost(ci, si)` return the individual field
+- single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` / `getAbsTimeStampInSec(ci, si)` (absolute timestamp in seconds, 0.0 when the stream-start anchor is unknown) / `isLost(ci, si)` return the individual field
 - Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `absTimeStampInSec`, `isLost`) are read-only properties.
 
 ```python
@@ -509,7 +498,7 @@ result = sensorProfile.setParam("NTF_GFORCE_GYRO", "ON")
 # set data stream to ON or OFF, result is "OK" if succeed
 # NTF_IMU is the master switch of the four NTF_GFORCE_* streams: toggling it
 # updates all four, and toggling any of the four updates the aggregated NTF_IMU state.
-# Note: on legacy (non-new) EMG devices, NTF_GEST and NTF_EMG are mutually exclusive.
+# Note: on legacy EMG devices, NTF_GEST and NTF_EMG are mutually exclusive.
 
 # Firmware filter toggles
 result = sensorProfile.setParam("FILTER_50HZ", "ON")
@@ -519,8 +508,7 @@ result = sensorProfile.setParam("FILTER_50HZ", "ON")
 result = sensorProfile.setParam("EEG_SAMPLE_RATE", "500")
 # The value is validated against the device-reported capability list (see
 # getParam("EEG_SAMPLE_RATE_LIST")); an unsupported value returns
-# "Error: unsupported sample rate ...". When the device has both EEG and ECG,
-# both configs are written with the same rate. While streaming, the stream is
+# "Error: unsupported sample rate ...". While streaming, the stream is
 # restarted so the new rate takes effect.
 
 result = sensorProfile.setParam("FILTER_60HZ", "ON")
@@ -537,19 +525,18 @@ result = sensorProfile.setParam("NEUCIR_SET_MODE", "APP_REMOTE")
 result = sensorProfile.setParam("NEUCIR_APP_CONTROL", "OPEN")   # OPEN / CLOSE / STOP
 
 result = sensorProfile.setParam("DEBUG_BLE_DATA_PATH", "d:/temp/test.bin")
-# set the bin export path: the session's raw BLE capture is recorded in the system
-# temp directory and copied to this location on stopDataNotification / disconnect;
-# "True" exports to {DeviceName}_data_YYYYMMDD_HHMMSS.bin in the SDK log directory
+# set the bin export path: the session's raw BLE capture (bin) is exported to
+# this location on stopDataNotification / disconnect.
+# "True" exports to a default bin file in the SDK log directory
 # (see setLogPath; disabled when file output is off), "False" or "" disables
-# export (the temp bin is just deleted).
+# export.
 # please give an absolute path and make sure it is valid and writeable by yourself
 
 result = sensorProfile.setParam("DEBUG_LOG_PATH", "True")
-# enable this profile's log file: {DeviceName}_log_YYYYMMDD_HHMMSS.txt in the SDK
-# log directory (see setLogPath), or pass an absolute custom path instead of "True";
-# "False" or "" disables it. The profile log contains only this profile's logs plus
-# the bleak/bumble logs related to its current connection; all other (common) logs
-# go to the controller log.
+# enable this profile's log file in the SDK log directory (see setLogPath),
+# or pass an absolute custom path instead of "True";
+# "False" or "" disables it. The profile log contains only this profile's logs;
+# all other (common) logs go to the controller log.
 # getParam("DEBUG_LOG_PATH") returns the current log file path ("" when disabled).
 ```
 
@@ -584,7 +571,7 @@ If the key is not supported, the result starts with `"Error"`.
 
 ## Bin file recording and replay
 
-On every successful connect, the SDK records all raw BLE packets of the session into a `.bin` file in the SDK log directory (`~/Documents/sensorsdklog` by default, or the directory of the configured log file), named `{DeviceName}_{MAC}_{YYYYMMDD_HHMMSS}.bin`. Recording is always on; it is skipped or stopped with a warning when free disk space is below 100MB or a disk error occurs, without affecting live streaming. Bin files can be replayed offline for debugging and packet-loss analysis.
+On every successful connect, the SDK records the raw BLE packets of the session into a `.bin` file. Bin files can be replayed offline for debugging and packet-loss analysis.
 
 ### Get bin file info
 
@@ -595,8 +582,7 @@ info = SensorControllerInstance.getBinFileInfo("path/to/session.bin")
 # Returns a dict:
 #   device_mac, device_name, chip_type, is_universal_stream, feature_map,
 #   device_info, sensor_datas (per data-type parse config),
-#   replay_duration (recording seconds, written into the header record at close;
-#                    older bins without a header fall back to a full-file estimate)
+#   replay_duration (recording seconds)
 # Returns None if the file does not exist or has no config record.
 ```
 
@@ -616,7 +602,7 @@ SensorControllerInstance.replayBinFile("path/to/session.bin", sensor, realtime=T
 
 - `sensor`: an existing SensorProfile to replay through. When `None`, the controller creates (or reuses) a profile from the bin config record; in that mode the profile is returned only after replay finishes, so register callbacks on an existing profile to receive data.
 - `realtime`: `True` replays at the recorded pace; `False` replays as fast as possible.
-- `timeout`: seconds to wait for completion. `None` auto-estimates from the bin duration in realtime mode (duration + 30s, min 60s), or 600s otherwise. On timeout the call returns while replay may still be running in the background.
+- `timeout`: seconds to wait for completion. `None` auto-estimates from the bin duration. On timeout the call returns while replay may still be running in the background.
 - Replay is rejected while the target sensor is streaming live data.
 
 ### Pause / resume / stop replay
@@ -628,9 +614,31 @@ result = SensorControllerInstance.stopBinReplay(sensor)    # abort; the blocking
 # Each returns "OK" on success or an error string otherwise.
 ```
 
+### Replay multiple bin files in sync (shared clock)
+
+Use `def multiReplayBinFile(self, file_paths: List[str], sensors: Optional[List[Optional[SensorProfile]]] = None, realtime: bool = True, timeout: Optional[float] = None) -> List[Optional[SensorProfile]]` to replay several bin captures on one shared clock aligned by record timestamps, so concurrently recorded captures keep their original relative offsets (a device that started streaming later delivers its first data correspondingly later).
+
+```python
+sensors = [SensorControllerInstance.requireSensor(device1),
+           SensorControllerInstance.requireSensor(device2)]
+for s in sensors:
+    s.onDataCallback = on_data
+results = SensorControllerInstance.multiReplayBinFile(
+    ["path/to/dev1.bin", "path/to/dev2.bin"], sensors=sensors, realtime=True)
+# results is aligned with file_paths; a None entry marks a member that failed
+# (file missing / no config record / duplicate MAC / device streaming or
+#  already replaying).
+```
+
+- `sensors`: optional list aligned with `file_paths`; a `None` entry (or omitting the parameter) makes the controller create (or reuse) the profile from that bin's config record — register callbacks on existing profiles to receive data.
+- `realtime`: `True` replays on the aligned group clock; `False` replays every member as fast as possible (no alignment).
+- `timeout`: seconds to wait for the whole group. `None` auto-estimates from the group's duration.
+- `pauseBinReplay` / `resumeBinReplay` on any member pauses/resumes the **whole group** (alignment is preserved); `stopBinReplay` still works per device.
+- The call blocks until all members finish; run it on a background thread to keep the UI responsive.
+
 ### Parse a bin file to CSV
 
-Use `def parseBinToCsv(self, bin_path: str, csv_path: Optional[str] = None) -> str` to convert a recorded bin file to CSV offline (parsing runs through the real pipeline; row timestamps come from the bin records):
+Use `def parseBinToCsv(self, bin_path: str, csv_path: Optional[str] = None) -> str` to convert a recorded bin file to CSV offline:
 
 ```python
 csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin")
@@ -645,32 +653,30 @@ csv_path = SensorControllerInstance.parseBinToCsv("d:/temp/test.bin", "d:/temp/t
 timestamp,mac,type,raw_hex,data_type,sample_rate,channel_count,lost_count,samples_info,first_sample
 ```
 
-Row kinds in record order (config records produce no rows; a bin without a config record yields `raw` rows only):
+Row kinds (a bin without a config record yields `raw` rows only):
 
-- `raw` rows — one per data record: `timestamp` = ISO 8601 (local time) of the bin record timestamp, `mac` (empty for records before the first config record), `type` = `raw`, `raw_hex` = raw packet bytes as hex; remaining columns empty.
-- `cmd_send` / `cmd_recv` rows — one per command record: `type` = `cmd_send` / `cmd_recv`, `raw_hex` = command bytes as hex, `data_type` = decoded command name (`cmd_send`, e.g. `NTF_DATA_START`) or `NAME:CODE` (`cmd_recv`, e.g. `GET_FEATURE_MAP:SUCCESS`); remaining columns empty. These rows are analysis-only and are not fed into parsing.
-- `event` rows — one per BLE event record: `type` = `event`, `raw_hex` = event name as hex, `data_type` = event name (`connect` / `disconnect` / `stream_start` / `stream_stop`); remaining columns empty.
-- `parsed` rows — one per parsed batch emitted by the real parsing pipeline (`raw_hex` empty):
+- `raw` rows — one per data record: `timestamp` = ISO 8601 (local time), `raw_hex` = raw packet bytes as hex; remaining columns empty.
+- `cmd_send` / `cmd_recv` rows — one per command record: `raw_hex` = command bytes as hex, `data_type` = decoded command name (e.g. `NTF_DATA_START` / `GET_FEATURE_MAP:SUCCESS`); analysis-only, not fed into parsing.
+- `event` rows — one per BLE event record: `data_type` = event name (`connect` / `disconnect` / `stream_start` / `stream_stop`).
+- `parsed` rows — one per parsed batch (`raw_hex` empty):
 
 | Column | Meaning |
 |--------|---------|
-| `timestamp` | ISO 8601 (local time) of the bin record being fed when the batch completed |
-| `mac` | Device MAC from the config record |
+| `timestamp` | ISO 8601 (local time) |
+| `mac` | Device MAC |
 | `type` | `parsed` |
 | `data_type` | `DataType` enum name of the batch, e.g. `NTF_EMG`, `NTF_EEG`, `NTF_ACC` |
 | `sample_rate` | Batch sample rate (Hz) |
 | `channel_count` | Batch channel count |
-| `lost_count` | `lostPackageCount` of the batch (non-zero only for new-EMG devices) |
+| `lost_count` | `lostPackageCount` of the batch |
 | `samples_info` | Per-channel sample counts as a Python list string, e.g. `[32, 32, 32]` |
-| `first_sample` | First sample of the first non-empty channel: `data=<v>\|raw=<raw>\|imp=<impedance>\|sat=<saturation>\|idx=<sampleIndex>\|ts=<computed ms timestamp>\|ch=<channelIndex>\|lost=<isLost>` |
+| `first_sample` | First sample of the first non-empty channel: `data=<v>\|raw=<raw>\|imp=<impedance>\|sat=<saturation>\|idx=<sampleIndex>\|ts=<ms timestamp>\|ch=<channelIndex>\|lost=<isLost>` |
 
 ## Logging controls
 
 `setLogPath` sets the SDK log **directory** (it must be a directory). All default file outputs live in it: the controller log, the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin exports (`DEBUG_BLE_DATA_PATH=True`).
 
-The **controller log** (`sensor_controller_log_YYYYMMDD_HHMMSS.txt`) holds all common logs (scan, connection management, dongle/backend, and logs of profiles whose profile log is not enabled). It is created automatically in the log directory when `setDebugEnabled(True)` is called, and closed on `setDebugEnabled(False)`. Each **profile log** (`{DeviceName}_log_YYYYMMDD_HHMMSS.txt`, enabled per profile via `setParam("DEBUG_LOG_PATH", ...)`) contains only that profile's logs plus the bleak/bumble logs related to its current connection.
-
-Records emitted before a log file is first created are held in a bounded memory buffer and replayed into the file on creation, so early (scan/connect) logs are not lost. The log directory and debug switch are automatically shared with the BLE subprocess, so both sides append to the same files.
+The **controller log** holds all common logs (scan, connection management, backend, and logs of profiles whose profile log is not enabled). It is created automatically when `setDebugEnabled(True)` is called, and closed on `setDebugEnabled(False)`. Each **profile log** (enabled per profile via `setParam("DEBUG_LOG_PATH", ...)`) contains only that profile's logs.
 
 ```python
 SensorControllerInstance.setDebugEnabled(True)
