@@ -53,9 +53,19 @@ DEVICES = [
         "identity": "206F",
     },
     {
+        "name_prefix": "OB",
+        "mac": "78:1C:9D:E4:5B:82",
+        "identity": "5B82",
+    },
+    {
         "name_prefix": "gForceUltra",
         "mac": "BC:93:2A:3F:80:F2",
         "identity": "80F2",
+    },
+    {
+        "name_prefix": "gForceUltra",
+        "mac": "BC:93:2A:3F:80:F4",
+        "identity": "80F4",
     },
     {
         "name_prefix": "gForceUltra",
@@ -73,7 +83,11 @@ DEVICES = [
         "mac": "BC:93:2A:3F:80:EF",
         "identity": "80EF",
     },
-
+    {
+        "name_prefix": "gForceUltra",
+        "mac": "BC:93:2A:3F:80:E5",
+        "identity": "80E5",
+    },
     {
         "name_prefix": "gForceUltra",
         "mac": "BC:93:2A:3F:80:F9",

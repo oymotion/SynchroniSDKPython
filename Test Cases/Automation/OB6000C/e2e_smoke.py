@@ -29,7 +29,7 @@ sys.path.insert(0, AUTOMATION_DIR)
 from sensor import *
 import config
 import common
-from common import record, _identity_of, scan_and_match
+from common import record, _identity_of, scan_and_match, resolve_target_identity
 
 COLLECT_SECONDS = 60  # 起流采集时长（秒），录制足够长便于后续 debug bin
 
@@ -76,6 +76,7 @@ class DataCounter:
 
 def main():
     ctrl = SensorControllerInstance
+    target_identity = resolve_target_identity()
 
     print("=" * 60, flush=True)
     print("E2E 冒烟：连接 → 起流 → 查看 bin", flush=True)
@@ -126,8 +127,11 @@ def main():
     record(results, "SensorController.isEnable 为 True", True, "isEnable == True", f"isEnable == {is_enable}")
 
     # 扫描匹配
-    print(f"\n[扫描] 目标 identity: {common.TARGET_IDENTITIES}", flush=True)
-    target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS)
+    if target_identity:
+        print(f"\n[扫描] 目标 identity: {', '.join(target_identity)}（命令行指定）", flush=True)
+    else:
+        print(f"\n[扫描] 目标 identity: {', '.join(common.TARGET_IDENTITIES)}（config 默认）", flush=True)
+    target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS, target_identity=target_identity)
     if target is None:
         print("[FAIL] 未匹配到目标设备", flush=True)
         record(results, "scan 匹配到目标设备", False, "scan 返回含目标设备", "未匹配到目标")

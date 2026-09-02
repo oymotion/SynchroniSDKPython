@@ -1,0 +1,44 @@
+2026-08-24 16:55:16.057 [INFO] [sensor_sdk] sensor-sdk version: 0.9.6
+2026-08-24 16:55:16.058 [INFO] [sensor_sdk] sensor-sdk version: 0.9.6
+2026-08-24 16:55:16.058 [INFO] [sensor_sdk_controller] [SensorController] scan called: period=5000
+2026-08-24 16:55:16.656 [INFO] [sensor_sdk] sensor-sdk version: 0.9.6
+2026-08-24 16:55:16.686 [WARNING] [sensor_sdk] [BumbleDongle] No USB Bluetooth dongle detected, use native bleak
+2026-08-24 16:55:16.686 [INFO] [sensor_sdk] [BleakProcess] BLE backend: bleak (native)
+2026-08-24 16:55:16.688 [INFO] [sensor_sdk_controller] [SensorController] BLE backend: bleak 
+2026-08-24 16:55:16.688 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: scan_once, mac=None
+2026-08-24 16:55:16.688 [INFO] [sensor_sdk_controller] [BleakProcess] scan_once: period=5000
+2026-08-24 16:55:16.690 [INFO] [sensor_sdk] [BumbleDongle] Dongle hotplug monitor started (polling, initial=[])
+2026-08-24 16:55:21.727 [INFO] [sensor_sdk_controller] [BleakProcess] scan_once result: 2 device(s), spec=None
+2026-08-24 16:55:21.727 [ERROR] [sensor_sdk] [BleakProcess] scan_once failed: Argument 'spec' has incorrect type (expected str, got NoneType), spec=None
+Traceback (most recent call last):
+  File "sensor/bleak_process.py", line 1147, in sensor.bleak_process.BleakProcess._run_scan_round
+TypeError: Argument 'spec' has incorrect type (expected str, got NoneType)
+2026-08-24 16:55:21.729 [INFO] [sensor_sdk_controller] [BleakHost] error: scan_once failed: Argument 'spec' has incorrect type (expected str, got NoneType)
+2026-08-24 16:55:21.730 [INFO] [sensor_sdk_controller] [SensorController] requireSensor called: 78:1C:9D:E4:6C:6B
+2026-08-24 16:55:21.730 [DEBUG] [sensor_sdk] [SensorProfile] connect called: 78:1C:9D:E4:6C:6B
+2026-08-24 16:55:21.881 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: connect, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:55:24.741 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: init, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:55:25.304 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: get_param, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:55:25.355 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: set_param, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:55:25.764 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: start_notification, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:25.814 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: stop_notification, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:26.422 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: get_param, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:26.474 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: cancel_reconnect, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:26.474 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: disconnect, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:26.474 [INFO] [sensor_sdk_controller] [BleakProcess] cancel_reconnect (user disconnect intent): 78:1C:9D:E4:6C:6B
+2026-08-24 16:56:26.475 [INFO] [sensor_sdk_controller] [BleakProcess] BLE link lost (disconnect callback): 78:1C:9D:E4:6C:6B
+2026-08-24 16:56:27.084 [INFO] [sensor_sdk_controller] [SensorController] parseBinToCsv called: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C(6C6B)_data_20260824_165525.bin -> None
+2026-08-24 16:56:37.298 [INFO] [sensor_sdk] [BinToCsv] bin_to_csv: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C(6C6B)_data_20260824_165525.bin -> D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C(6C6B)_data_20260824_165525.csv (11201 rows)
+2026-08-24 16:56:37.299 [INFO] [sensor_sdk_controller] [SensorController] replayBinFile called: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C(6C6B)_data_20260824_165525.bin realtime=False
+2026-08-24 16:56:37.303 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: replay_bin, mac=78:1C:9D:E4:6C:6B
+2026-08-24 16:56:40.249 [WARNING] [sensor_sdk] [BleakProcess] main loop stalled 2.9s between iterations
+2026-08-24 16:56:40.249 [INFO] [sensor_sdk_controller] [BleakProcess] main loop stalled 2.9s between iterations
+2026-08-24 16:56:43.234 [WARNING] [sensor_sdk] [BleakProcess] main loop stalled 3.0s between iterations
+2026-08-24 16:56:43.234 [INFO] [sensor_sdk_controller] [BleakProcess] main loop stalled 3.0s between iterations
+2026-08-24 16:56:46.157 [WARNING] [sensor_sdk] [BleakProcess] main loop stalled 2.9s between iterations
+2026-08-24 16:56:46.157 [INFO] [sensor_sdk_controller] [BleakProcess] main loop stalled 2.9s between iterations
+2026-08-24 16:56:48.115 [WARNING] [sensor_sdk] [BleakProcess] main loop stalled 2.0s between iterations
+2026-08-24 16:56:48.115 [INFO] [sensor_sdk_controller] [BleakProcess] main loop stalled 2.0s between iterations
+2026-08-24 16:56:48.618 [INFO] [sensor_sdk_controller] [SensorController] replayBinFile finished: OK: replayed 7337 packets (skipped 10)
+2026-08-24 16:56:48.639 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: set_debug_enabled, mac=None
+2026-08-24 16:56:48.639 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: terminate, mac=None

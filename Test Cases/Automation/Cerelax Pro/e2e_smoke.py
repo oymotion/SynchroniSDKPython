@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """E2E 冒烟：一次走通「连接 → 起流 → 查看 bin」主链路，尽量非交互。
 
@@ -6,13 +5,17 @@
   1) 环境：SensorController.isEnable / getVersion / getBLEBackendName
   2) 扫描：scan_and_match（带重试）
   3) 连接：requireSensor / connect → Ready / init / hasInited
-  4) 设备信息：getDeviceInfo（型号、固件、通道数等）
+  4) 设备信息：getDeviceInfo（型号、固件、EEG 通道数等）
   5) 参数：setParam / getParam（FILTER 聚合查询）
   6) 数据流：startDataNotification / onDataCallback 计数 / isDataTransfering / stopDataNotification
   7) 电量：getBatteryLevel
   8) bin：DEBUG_BLE_DATA_PATH=True 导出 → getParam 取路径 → 文件存在
   9) bin 解析：getBinFileInfo（元数据）→ parseBinToCsv（转 CSV）
  10) bin 回放：replayBinFile(realtime=False) 快速回放并确认有数据回调
+
+用法：
+  python e2e_smoke.py            # 使用 config.TARGET_IDENTITY 指定的设备
+  python e2e_smoke.py 850B       # 指定目标 identity（须在 config.DEVICES 中定义）
 
 说明：
   不设 input() 人工暂停；若设备未上电/未匹配到，直接判 FAIL 并给出原因。
@@ -87,7 +90,7 @@ def main():
 
     print("\n[前置条件]", flush=True)
     print("  - 主机(电脑)：蓝牙已开启", flush=True)
-    print("  - 待测设备：OYWW1100 上电、在范围内", flush=True)
+    print("  - 待测设备：Cerelax 头环 上电、在范围内", flush=True)
 
     results = []
 
@@ -207,10 +210,10 @@ def main():
     if info_ok:
         model = getattr(info, 'ModelName', '?')
         fw = getattr(info, 'FirmwareVersion', '?')
-        emg_ch = getattr(info, 'EmgChannelCount', '?')
-        emg_rate = getattr(info, 'EmgSampleRate', '?')
-        acc_ch = getattr(info, 'AccChannelCount', '?')
-        print(f"[设备信息] Model={model} FW={fw} EmgChannel={emg_ch} EmgRate={emg_rate} AccChannel={acc_ch}", flush=True)
+        eeg_ch = getattr(info, 'EegChannelCount', '?')
+        eeg_rate = getattr(info, 'EegSampleRate', '?')
+        ppg_ch = getattr(info, 'PpgChannelCount', '?')
+        print(f"[设备信息] Model={model} FW={fw} EegChannel={eeg_ch} EegRate={eeg_rate} PpgChannel={ppg_ch}", flush=True)
     record(results, "SensorProfile.getDeviceInfo 返回 DeviceInfo", info_ok,
            "init 后 getDeviceInfo() 返回非 None", f"返回 {type(info).__name__}" if info_ok else "返回 None")
 

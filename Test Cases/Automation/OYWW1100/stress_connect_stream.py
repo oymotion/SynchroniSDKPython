@@ -33,7 +33,7 @@ sys.path.insert(0, AUTOMATION_DIR)
 from sensor import *
 import config
 import common
-from common import _identity_of, match_target
+from common import _identity_of, match_target, resolve_target_identity
 
 MAX_ROUNDS = 50          # 共跑 10 轮
 STREAM_SECONDS = 120     # 每轮起流时长 100 秒
@@ -66,7 +66,7 @@ def _get_ble_path(sensor):
         return None
 
 
-def _one_round(ctrl, round_num, log_dir):
+def _one_round(ctrl, round_num, log_dir, target_identity=None):
     """执行一次完整的连接-长时间起流-断开。返回 (ok, detail)。"""
     print(f"\n---- 第 {round_num}/{MAX_ROUNDS} 轮 ----", flush=True)
 
@@ -75,7 +75,10 @@ def _one_round(ctrl, round_num, log_dir):
     SCAN_RETRY_WAIT = 10
     target = None
     for attempt in range(1, SCAN_RETRIES + 1):
-        print(f"  [scan] 目标 identity: {common.TARGET_IDENTITIES}（第 {attempt}/{SCAN_RETRIES} 次）...", flush=True)
+        if target_identity:
+            print(f"  [scan] 目标 identity: {', '.join(target_identity)}（命令行指定，第 {attempt}/{SCAN_RETRIES} 次）...", flush=True)
+        else:
+            print(f"  [scan] 目标 identity: {', '.join(common.TARGET_IDENTITIES)}（config 默认，第 {attempt}/{SCAN_RETRIES} 次）...", flush=True)
         try:
             devices = ctrl.scan(config.SCAN_TIMEOUT_MS)
         except Exception as e:
@@ -90,7 +93,7 @@ def _one_round(ctrl, round_num, log_dir):
                 ident = _identity_of(n)
                 print(f"  [scan]   设备: {n}  MAC={a}  identity={ident}", flush=True)
 
-        target = match_target(devices)
+        target = match_target(devices, target_identity=target_identity)
         if target is not None:
             break
 
@@ -225,13 +228,17 @@ def _one_round(ctrl, round_num, log_dir):
 
 def main():
     ctrl = SensorControllerInstance
+    target_identity = resolve_target_identity()
 
     print("=" * 60, flush=True)
     print("压力测试：反复连接-长时间起流-断开", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
-    print(f"目标 identity: {common.TARGET_IDENTITIES}", flush=True)
+    if target_identity:
+        print(f"目标 identity: {', '.join(target_identity)}（命令行指定）", flush=True)
+    else:
+        print(f"目标 identity: {', '.join(common.TARGET_IDENTITIES)}（config 默认）", flush=True)
     print(f"循环上限: {MAX_ROUNDS} 次，每次起流 {STREAM_SECONDS}s（{STREAM_SECONDS // 60} 分钟）", flush=True)
 
     print("\n[前置条件]", flush=True)
@@ -263,7 +270,7 @@ def main():
     total_rounds = 0
 
     for i in range(1, MAX_ROUNDS + 1):
-        ok, detail = _one_round(ctrl, i, log_dir)
+        ok, detail = _one_round(ctrl, i, log_dir, target_identity)
         total_rounds = i
 
         if ok:

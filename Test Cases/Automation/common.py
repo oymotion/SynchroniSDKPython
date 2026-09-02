@@ -57,6 +57,34 @@ def record(results, name, ok, expect, actual):
     results.append((name, status, expect, actual))
 
 
+def resolve_target_identity():
+    """解析命令行参数指定的目标 identity（逗号分隔，覆盖 config.TARGET_IDENTITY）。
+
+    用法：python <script>.py [identity[,identity...]]
+      - 提供参数：作为目标 identity 列表（覆盖 config.TARGET_IDENTITY）
+      - 未提供：返回 None，走 config 默认（TARGET_IDENTITIES）
+
+    每个 identity 都必须在 config.DEVICES 中定义，否则报错退出。
+    """
+    if len(sys.argv) <= 1:
+        return None
+    raw = sys.argv[1].strip()
+    if not raw:
+        print("[common] 错误：命令行参数 identity 为空", flush=True)
+        raise SystemExit(1)
+    ids = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if not ids:
+        print("[common] 错误：命令行参数 identity 为空", flush=True)
+        raise SystemExit(1)
+    defined = {(c.get("identity") or "").strip().upper() for c in config.DEVICES}
+    undefined = [i for i in ids if i not in defined]
+    if undefined:
+        print(f"[common] 错误：命令行指定的 identity {undefined} 未在 config.DEVICES 中定义", flush=True)
+        print(f"[common] DEVICES 中已定义的 identity: {sorted(defined)}", flush=True)
+        raise SystemExit(1)
+    return ids
+
+
 def _identity_of(name):
     """Extract 4-hex identity from broadcast name like 'OYWW1100(80F3)' -> '80F3'."""
     m = re.search(r"\(([0-9A-Fa-f]{4})\)", name or "")
@@ -80,7 +108,10 @@ def match_target(devices, target_identity=None):
     Returns the first matching BLEDevice, or None if no match.
     """
     if target_identity is not None:
-        targets = [target_identity.strip().upper()]
+        if isinstance(target_identity, str):
+            targets = [target_identity.strip().upper()]
+        else:
+            targets = [t.strip().upper() for t in target_identity if (t or "").strip()]
     else:
         targets = TARGET_IDENTITIES if isinstance(TARGET_IDENTITIES, list) else [TARGET_IDENTITIES]
     
