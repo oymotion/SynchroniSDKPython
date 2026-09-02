@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DEV-SM-010：onAutoReconnect(restore=True) 自定义恢复（返回 True 跳过默认恢复）。
+"""DEV-SM-010：onAutoReconnect(restore=True) 自定义恢复（answer(True) 跳过默认恢复）。
 
 对应用例：02_连接与状态机.md -> DEV-SM-010
 可自动化：semi-auto（需人工断电/移出范围，再恢复供电/移回范围）
@@ -11,16 +11,16 @@
 流程：
   1) 确认设备开机 -> 按回车
   2) scan -> requireSensor -> 检查 autoReconnect==True（默认）
-  3) 注册 onAutoReconnect 返回 True（表示由应用接管，跳过 SDK 默认恢复流程）
+  3) 注册 onAutoReconnect 回调 answer(True)（表示由应用接管，跳过 SDK 默认恢复流程）
   4) connect 到 Ready -> init -> startDataNotification 起流
   5) 人工断电/移出范围 -> 观察断链（Disconnected + onErrorCallback）
   6) 人工恢复供电/移回范围 -> 等待 onAutoReconnect 触发（restore 参数）
-     返回 True 后观察窗口内确认【跳过默认恢复】（未自动回到 Ready/未自动起流）
+     answer(True) 后观察窗口内确认【跳过默认恢复】（未自动回到 Ready/未自动起流）
 
 语义说明（来自 examples/SynchroniSDKPython_DemoNewMulti.py）：
-  - onAutoReconnect(sensor, restore) 在自动重连找回设备时触发
-  - 返回 True：由应用接管，SDK 不再执行默认的参数回放恢复
-  - 返回 False：SDK 执行默认恢复（connect -> init -> replay setParam -> startDataNotification）
+  - onAutoReconnect(sensor, restore, answer) 在自动重连找回设备时触发
+  - answer(True)：由应用接管，SDK 不再执行默认的参数回放恢复
+  - answer(False)：SDK 执行默认恢复（connect -> init -> replay setParam -> startDataNotification）
 """
 
 import os
@@ -121,10 +121,10 @@ def main():
         errors.append(reason)
         print(f"  [SensorProfile.onErrorCallback] {s.BLEDevice.Name}: {reason!r}", flush=True)
 
-    def on_reconnect(s, restore):
+    def on_reconnect(s, restore, answer):
         reconnects.append(restore)
         print(f"  [SensorProfile.onAutoReconnect] {s.BLEDevice.Name} restore={restore!r}", flush=True)
-        return True  # 自定义恢复接管，跳过 SDK 默认恢复流程
+        answer(True)  # 自定义恢复接管，跳过 SDK 默认恢复流程
 
     sensor.onStateChanged = on_state
     sensor.onErrorCallback = on_error
@@ -220,7 +220,7 @@ def main():
            f"触发 {len(reconnects)} 次 restore={reconnects!r}")
 
     if cb_triggered:
-        # 返回 True 后，观察窗口内确认跳过默认恢复
+        # answer(True) 后，观察窗口内确认跳过默认恢复
         print(f"\n[观察跳过默认恢复] 观察窗口 {NO_RECONNECT_WINDOW}s ...", flush=True)
         reached_ready = False
         t0 = time.time()
@@ -234,18 +234,18 @@ def main():
         transferring_after = sensor.isDataTransfering
         print(f"[观察] deviceState={sensor.deviceState} isDataTransfering={transferring_after} 状态序列 {[str(s) for s in states]}", flush=True)
 
-        record(results, "返回 True 后跳过默认恢复（未自动回到 Ready）", not reached_ready,
-               "onAutoReconnect 返回 True 后 deviceState 不自动回到 Ready",
+        record(results, "answer(True) 后跳过默认恢复（未自动回到 Ready）", not reached_ready,
+               "onAutoReconnect answer(True) 后 deviceState 不自动回到 Ready",
                f"state={sensor.deviceState} 状态序列={[str(s) for s in states]}")
-        record(results, "返回 True 后未自动起流（isDataTransfering 保持 False）", transferring_after is not True,
-               "onAutoReconnect 返回 True 后 isDataTransfering 不自动恢复 True",
+        record(results, "answer(True) 后未自动起流（isDataTransfering 保持 False）", transferring_after is not True,
+               "onAutoReconnect answer(True) 后 isDataTransfering 不自动恢复 True",
                f"isDataTransfering={transferring_after}")
     else:
-        record(results, "返回 True 后跳过默认恢复（未自动回到 Ready）", None,
-               "onAutoReconnect 返回 True 后 deviceState 不自动回到 Ready",
+        record(results, "answer(True) 后跳过默认恢复（未自动回到 Ready）", None,
+               "onAutoReconnect answer(True) 后 deviceState 不自动回到 Ready",
                "onAutoReconnect 未触发，无法验证（前置失败）")
-        record(results, "返回 True 后未自动起流（isDataTransfering 保持 False）", None,
-               "onAutoReconnect 返回 True 后 isDataTransfering 不自动恢复 True",
+        record(results, "answer(True) 后未自动起流（isDataTransfering 保持 False）", None,
+               "onAutoReconnect answer(True) 后 isDataTransfering 不自动恢复 True",
                "onAutoReconnect 未触发，无法验证（前置失败）")
 
     # 清理
