@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""PARAM-FUNC-004：EEG_SAMPLE_RATE 设置（待确认，按能力自动 SKIP）。
+"""PARAM-FUNC-004：OYWW1100 EMG_SAMPLE_RATE 正反向（500/1000 设置 + 非法值 750）。
 
 对应用例：04_参数.md -> PARAM-FUNC-004
-可自动化：auto（能力判定后执行/跳过）
+可自动化：auto（设备上电、在范围内为运行前置）
 
-流程：
+流程（正向）：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 能力判定：getParam("EEG_SAMPLE_RATE_LIST") 返回以 "Error" 开头
-     → 设备未上报 EEG/ECG 采样率能力，记录"不支持，跳过"
-  3) 支持时：逐个列表值 setParam("EEG_SAMPLE_RATE", 值)，校验返回 "OK"
-     且 getParam("EEG_SAMPLE_RATE") 返回该值；设备同时有 EEG/ECG 时校验同写
+  2) 能力判定：getParam("EMG_SAMPLE_RATE") 返回以 "Error" 开头 → 不支持，SKIP
+  3) 默认值校验：初始 getParam("EMG_SAMPLE_RATE") 应为 "1000"
+  4) 可选列表校验：getParam("EMG_SAMPLE_RATE_LIST") 非 Error 时校验含 500/1000
+  5) 逐一 setParam("EMG_SAMPLE_RATE", value)，getParam("EMG_SAMPLE_RATE") 核对
+
+流程（反向）：
+  6) setParam("EMG_SAMPLE_RATE", "750") 应返回 Error（列表外值）
+  7) setParam("EMG_SAMPLE_RATE", 空串) 应返回 Error
 
 说明：
-  README：EEG_SAMPLE_RATE 值按设备上报的能力列表校验；
-  无能力时 getParam("EEG_SAMPLE_RATE_LIST") 返回 "Error: Not supported"。
-  腕带 OYWW1100 通常无 EEG，预期 SKIP。
+  OYWW1100 腕带 EMG 采样率支持 500Hz 与 1000Hz 两档，默认 1000Hz。
+  本脚本合并正反向：正向校验默认值 + 两档逐一设置读回一致；反向校验
+  列表外值（750）与空串被拒绝（返回 Error 或抛异常）。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -22,7 +26,6 @@
 """
 
 import os
-import re
 import sys
 import time
 
@@ -35,23 +38,29 @@ import config
 import common
 from common import record, scan_and_match
 
+EXPECTED_RATES = ["500", "1000"]  # OYWW1100 EMG 采样率两档
+DEFAULT_RATE = "1000"             # 默认采样率
+INVALID_VALUES = ["750", ""]      # 反向：列表外值 + 空串
 
-def _capability_ok(sensor):
-    """返回 (是否支持, 列表字符串/None)。"""
+
+def _read_param(sensor, key):
+    """读取参数，异常时返回带前缀的字符串，避免中断。"""
     try:
-        r = sensor.getParam("EEG_SAMPLE_RATE_LIST")
+        return sensor.getParam(key)
     except Exception as e:
-        return False, f"抛异常 {type(e).__name__}: {e}"
-    if not isinstance(r, str) or r.startswith("Error"):
-        return False, r
-    return True, r
+        return f"抛异常 {type(e).__name__}: {e}"
+
+
+def _is_error(txt):
+    """参数返回是否为 Error（字符串以 Error 开头）。"""
+    return not isinstance(txt, str) or txt.startswith("Error")
 
 
 def main():
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
-    print("PARAM-FUNC-004 EEG_SAMPLE_RATE 设置", flush=True)
+    print("PARAM-FUNC-004 OYWW1100 EMG_SAMPLE_RATE 正反向（500/1000 + 非法值）", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
@@ -65,6 +74,7 @@ def main():
 
     results = []
 
+    # 环境检查
     is_enable = ctrl.isEnable
     print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
     if is_enable is not True:
@@ -72,8 +82,16 @@ def main():
         ctrl.terminate()
         return
 
-    print(f"\n[扫描] SensorController.scan({config.SCAN_TIMEOUT_MS}) ...", flush=True)
+    # 扫描匹配
+    print(f"\n[扫描] 目标 identity: {common.TARGET_IDENTITIES}", flush=True)
     target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS)
+    print(f"[扫描] 扫描到 {len(devices) if devices else 0} 台设备:", flush=True)
+    if devices:
+        for d in devices:
+            n = getattr(d, 'Name', '?')
+            a = getattr(d, 'Address', '?')
+            print(f"  {n} {a} identity={common._identity_of(n)}", flush=True)
+
     if target is None:
         print("[FAIL] 未匹配到目标设备", flush=True)
         record(results, "scan 匹配到目标设备", False, "scan 返回含目标设备", "未匹配到目标")
@@ -86,6 +104,7 @@ def main():
     print(f"[扫描] 目标设备: {name} {addr}", flush=True)
     record(results, "scan 匹配到目标设备", True, "scan 返回含目标设备", f"匹配到 {name} {addr}")
 
+    # requireSensor
     sensor = ctrl.requireSensor(target)
     if sensor is None:
         print("[FAIL] SensorController.requireSensor 返回 None", flush=True)
@@ -96,6 +115,7 @@ def main():
     record(results, "requireSensor 返回 SensorProfile", isinstance(sensor, SensorProfile),
            "返回 SensorProfile", f"返回 {type(sensor).__name__}")
 
+    # connect
     print("\n[连接] SensorProfile.connect() ...", flush=True)
     try:
         ok = sensor.connect()
@@ -107,6 +127,7 @@ def main():
     record(results, "SensorProfile.connect 返回 True", ok is True,
            "connect() 返回 True", f"connect() -> {connect_txt}")
 
+    # 到达 Ready
     t0 = time.time()
     while time.time() - t0 < 15 and sensor.deviceState != DeviceStateEx.Ready:
         time.sleep(0.2)
@@ -123,6 +144,7 @@ def main():
         ctrl.terminate()
         return
 
+    # init
     print(f"\n[init] SensorProfile.init({config.PACKAGE_SAMPLE_COUNT}, {config.POWER_REFRESH_INTERVAL_MS}) ...", flush=True)
     try:
         iret = sensor.init(config.PACKAGE_SAMPLE_COUNT, config.POWER_REFRESH_INTERVAL_MS)
@@ -133,14 +155,17 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # 能力判定
-    supported, cap_txt = _capability_ok(sensor)
-    print(f"\n[能力] getParam('EEG_SAMPLE_RATE_LIST') = {cap_txt!r}", flush=True)
-    if not supported:
-        record(results, "EEG_SAMPLE_RATE 设置生效", None,
-               "支持 EEG/ECG 采样率时校验设置",
-               f"getParam('EEG_SAMPLE_RATE_LIST')={cap_txt!r}，设备未上报能力")
-        print("[SKIP] 设备未上报 EEG/ECG 采样率能力，跳过", flush=True)
+    # 上电默认值 + 能力判定：未做任何 setParam 前，首次读取 EMG 采样率
+    cur_init = _read_param(sensor, "EMG_SAMPLE_RATE")
+    list_str = _read_param(sensor, "EMG_SAMPLE_RATE_LIST")
+    print(f"\n[上电默认值/能力] getParam('EMG_SAMPLE_RATE') = {cur_init!r}（未 set 前首次读取）", flush=True)
+    print(f"[能力] getParam('EMG_SAMPLE_RATE_LIST') = {list_str!r}", flush=True)
+
+    if _is_error(cur_init) and _is_error(list_str):
+        record(results, "EMG_SAMPLE_RATE 能力判定", None,
+               "getParam('EMG_SAMPLE_RATE')/LIST 至少一个返回有效值",
+               f"EMG_SAMPLE_RATE={cur_init!r} LIST={list_str!r}，设备未上报能力")
+        print("[SKIP] 设备未上报 EMG 采样率能力，跳过", flush=True)
         try:
             sensor.disconnect()
         except Exception:
@@ -149,91 +174,85 @@ def main():
         ctrl.terminate()
         return
 
-    rates = [x.strip() for x in cap_txt.split("|") if x.strip()]
-    if not rates:
-        record(results, "EEG_SAMPLE_RATE 设置生效", False,
-               "能力列表非空", f"列表={cap_txt!r}")
-        print("[FAIL] EEG_SAMPLE_RATE_LIST 为空", flush=True)
-        try:
-            sensor.disconnect()
-        except Exception:
-            pass
-        print("\n结论: FAIL", flush=True)
-        ctrl.terminate()
-        return
-
-    # 读 EEG/ECG 能力，用于同写验证
-    info = sensor.getDeviceInfo()
-    eeg_ch = 0
-    ecg_ch = 0
-    if info is not None:
-        try:
-            eeg_ch = int(getattr(info, 'EegChannelCount', 0) or 0)
-        except Exception:
-            eeg_ch = 0
-        try:
-            ecg_ch = int(getattr(info, 'EcgChannelCount', 0) or 0)
-        except Exception:
-            ecg_ch = 0
-    print(f"[能力] EegChannelCount={eeg_ch} EcgChannelCount={ecg_ch}", flush=True)
-
-    # 逐个列表值设置并核对
-    for rate_val in rates:
-        print(f"\n[参数] setParam('EEG_SAMPLE_RATE', {rate_val!r}) ...", flush=True)
-        try:
-            sret = sensor.setParam("EEG_SAMPLE_RATE", rate_val)
-        except Exception as e:
-            sret = f"抛异常 {type(e).__name__}: {e}"
-        print(f"[参数] setParam -> {sret!r}", flush=True)
-
-        try:
-            cur = sensor.getParam("EEG_SAMPLE_RATE")
-        except Exception as e:
-            cur = f"抛异常 {type(e).__name__}: {e}"
-        print(f"[参数] getParam('EEG_SAMPLE_RATE') = {cur!r}", flush=True)
-
-        ok_val = (sret == "OK") and (cur == rate_val)
-        record(results, f"EEG_SAMPLE_RATE 设置值 {rate_val} 生效",
-               ok_val,
-               f"setParam 返回 'OK' 且 getParam('EEG_SAMPLE_RATE')=='{rate_val}'",
-               f"setParam->{sret!r} getParam->{cur!r}")
-
-    # EEG/ECG 同写验证（仅当同时有 EEG 与 ECG 时）
-    if eeg_ch > 0 and ecg_ch > 0:
-        time.sleep(1.0)  # 等待 DeviceInfo 采样率更新
-        info2 = sensor.getDeviceInfo()
-        if info2 is None:
-            record(results, "EEG/ECG 采样率同写为相同值", False,
-                   "设置后 getDeviceInfo() 返回 DeviceInfo", "返回 None")
-        else:
-            try:
-                eeg_rate = int(getattr(info2, 'EegSampleRate', -1))
-            except Exception:
-                eeg_rate = -1
-            try:
-                ecg_rate = int(getattr(info2, 'EcgSampleRate', -1))
-            except Exception:
-                ecg_rate = -1
-            last_rate = rates[-1]
-            try:
-                last_rate_int = int(last_rate)
-            except Exception:
-                last_rate_int = -1
-            same = (eeg_rate == last_rate_int and ecg_rate == last_rate_int)
-            print(f"[同写] EegSampleRate={eeg_rate} EcgSampleRate={ecg_rate} 期望={last_rate_int}", flush=True)
-            record(results, "EEG/ECG 采样率同写为相同值", same,
-                   f"EegSampleRate==EcgSampleRate=={last_rate_int}",
-                   f"EegSampleRate={eeg_rate} EcgSampleRate={ecg_rate}")
+    # 确定可选档位：优先用 LIST，LIST 无效时回退到硬编码档位
+    if not _is_error(list_str):
+        rates = [r.strip() for r in list_str.split("|") if r.strip()]
     else:
-        record(results, "EEG/ECG 采样率同写为相同值", None,
-               "同时有 EEG 与 ECG 时校验同写",
-               f"EegChannelCount={eeg_ch} EcgChannelCount={ecg_ch}，无双模态，跳过")
+        rates = EXPECTED_RATES
+    print(f"[参数] 支持采样率: {rates}", flush=True)
 
+    # 上电默认值校验（未 set 前首次读取）
+    record(results, "EMG_SAMPLE_RATE 上电默认值 = 1000",
+           str(cur_init) == DEFAULT_RATE,
+           f"首次(未 set 前) getParam('EMG_SAMPLE_RATE') == '{DEFAULT_RATE}'",
+           f"getParam('EMG_SAMPLE_RATE') = {cur_init!r}")
+
+    # 可选列表校验（仅当 LIST 可用时）
+    if not _is_error(list_str):
+        missing = [r for r in EXPECTED_RATES if r not in rates]
+        list_ok = (len(missing) == 0)
+        record(results, "EMG_SAMPLE_RATE_LIST 含 500 与 1000",
+               list_ok,
+               f"EMG_SAMPLE_RATE_LIST 含 {EXPECTED_RATES}",
+               f"列表={rates}，缺失={missing if missing else '无'}")
+        if not list_ok:
+            print(f"[FAIL] EMG_SAMPLE_RATE_LIST 缺少期望采样率: {missing}", flush=True)
+            try:
+                sensor.disconnect()
+            except Exception:
+                pass
+            print("\n结论: FAIL", flush=True)
+            ctrl.terminate()
+            return
+
+    # ---- 正向：逐一设置读回一致 ----
+    for rate in EXPECTED_RATES:
+        print(f"\n[测试] EMG_SAMPLE_RATE = {rate}", flush=True)
+
+        # setParam 单独处理（返回值为 "OK"/"Error" 字符串）
+        try:
+            set_ret = sensor.setParam("EMG_SAMPLE_RATE", rate)
+            set_txt = f"返回 {set_ret!r}"
+        except Exception as e:
+            set_ret = None
+            set_txt = f"抛异常 {type(e).__name__}: {e}"
+        print(f"[setParam] EMG_SAMPLE_RATE={rate} -> {set_txt}", flush=True)
+
+        cur = _read_param(sensor, "EMG_SAMPLE_RATE")
+        print(f"[getParam] EMG_SAMPLE_RATE = {cur!r}", flush=True)
+
+        ok_val = (set_ret == "OK") and (str(cur) == rate)
+        record(results, f"EMG_SAMPLE_RATE={rate} 设置并读回一致",
+               ok_val,
+               f"setParam 返回 OK，getParam 返回 {rate}",
+               f"setParam={set_txt}, getParam={cur!r}")
+
+    # ---- 反向：列表外值与空串报错 ----
+    print(f"\n[反向] 不支持的值: {INVALID_VALUES}", flush=True)
+    for val in INVALID_VALUES:
+        label = f"EMG_SAMPLE_RATE={val!r}" if val != "" else "EMG_SAMPLE_RATE=空串"
+        print(f"\n[setParam] {label} ...", flush=True)
+        try:
+            r = sensor.setParam("EMG_SAMPLE_RATE", val)
+            ret_txt = f"返回 {r!r}"
+        except Exception as e:
+            r = f"抛异常 {type(e).__name__}: {e}"
+            ret_txt = f"抛异常 {type(e).__name__}: {e}"
+        print(f"[setParam] {label} -> {ret_txt}", flush=True)
+
+        is_error = (isinstance(r, str) and r.startswith("Error")) or ("异常" in ret_txt)
+        record(results, f"setParam({label}) 返回 Error",
+               is_error,
+               f"setParam({label}) 返回 Error 或抛异常",
+               ret_txt)
+
+    # 清理
     try:
         sensor.disconnect()
     except Exception as e:
         print(f"[断开] SensorProfile.disconnect 抛异常 {type(e).__name__}: {e}", flush=True)
 
+    # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)
     print("测试结果汇总", flush=True)
     print("=" * 60, flush=True)

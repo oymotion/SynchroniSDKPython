@@ -35,9 +35,9 @@ import config
 import common
 from common import _identity_of, match_target, resolve_target_identity
 
-MAX_ROUNDS = 50          # 共跑 10 轮
-STREAM_SECONDS = 120     # 每轮起流时长 100 秒
-CHECK_INTERVAL = 30      # 每 20 秒输出一次电量
+MAX_ROUNDS = 50          # 共跑 50 轮
+STREAM_SECONDS = 90     # 每轮起流时长 90 秒
+CHECK_INTERVAL = 30      # 每 30 秒输出一次电量
 
 
 def _on_error(sensor, reason):
@@ -66,9 +66,41 @@ def _get_ble_path(sensor):
         return None
 
 
+def _snapshot_files(log_dir):
+    """返回 log_dir 当前 bin/log 文件集合（用于识别上一轮遗留文件）。"""
+    if not log_dir or not os.path.isdir(log_dir):
+        return set()
+    try:
+        return {fn for fn in os.listdir(log_dir)
+                if fn.lower().endswith((".bin", ".txt", ".log"))}
+    except OSError:
+        return set()
+
+
+def _cleanup_previous_round(log_dir, before_files):
+    """删除上一轮遗留的 bin/log 文件，减少垃圾数据。
+
+    在每轮成功 connect 之后调用；before_files 为 connect 之前的文件快照，
+    只删除其中遗留的 bin/log，避免误删本轮刚产生、仍在写入的文件。
+    SDK 长期持有的全局日志文件删除失败时忽略（保留，便于出错定位）。
+    """
+    removed = []
+    for fn in before_files:
+        p = os.path.join(log_dir, fn)
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+                removed.append(fn)
+        except OSError:
+            pass  # 文件被占用，保留
+    if removed:
+        print(f"  [清理] 已删除上一轮 {len(removed)} 个文件（bin/log）", flush=True)
+
+
 def _one_round(ctrl, round_num, log_dir, target_identity=None):
     """执行一次完整的连接-长时间起流-断开。返回 (ok, detail)。"""
     print(f"\n---- 第 {round_num}/{MAX_ROUNDS} 轮 ----", flush=True)
+    before_files = _snapshot_files(log_dir)
 
     # scan（最多重试 3 次，每次间隔 10 秒）
     SCAN_RETRIES = 3
@@ -122,6 +154,9 @@ def _one_round(ctrl, round_num, log_dir, target_identity=None):
             return False, f"connect 返回 {ok}"
     except Exception as e:
         return False, f"connect 抛异常: {type(e).__name__}: {e}"
+
+    # 连接成功后，清理上一轮遗留的 bin/log 文件，减少垃圾数据
+    _cleanup_previous_round(log_dir, before_files)
 
     # 到达 Ready
     t0 = time.time()

@@ -121,8 +121,8 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # ---- getParam("EEG_SAMPLE_RATE")：OB6000C 固定 250 ----
-    print("\n[getParam] EEG_SAMPLE_RATE ...", flush=True)
+    # ---- getParam("EEG_SAMPLE_RATE")：上电默认值（未做任何 set 前首次读取）----
+    print("\n[getParam] EEG_SAMPLE_RATE（上电默认值，未 set 前首次读取）...", flush=True)
     try:
         current_rate = sensor.getParam("EEG_SAMPLE_RATE")
         print(f"[getParam] EEG_SAMPLE_RATE = {current_rate!r}", flush=True)
@@ -131,9 +131,9 @@ def main():
         print(f"[getParam] EEG_SAMPLE_RATE 异常: {e}", flush=True)
 
     rate_is_250 = (isinstance(current_rate, str) and current_rate.strip() == "250")
-    record(results, "getParam('EEG_SAMPLE_RATE') 返回 250",
+    record(results, "getParam('EEG_SAMPLE_RATE') 上电默认值 = 250",
            rate_is_250,
-           "getParam('EEG_SAMPLE_RATE') == '250'（OB6000C 固定 250）",
+           "首次(未 set 前)读取 getParam('EEG_SAMPLE_RATE') == '250'（OB6000C 上电默认值 250）",
            f"返回 {current_rate!r}")
 
     # ---- getParam("EEG_SAMPLE_RATE_LIST")：固定仅 250 ----
