@@ -133,6 +133,8 @@ PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
 SAMPLE_RATE_CANDIDATES = (250, 500, 1000, 2000)
 EMG_SAMPLE_RATE_CANDIDATES = (500, 1000)
 IMU_SAMPLE_RATE_CANDIDATES = (50, 100, 200, 250, 400, 500, 1000, 2000)
+# 固件 PPG_SR_* 掩码全集；不支持的候选由 _apply_control_states 隐藏
+PPG_SAMPLE_RATE_CANDIDATES = (50, 100, 200, 400, 800, 1000, 1600, 3200)
 
 
 class DeviceDataState:
@@ -149,6 +151,7 @@ class DeviceDataState:
         self.sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) EEG/ECG
         self.emg_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) EMG
         self.imu_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) IMU
+        self.ppg_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) PPG
         self.gesture = None            # (gesture, raw_gesture, possiblity, strength)
 
         self.buffers: dict = {}
@@ -890,6 +893,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._updating_sample_rate_controls = False
         self._updating_emg_sample_rate_controls = False
         self._updating_imu_sample_rate_controls = False
+        self._updating_ppg_sample_rate_controls = False
         self._debug_log_checkbox = None
         self._data_debug_log_checkbox = None
         self._ntf_checkboxes: dict = {}
@@ -903,6 +907,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._imu_sample_rate_radios: dict = {}
         self._imu_sample_rate_button_group = None
         self._imu_sample_rate_group = None
+        self._ppg_sample_rate_radios: dict = {}
+        self._ppg_sample_rate_button_group = None
+        self._ppg_sample_rate_group = None
         self._debug_log_enabled = True
         self._data_debug_log_enabled = True
         # 每设备上次会话的日志/bin 导出路径：重连时优先续用上一条，而不是另起新文件
@@ -1262,6 +1269,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             imu_sample_rate_layout.addWidget(rb)
         imu_sample_rate_group.setLayout(imu_sample_rate_layout)
 
+        ppg_sample_rate_group = QtWidgets.QGroupBox("PPG Sample Rate")
+        ppg_sample_rate_group.setVisible(False)
+        self._ppg_sample_rate_group = ppg_sample_rate_group
+        ppg_sample_rate_layout = QtWidgets.QHBoxLayout()
+        self._ppg_sample_rate_button_group = QtWidgets.QButtonGroup(self)
+        for rate in PPG_SAMPLE_RATE_CANDIDATES:
+            rb = QtWidgets.QRadioButton(f"{rate} Hz")
+            rb.setAutoExclusive(False)
+            rb.setEnabled(False)
+            rb.toggled.connect(lambda checked, r=rate: self._on_ppg_sample_rate_toggled(r, checked))
+            self._ppg_sample_rate_radios[rate] = rb
+            self._ppg_sample_rate_button_group.addButton(rb)
+            ppg_sample_rate_layout.addWidget(rb)
+        ppg_sample_rate_group.setLayout(ppg_sample_rate_layout)
+
         options_layout = QtWidgets.QHBoxLayout()
         options_layout.addWidget(debug_log_group, stretch=1)
         options_layout.addWidget(ntf_group, stretch=1)
@@ -1269,6 +1291,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         options_layout.addWidget(sample_rate_group, stretch=1)
         options_layout.addWidget(emg_sample_rate_group, stretch=1)
         options_layout.addWidget(imu_sample_rate_group, stretch=1)
+        options_layout.addWidget(ppg_sample_rate_group, stretch=1)
         controls_layout.addLayout(options_layout)
 
         controls_layout.addStretch()
@@ -3514,6 +3537,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     state.imu_sample_rate_state = (options, rate)
                     if self.current_sensor == sensor:
                         self._set_imu_sample_rate_checked(rate)
+            if info.PpgSampleRate > 0:
+                rate = int(info.PpgSampleRate)
+                options, cur = state.ppg_sample_rate_state
+                if cur != rate:
+                    state.ppg_sample_rate_state = (options, rate)
+                    if self.current_sensor == sensor:
+                        self._set_ppg_sample_rate_checked(rate)
         if self.current_sensor == sensor:
             self.link_label.setText(self._link_text(info))
             self.mtu_label.setText(self._mtu_text(info))
@@ -3696,6 +3726,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 pass
         imu_sample_rate_state = (imu_sample_rate_options, current_imu_sample_rate)
 
+        ppg_sample_rate_options = []
+        ppg_options_result = sensor.getParam("PPG_SAMPLE_RATE_LIST")
+        print(f"[Refresh] getParam(PPG_SAMPLE_RATE_LIST) -> {ppg_options_result}")
+        if not str(ppg_options_result).startswith("Error"):
+            for item in str(ppg_options_result).split("|"):
+                try:
+                    ppg_sample_rate_options.append(int(item))
+                except ValueError:
+                    pass
+
+        current_ppg_sample_rate = 0
+        ppg_rate_result = sensor.getParam("PPG_SAMPLE_RATE")
+        print(f"[Refresh] getParam(PPG_SAMPLE_RATE) -> {ppg_rate_result}")
+        if not str(ppg_rate_result).startswith("Error"):
+            try:
+                current_ppg_sample_rate = int(ppg_rate_result)
+            except ValueError:
+                pass
+        ppg_sample_rate_state = (ppg_sample_rate_options, current_ppg_sample_rate)
+
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None:
             state.ntf_states = ntf_states
@@ -3703,13 +3753,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             state.sample_rate_state = sample_rate_state
             state.emg_sample_rate_state = emg_sample_rate_state
             state.imu_sample_rate_state = imu_sample_rate_state
+            state.ppg_sample_rate_state = ppg_sample_rate_state
 
         if self.current_sensor == sensor:
             self._apply_control_states(ntf_states, filter_states, sample_rate_state,
-                                       emg_sample_rate_state, imu_sample_rate_state)
+                                       emg_sample_rate_state, imu_sample_rate_state,
+                                       ppg_sample_rate_state)
 
     def _apply_control_states(self, ntf_states: dict, filter_states: dict, sample_rate_state: tuple = ([], 0),
-                              emg_sample_rate_state: tuple = ([], 0), imu_sample_rate_state: tuple = ([], 0)):
+                              emg_sample_rate_state: tuple = ([], 0), imu_sample_rate_state: tuple = ([], 0),
+                              ppg_sample_rate_state: tuple = ([], 0)):
         """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）；设备不支持的 NTF 选项直接隐藏。"""
         self._updating_ntf_controls = True
         try:
@@ -3769,6 +3822,19 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._imu_sample_rate_button_group.setExclusive(True)
         finally:
             self._updating_imu_sample_rate_controls = False
+        ppg_options, current_ppg_rate = ppg_sample_rate_state
+        self._ppg_sample_rate_group.setVisible(bool(ppg_options))
+        self._updating_ppg_sample_rate_controls = True
+        try:
+            if current_ppg_rate not in self._ppg_sample_rate_radios:
+                self._ppg_sample_rate_button_group.setExclusive(False)
+            for rate, rb in self._ppg_sample_rate_radios.items():
+                rb.setVisible(rate in ppg_options)
+                rb.setEnabled(rate in ppg_options)
+                rb.setChecked(rate == current_ppg_rate)
+            self._ppg_sample_rate_button_group.setExclusive(True)
+        finally:
+            self._updating_ppg_sample_rate_controls = False
 
     def _set_sample_rate_checked(self, rate: int):
         """仅更新采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
@@ -3805,6 +3871,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._imu_sample_rate_button_group.setExclusive(True)
         finally:
             self._updating_imu_sample_rate_controls = False
+
+    def _set_ppg_sample_rate_checked(self, rate: int):
+        """仅更新 PPG 采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
+        self._updating_ppg_sample_rate_controls = True
+        try:
+            if rate not in self._ppg_sample_rate_radios:
+                self._ppg_sample_rate_button_group.setExclusive(False)
+            for r, rb in self._ppg_sample_rate_radios.items():
+                rb.setChecked(r == rate)
+            self._ppg_sample_rate_button_group.setExclusive(True)
+        finally:
+            self._updating_ppg_sample_rate_controls = False
 
     def _on_filter_combo_changed(self, _index: int):
         """Live Filter 频段下拉框切换：更新选中项；各设备的回调线程滤波路径
@@ -3882,6 +3960,23 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
+    def _on_ppg_sample_rate_toggled(self, rate: int, checked: bool):
+        if not checked:
+            return
+        if self.current_sensor is None or not self.current_sensor.isReady:
+            return
+        if self._updating_ppg_sample_rate_controls:
+            return
+        value = str(rate)
+        print(f"[Sample Rate] setParam(PPG_SAMPLE_RATE, {value}) ...")
+        result = self.current_sensor.setParam("PPG_SAMPLE_RATE", value)
+        print(f"[Sample Rate] setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
+        self._app_log(f"User: setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
+        self._check_set_param_result("PPG_SAMPLE_RATE", result)
+        self._refresh_control_states(self.current_sensor)
+        if not str(result).startswith("Error"):
+            self._clear_ui_data()
+
     def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
         """切换显示设备时，刷新设备信息、丢包统计、手势、开关状态与图表。"""
         self._last_plotted_sample_indices.clear()
@@ -3929,8 +4024,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sample_rate_state = state.sample_rate_state if state is not None else ([], 0)
         emg_sample_rate_state = state.emg_sample_rate_state if state is not None else ([], 0)
         imu_sample_rate_state = state.imu_sample_rate_state if state is not None else ([], 0)
+        ppg_sample_rate_state = state.ppg_sample_rate_state if state is not None else ([], 0)
         self._apply_control_states(ntf_states, filter_states, sample_rate_state,
-                                   emg_sample_rate_state, imu_sample_rate_state)
+                                   emg_sample_rate_state, imu_sample_rate_state,
+                                   ppg_sample_rate_state)
 
         self._rebuild_2d_plot()
         self._rebuild_eeg_plot()
