@@ -3916,13 +3916,23 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if self._updating_sample_rate_controls:
             return
+        # 先把控件状态应用到用户选择（toggled 返回后单选组才完全定型），
+        # 再把速率设置投递回 UI 线程执行：setParam 走停流→设置→起流耗时较长，
+        # 在 toggled 里直接阻塞会卡住控件状态迁移
+        self._set_sample_rate_checked(rate)
+        QtCore.QTimer.singleShot(0, lambda r=rate: self._apply_sample_rate(r))
+
+    def _apply_sample_rate(self, rate: int):
+        sensor = self.current_sensor
+        if sensor is None or not sensor.isReady:
+            return
         value = str(rate)
         print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) ...")
-        result = self.current_sensor.setParam("EEG_SAMPLE_RATE", value)
+        result = sensor.setParam("EEG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
         self._check_set_param_result("EEG_SAMPLE_RATE", result)
-        self._refresh_control_states(self.current_sensor)
+        self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
@@ -3933,13 +3943,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if self._updating_emg_sample_rate_controls:
             return
+        self._set_emg_sample_rate_checked(rate)
+        QtCore.QTimer.singleShot(0, lambda r=rate: self._apply_emg_sample_rate(r))
+
+    def _apply_emg_sample_rate(self, rate: int):
+        sensor = self.current_sensor
+        if sensor is None or not sensor.isReady:
+            return
         value = str(rate)
         print(f"[Sample Rate] setParam(EMG_SAMPLE_RATE, {value}) ...")
-        result = self.current_sensor.setParam("EMG_SAMPLE_RATE", value)
+        result = sensor.setParam("EMG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(EMG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(EMG_SAMPLE_RATE, {value}) -> {result}")
         self._check_set_param_result("EMG_SAMPLE_RATE", result)
-        self._refresh_control_states(self.current_sensor)
+        self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
@@ -3950,13 +3967,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if self._updating_imu_sample_rate_controls:
             return
+        self._set_imu_sample_rate_checked(rate)
+        QtCore.QTimer.singleShot(0, lambda r=rate: self._apply_imu_sample_rate(r))
+
+    def _apply_imu_sample_rate(self, rate: int):
+        sensor = self.current_sensor
+        if sensor is None or not sensor.isReady:
+            return
         value = str(rate)
         print(f"[Sample Rate] setParam(IMU_SAMPLE_RATE, {value}) ...")
-        result = self.current_sensor.setParam("IMU_SAMPLE_RATE", value)
+        result = sensor.setParam("IMU_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(IMU_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(IMU_SAMPLE_RATE, {value}) -> {result}")
         self._check_set_param_result("IMU_SAMPLE_RATE", result)
-        self._refresh_control_states(self.current_sensor)
+        self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
@@ -3967,13 +3991,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if self._updating_ppg_sample_rate_controls:
             return
+        self._set_ppg_sample_rate_checked(rate)
+        QtCore.QTimer.singleShot(0, lambda r=rate: self._apply_ppg_sample_rate(r))
+
+    def _apply_ppg_sample_rate(self, rate: int):
+        sensor = self.current_sensor
+        if sensor is None or not sensor.isReady:
+            return
         value = str(rate)
         print(f"[Sample Rate] setParam(PPG_SAMPLE_RATE, {value}) ...")
-        result = self.current_sensor.setParam("PPG_SAMPLE_RATE", value)
+        result = sensor.setParam("PPG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
         self._check_set_param_result("PPG_SAMPLE_RATE", result)
-        self._refresh_control_states(self.current_sensor)
+        self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
