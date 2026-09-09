@@ -13,11 +13,13 @@
   1) 确认 ≥2 台设备开机 -> 按回车
   2) scan 匹配 common.TARGET_IDENTITIES 中所有设备（需 ≥2 台，否则 SKIP）
   3) 对每台 requireSensor -> asyncConnect -> 等待 Ready -> asyncInit
-  4) 检测型号：同型号用默认参数；混型号放宽 timeout=60/maxDelayDispersionMs=-1/maxAttempts=5
+  4) 检测型号：同型号/混型号均跳过首包延迟离散度检查（maxDelayDispersionMs=-1）；
+     混型号额外放宽 timeout=60/maxAttempts=5
      await ctrl.asyncMultiStartDataNotification([s1, s2]) -> 返回 {mac: bool}
   5) 检查返回字典中所有值皆为 True
   6) 检查所有传感器 isDataTransfering==True
-  7) 清理：asyncMultiStopDataNotification + asyncDisconnect 所有
+  7) 等待 COLLECT_SECONDS 秒，检查每台 onDataCallback 是否收到 ≥1 批数据
+  8) 清理：asyncMultiStopDataNotification + asyncDisconnect 所有
 """
 
 import asyncio
@@ -34,6 +36,7 @@ import config
 import common
 
 READY_TIMEOUT = 15
+COLLECT_SECONDS = 3            # 起流后采集时长（秒），验证数据确实在传输
 
 from common import record, _identity_of, async_scan_and_match_all
 
@@ -43,6 +46,28 @@ def _tag_of(d):
     name = getattr(d, 'Name', '') or ''
     ident = _identity_of(name)
     return ident or (getattr(d, 'Address', '') or '?').upper()
+
+
+class DataResult:
+    def __init__(self):
+        self.batches = 0
+        self.total_samples = 0
+
+
+def make_on_data(result):
+    def on_data(sensor, data):
+        items = data if isinstance(data, list) else [data]
+        for d in items:
+            result.batches += 1
+            cs = getattr(d, 'channelSamples', None)
+            n = 0
+            if cs:
+                try:
+                    n = sum(len(ch) for ch in cs)
+                except TypeError:
+                    n = len(cs)
+            result.total_samples += n
+    return on_data
 
 
 async def main_async():
@@ -167,23 +192,30 @@ async def main_async():
     print(f"[型号] 检测到 {len(model_names)} 种型号: {model_txt}，same_model={same_model}", flush=True)
 
     # ---- asyncMultiStartDataNotification ----
+    # 本用例只验证"两台均起流"，跳过首包延迟离散度检查（ModelName 区分不了 OB6000C/A，
+    # 混型号设备也无法保证 5ms 同步）；混型号额外放宽 timeout/maxAttempts。
     sensor_list = [s for _, s in sensors]
     tag_list = [t for t, _ in sensors]
+
+    # 注册数据回调，用于验证起流后数据确实在传输
+    data_results = {}
+    for tag, sensor in sensors:
+        dr = DataResult()
+        sensor.onDataCallback = make_on_data(dr)
+        data_results[tag] = dr
+
     if same_model:
-        print(f"\n[异步多起流] await ctrl.asyncMultiStartDataNotification([{', '.join(tag_list)}]) ...", flush=True)
-        try:
-            multi_start_ret = await ctrl.asyncMultiStartDataNotification(sensor_list)
-        except Exception as e:
-            multi_start_ret = None
-            print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
+        timeout, max_dispersion, max_attempts = 30.0, -1, 3
     else:
-        print(f"\n[异步多起流] 混型号，放宽参数 timeout=60, maxDelayDispersionMs=-1, maxAttempts=5 ...", flush=True)
-        try:
-            multi_start_ret = await ctrl.asyncMultiStartDataNotification(
-                sensor_list, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
-        except Exception as e:
-            multi_start_ret = None
-            print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
+        timeout, max_dispersion, max_attempts = 60.0, -1, 5
+    print(f"\n[异步多起流] await ctrl.asyncMultiStartDataNotification([{', '.join(tag_list)}], "
+          f"timeout={timeout}, maxDelayDispersionMs={max_dispersion}, maxAttempts={max_attempts}) ...", flush=True)
+    try:
+        multi_start_ret = await ctrl.asyncMultiStartDataNotification(
+            sensor_list, timeout=timeout, maxDelayDispersionMs=max_dispersion, maxAttempts=max_attempts)
+    except Exception as e:
+        multi_start_ret = None
+        print(f"[异步多起流] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     print(f"[异步多起流] asyncMultiStartDataNotification() -> {multi_start_ret!r}", flush=True)
 
@@ -203,6 +235,15 @@ async def main_async():
             print(f"[检查] [{tag}] isDataTransfering = {transferring}", flush=True)
             record(results, f"[{tag}] 起流后 isDataTransfering==True", transferring is True,
                    "isDataTransfering == True", f"isDataTransfering == {transferring}")
+
+    # 起流后等待采集窗口，验证每台设备真的在传输数据
+    print(f"\n[采集] 等待 {COLLECT_SECONDS}s 观察各设备 onDataCallback ...", flush=True)
+    await asyncio.sleep(COLLECT_SECONDS)
+    for tag, sensor in sensors:
+        dr = data_results[tag]
+        print(f"[采集] [{tag}] 批数={dr.batches} 样本数={dr.total_samples}", flush=True)
+        record(results, f"[{tag}] 起流后收到数据（≥1 批）", dr.batches >= 1,
+               "onDataCallback 收到 ≥1 批数据", f"批数={dr.batches} 样本数={dr.total_samples}")
 
     # 清理：asyncMultiStopDataNotification
     print(f"\n[异步多停流] await ctrl.asyncMultiStopDataNotification([{', '.join(tag_list)}]) ...", flush=True)

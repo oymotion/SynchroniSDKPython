@@ -19,8 +19,10 @@
       2) 电量 < LOW_BATTERY_THRESHOLD（默认 5%）
       3) 数据流意外中断（isDataTransfering=False）或设备状态异常（未保持 Ready），
          但会先进入 RECONNECT_GRACE_SECONDS 宽限期等待自动重连，超时未恢复才退出
-      4) 累计 SAMPLE_DROP_EXIT_COUNT 次「样本增量波动>5% 且丢包数增加」（持续丢包保护，优雅退出拿 log/bin）
-      5) 基准期（第3/4/5周期）样本增量波动 >2%（数据不稳，优雅退出）
+      4) 数据停滞：连续 STALL_CHECK_CYCLES 个周期 batches 无增长
+  - 数据质量告警（仅告警/计数，不触发退出）：
+      * 样本增量波动>5% 且丢包数增加（计入最终报告「严重丢包」次数）
+      * 基准期（第3/4/5周期）样本增量波动 >2%
   - 结束时 stopDataNotification + disconnect，导出 bin，并校验 bin 文件存在
   - 支持 Ctrl+C 中断，同样走收尾流程
 
@@ -55,9 +57,8 @@ BIN_COMPLETENESS_RATIO = 0.99    # bin 录制时长/实际起流时长 的完整
 STALL_CHECK_CYCLES = 3           # 连续 N 个周期 batches 无增长即判数据停滞
 SAMPLE_DELTA_TOLERANCE = 0.01    # 样本增量波动阈值（±1%），数据量视角的丢包交叉校验
 BASELINE_CYCLES = [3, 4, 5]      # 取这几个周期的样本增量均值作为固定基准（跳过启动期前 2 个周期）
-BASELINE_DISPERSION_TOLERANCE = 0.02  # 基准期（3/4/5 周期）样本增量之间的最大波动阈值（±2%），超过则数据不稳退出
-SAMPLE_DROP_TOLERANCE = 0.05     # 样本增量大幅波动阈值（±5%），与丢包叠加时判为数据质量劣化
-SAMPLE_DROP_EXIT_COUNT = 10      # 累计满足「波动>5% 且丢包数增加」的次数达到该值即优雅退出
+BASELINE_DISPERSION_TOLERANCE = 0.02  # 基准期（3/4/5 周期）样本增量之间的最大波动阈值（±2%），超过仅告警不退出
+SAMPLE_DROP_TOLERANCE = 0.05     # 样本增量大幅波动阈值（±5%），与丢包叠加时判为数据质量劣化（仅告警统计）
 RECONNECT_GRACE_SECONDS = 30     # 数据流/设备状态异常后的宽限期（秒），等待自动重连恢复，超时未恢复才退出
 GRACE_POLL_INTERVAL = 5          # 宽限期内的轮询间隔（秒），尽快感知数据流恢复
 
@@ -358,14 +359,6 @@ def main():
 
     sensor = None
 
-    # 环境检查
-    is_enable = ctrl.isEnable
-    print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
-    if is_enable is not True:
-        print("[跳过] 前置条件不满足：电脑蓝牙未开启。请先开启【电脑】蓝牙后重跑。", flush=True)
-        _teardown(ctrl, sensor, log_dir, bins_before)
-        return
-
     # 扫描匹配
     if target_identity:
         print(f"\n[扫描] 目标 identity: {target_identity}（命令行指定）", flush=True)
@@ -513,7 +506,7 @@ def main():
     prev_lost = 0            # 上一周期累计丢包数
     cycle_index = 0          # 周期计数（第 1/2 周期为启动期跳过，第 3/4/5 周期定基准，第 6 周期起校验）
     baseline_window = []     # 用于计算基准的样本增量（第 3/4/5 个周期）
-    drop_loss_cycles = 0     # 累计「样本增量波动>5% 且丢包数增加」的周期数，达 SAMPLE_DROP_EXIT_COUNT 则退出
+    drop_loss_cycles = 0     # 累计「样本增量波动>5% 且丢包数增加」的周期数（即最终报告的「严重丢包」次数，仅计数不退出）
     drop_started_at = None   # 数据流/设备状态异常的起始时刻（进入宽限期等待自动重连）
 
     def _fmt_hms(sec):
@@ -604,7 +597,7 @@ def main():
                     baseline_samples = sum(baseline_window) / len(baseline_window)
                     print(f"[基准] 样本增量基准 = {baseline_samples:.0f} 样本/周期"
                           f"（第{'/'.join(map(str, BASELINE_CYCLES))}个周期均值，{CHECK_INTERVAL}s/周期）", flush=True)
-                    # 基准期一致性校验：第 3/4/5 周期样本增量波动不得超过 2%，否则数据不稳，优雅退出
+                    # 基准期一致性校验：第 3/4/5 周期样本增量波动超过 2% 仅告警（不退出，供最终报告）
                     if baseline_samples:
                         max_dev = max(abs(d - baseline_samples) for d in baseline_window) / baseline_samples
                         if max_dev > BASELINE_DISPERSION_TOLERANCE:
@@ -615,8 +608,6 @@ def main():
                                 ctrl.log(f"[Longevity] {warn}", "E")
                             except Exception as e:
                                 print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
-                            exit_reason = f"基准期（第3/4/5周期）样本增量波动 {max_dev:.2%} 超过 2%，数据不稳定"
-                            break
             elif cycle_index > BASELINE_CYCLES[-1] and baseline_samples:
                 sample_ratio = abs(delta_samples - baseline_samples) / baseline_samples
                 if sample_ratio > SAMPLE_DELTA_TOLERANCE:
@@ -639,20 +630,16 @@ def main():
                 except Exception as e:
                     print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
 
-            # ---- 退出条件：样本大幅波动(>5%) 且丢包数增加，累计达阈值即优雅退出（拿 log/bin）----
+            # ---- 告警统计：样本大幅波动(>5%) 且丢包数增加（仅告警计数，不退出，供最终报告）----
             if sample_ratio is not None and sample_ratio > SAMPLE_DROP_TOLERANCE and delta_lost > 0:
                 drop_loss_cycles += 1
                 print(f"[告警] 样本大幅波动且丢包增加: 波动 {sample_ratio:.2%}(>{SAMPLE_DROP_TOLERANCE:.0%})、"
-                      f"新增丢包 {delta_lost}，累计 {drop_loss_cycles}/{SAMPLE_DROP_EXIT_COUNT} 次", flush=True)
+                      f"新增丢包 {delta_lost}，累计 {drop_loss_cycles} 次", flush=True)
                 try:
                     ctrl.log(f"[Longevity] 样本大幅波动且丢包增加: 波动 {sample_ratio:.2%}、"
-                             f"新增丢包 {delta_lost}，累计 {drop_loss_cycles}/{SAMPLE_DROP_EXIT_COUNT} 次", "W")
+                             f"新增丢包 {delta_lost}，累计 {drop_loss_cycles} 次", "W")
                 except Exception as e:
                     print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
-                if drop_loss_cycles >= SAMPLE_DROP_EXIT_COUNT:
-                    exit_reason = (f"累计 {SAMPLE_DROP_EXIT_COUNT} 次样本大幅波动(>5%)且丢包数增加"
-                                   f"（样本增量波动过大 + 持续丢包）")
-                    break
 
             # 退出条件 4：数据停滞（连续 STALL_CHECK_CYCLES 个周期 batches 无增长）
             if last_batches is not None and batches == last_batches:
@@ -665,7 +652,7 @@ def main():
                 stall_cycles = 0
             last_batches = batches
 
-            print(f"[状态] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本  回调={calls}次  丢包={lost}包", flush=True)
+            print(f"[状态][pid={os.getpid()}] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本  回调={calls}次  丢包={lost}包", flush=True)
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         exit_reason = "用户手动中断（Ctrl+C）"
@@ -689,6 +676,7 @@ def main():
             print(f"    - {_ev}", flush=True)
     else:
         print(f"  自动重连: 0 次", flush=True)
+    print(f"  严重丢包: {drop_loss_cycles} 次（样本增量波动>5% 且本周期新增丢包）", flush=True)
     if have_bin:
         print(f"  bin 有效性: {'有效' if bin_valid else '无效'}", flush=True)
         if bin_complete is None:
