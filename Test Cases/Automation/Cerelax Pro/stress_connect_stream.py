@@ -372,16 +372,24 @@ def main():
         print(f"目标 identity: {', '.join(common.TARGET_IDENTITIES)}（config 默认）", flush=True)
     print(f"循环上限: {MAX_ROUNDS} 次，每次起流 {STREAM_SECONDS}s（{STREAM_SECONDS // 60} 分钟）", flush=True)
 
+    # dongle 就绪检查：非 dongle（系统蓝牙）则中断，避免系统蓝牙不稳定
+    try:
+        dongle_ok = checkSetupDongle()
+    except Exception as e:
+        dongle_ok = None
+        print(f"[dongle] checkSetupDongle() 抛异常 {type(e).__name__}: {e}", flush=True)
+    print(f"[dongle] checkSetupDongle() -> {dongle_ok!r}", flush=True)
+    if not (isinstance(dongle_ok, str) and dongle_ok.startswith("OK")):
+        print("[FAIL] USB dongle 未就绪（无可用 dongle），将回退系统蓝牙（不稳定），已中断。", flush=True)
+        ctrl.terminate()
+        return
+
     print("\n[前置条件]", flush=True)
-    print("  - 主机(电脑)：蓝牙已开启", flush=True)
+    print("  - 主机(电脑)：系统蓝牙已【关闭】", flush=True)
+    print("  - USB dongle：已插入并绑定 WinUSB 驱动", flush=True)
     print("  - 待测设备：上电、在范围内", flush=True)
 
     input("\n>>> [人工操作] 请确认待测设备已【开机】且在范围内，按回车开始 ...")
-
-    if not ctrl.isEnable:
-        print("[跳过] 电脑蓝牙未开启", flush=True)
-        ctrl.terminate()
-        return
 
     # 长期开启日志：创建日志目录并启用 debug 日志
     log_dir = tempfile.mkdtemp(prefix="sdklog_stress_")

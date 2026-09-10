@@ -7,7 +7,8 @@
   2) 注册 onPowerChanged 回调，记录电量
   3) setParam("DEBUG_BLE_DATA_PATH", "True") 开启 bin 录制
   4) startDataNotification 起流，持续 STREAM_SECONDS 秒
-  5) 每 CHECK_INTERVAL 秒输出当前电量，不因电量变化提前退出
+  5) 起流期间每 CHECK_INTERVAL 秒输出电量，并监测 deviceState：
+     一旦离开 Ready（复位/断连）立即记录本轮失败（针对设备复位循环）
   6) stopDataNotification + 读取 bin 路径 + disconnect
   7) 若 startDataNotification 返回 False，立即停止，记录失败轮次
   8) 出错时打印日志目录与最近生成的 bin 文件位置，便于定位
@@ -180,21 +181,30 @@ def _one_round(ctrl, round_num, log_dir, target_identity=None):
         sensor.disconnect()
         return False, f"init 抛异常: {type(e).__name__}: {e}"
 
-    # 注册 onPowerChanged 回调（线程安全）
+    # 注册回调（线程安全）：onPowerChanged 作为命令通道心跳，onDataCallback 作为数据流心跳
     power_records = []
     lock = threading.Lock()
     initial_level = [None]
     latest_level = [None]
+    last_power_cb_ts = [None]   # 最后一次 onPowerChanged 时间戳（命令通道心跳）
+    last_data_cb_ts = [None]    # 最后一次 onDataCallback 时间戳（数据流心跳）
 
     def on_power_changed(sensor, level):
         ts = time.time()
         with lock:
             power_records.append((ts, level))
+            last_power_cb_ts[0] = ts
             if initial_level[0] is None:
                 initial_level[0] = level
             latest_level[0] = level
 
     sensor.onPowerChanged = on_power_changed
+
+    def on_data(sensor, data):
+        with lock:
+            last_data_cb_ts[0] = time.time()
+
+    sensor.onDataCallback = on_data
 
     # 开启 bin 录制（每轮生成一个 bin，供出错时定位）
     try:
