@@ -34,7 +34,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5   # 秒，工作线程 FFT 频谱的计算间隔
-DEMO_VERSION               = "0.0.9"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
+DEMO_VERSION               = "0.1.3"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 
@@ -56,6 +56,7 @@ DATA_TYPE_NAMES = {
     DataType.NTF_GYRO:       "Gyroscope (GYRO)",
     DataType.NTF_EULER_DATA: "Euler Angle (Euler)",
     DataType.NTF_QUATERNION: "Quaternion (Quaternion)",
+    DataType.NTF_MAG_ANGLE_DATA: "Mag Angle (MAG_ANGLE)",
 }
 
 # 实时频段滤波选项（右侧 EMG/EEG/ECG/BRTH/PPG 生物电波形）：(显示名, (下限, 上限))，None = 关闭
@@ -185,6 +186,15 @@ class DeviceDataState:
         self.brth_sample_rate = 0
         self.brth_impedance: list = []
         self.brth_buffer_lock = QtCore.QMutex()
+
+        # 磁角度/关节角度流（新 EMG 设备真磁角度；ORehab 关节角度，Emg 字段为 0）：
+        # 单通道，在右侧生物电窗口占一行显示（含 FFT），缓冲结构与 BRTH 一致
+        self.has_mag_angle = False
+        self.mag_angle_buffer = None
+        self.mag_angle_sample_index_buffer = None
+        self.mag_angle_buffer_index = 0
+        self.mag_angle_sample_rate = 0
+        self.mag_angle_buffer_lock = QtCore.QMutex()
 
         self.has_emg = False
         self.emg_buffer = None
@@ -365,10 +375,19 @@ class DeviceDataState:
             self.brth_sample_index_buffer = np.zeros((info.BrthChannelCount, buf_len), dtype=np.int64)
             self.brth_buffer_index = 0
 
+        self.has_mag_angle = info.MagAngleSampleRate > 0 and info.MagAngleChannelCount > 0
+        if self.has_mag_angle:
+            self.mag_angle_sample_rate = info.MagAngleSampleRate
+            buf_len = max(info.MagAngleSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.mag_angle_buffer = np.zeros((info.MagAngleChannelCount, buf_len))
+            self.mag_angle_sample_index_buffer = np.zeros((info.MagAngleChannelCount, buf_len), dtype=np.int64)
+            self.mag_angle_buffer_index = 0
+
         self.has_emg = info.EmgSampleRate > 0 and info.EmgChannelCount > 0
         if self.has_emg:
             self.emg_sample_rate = info.EmgSampleRate
-            self.emg_display_channels = min(info.EmgChannelCount, eeg_axis_count)
+            # 有磁角度流时 EMG 通道让出生物电窗口最后一行给 MAG_ANGLE 行
+            self.emg_display_channels = min(info.EmgChannelCount, eeg_axis_count - int(self.has_mag_angle))
             buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
             self.emg_buffer = np.zeros((self.emg_display_channels, buf_len))
             self.emg_sample_index_buffer = np.zeros((self.emg_display_channels, buf_len), dtype=np.int64)
@@ -381,7 +400,9 @@ class DeviceDataState:
             self.bio_kind = "ppg"
         elif self.eeg_buffer is not None:
             self.bio_kind = "eeg"
-        elif self.emg_buffer is not None:
+        elif self.emg_buffer is not None or self.has_mag_angle:
+            # 无 EMG 但有磁角度流的设备（ORehabArm/ORehabLeg）也走 EMG 布局，
+            # 只显示 MAG_ANGLE 行
             self.bio_kind = "emg"
         else:
             self.bio_kind = None
@@ -401,7 +422,7 @@ class DeviceDataState:
                     self.bio_sample_rates[dt] = sr
                     self.bio_impedance[dt] = []
 
-        extra_axes = int(self.has_ecg) + int(self.has_brth)
+        extra_axes = int(self.has_ecg) + int(self.has_brth) + int(self.has_mag_angle)
         self.eeg_channels_per_page = eeg_axis_count - extra_axes
 
     def sync_bio_sample_rates(self, info: DeviceInfo) -> bool:
@@ -764,6 +785,41 @@ class DeviceDataState:
                 self.brth_buffer_lock.unlock()
             return
 
+        if data.getDataType() == DataType.NTF_MAG_ANGLE_DATA:
+            self.mag_angle_buffer_lock.lock()
+            try:
+                buf = self.mag_angle_buffer
+                idx_buf = self.mag_angle_sample_index_buffer
+                if buf is None or idx_buf is None:
+                    return
+                buf_len = buf.shape[1]
+                n = 0
+                for ch_idx, ch_samples in enumerate(data.channelSamples):
+                    if ch_idx >= buf.shape[0]:
+                        break
+                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
+                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
+                    n = min(len(new_vals), buf_len)
+                    if n == 0:
+                        continue
+                    write_start = self.mag_angle_buffer_index
+                    write_end = write_start + n
+                    new_vals = new_vals[-n:]
+                    new_indices = new_indices[-n:]
+                    if write_end <= buf_len:
+                        buf[ch_idx, write_start:write_end] = new_vals
+                        idx_buf[ch_idx, write_start:write_end] = new_indices
+                    else:
+                        first_part = buf_len - write_start
+                        buf[ch_idx, write_start:] = new_vals[:first_part]
+                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
+                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
+                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                self.mag_angle_buffer_index = (self.mag_angle_buffer_index + n) % buf_len
+            finally:
+                self.mag_angle_buffer_lock.unlock()
+            return
+
         lock = self.get_buffer_lock(data.getDataType())
         lock.lock()
         try:
@@ -815,6 +871,7 @@ class DeviceDataState:
         self.ecg_buffer_lock.lock()
         self.brth_buffer_lock.lock()
         self.emg_buffer_lock.lock()
+        self.mag_angle_buffer_lock.lock()
         try:
             if self.eeg_buffer is not None:
                 self.eeg_buffer.fill(0)
@@ -832,7 +889,12 @@ class DeviceDataState:
                 self.emg_buffer.fill(0)
                 self.emg_sample_index_buffer.fill(0)
                 self.emg_buffer_index = 0
+            if self.mag_angle_buffer is not None:
+                self.mag_angle_buffer.fill(0)
+                self.mag_angle_sample_index_buffer.fill(0)
+                self.mag_angle_buffer_index = 0
         finally:
+            self.mag_angle_buffer_lock.unlock()
             self.emg_buffer_lock.unlock()
             self.brth_buffer_lock.unlock()
             self.ecg_buffer_lock.unlock()
@@ -884,6 +946,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
+        self.mag_angle_line = None
         self.emg_lines = []
         self.bio_lines = []
         self._eeg_display_channels = 0
@@ -932,7 +995,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._fft_pending = False
         self._fft_last_submit = 0.0
 
-        # 右侧生物电每行 FFT（EEG/EMG/ECG/PPG 行：左 50% 频谱 + 右 50% 时域波形）：
+        # 右侧生物电每行 FFT（EEG/EMG/ECG/MAG_ANGLE/PPG 行：左 50% 频谱 + 右 50% 时域波形）：
         # axes_bio_fft 与 axes_eeg 等长（无频谱的行为 None），bio_fft_lines 同理；
         # 与 2D FFT 共用同一个单工作线程执行器，_bio_fft_pending 独立防堆积
         self.axes_bio_fft = []
@@ -1608,8 +1671,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ("Quat",  info.QuatChannelCount,  info.QuatSampleRate,  DataType.NTF_QUATERNION),
             ]
             if state.bio_kind == "emg":
-                state.status_parts.append(
-                    ("EMG", info.EmgChannelCount, info.EmgSampleRate, DataType.NTF_EMG))
+                # ORehab 等纯磁角度设备 bio_kind 也为 "emg" 但无 EMG 流，不显示 EMG 状态项
+                if info.EmgChannelCount > 0:
+                    state.status_parts.append(
+                        ("EMG", info.EmgChannelCount, info.EmgSampleRate, DataType.NTF_EMG))
             elif state.bio_kind == "ppg":
                 state.status_parts.extend([
                     ("EEG",  info.EegChannelCount,  info.EegSampleRate,  DataType.NTF_EEG),
@@ -1622,9 +1687,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     ("ECG",  info.EcgChannelCount,  info.EcgSampleRate,  DataType.NTF_ECG),
                     ("BRTH", info.BrthChannelCount, info.BrthSampleRate, DataType.NTF_BRTH),
                 ])
-            # GEST 的标称值 DeviceInfo 不提供，首个数据批到达时从批次自带的
-            # sampleRate/通道数补齐
-            state.status_parts.append(("GEST", 0, 0, DataType.NTF_GEST))
+            # 无手势能力的设备（如 gForceDual/gForceDuo）GestChannelCount=0，
+            # 不显示 GEST 状态项
+            if info.GestChannelCount > 0:
+                state.status_parts.append(("GEST", info.GestChannelCount, info.GestSampleRate, DataType.NTF_GEST))
+            # 无磁角度能力的设备 MagAngleChannelCount=0，不显示 MAG_ANGLE 状态项
+            # （新 EMG 设备真磁角度 40Hz；ORehabArm/ORehabLeg 关节角度 250Hz）
+            if info.MagAngleChannelCount > 0:
+                state.status_parts.append(("MAG_ANGLE", info.MagAngleChannelCount, info.MagAngleSampleRate, DataType.NTF_MAG_ANGLE_DATA))
             state.status_text = state.build_status_text()
 
         if not sensor.isDataTransfering:
@@ -2152,7 +2222,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     self._update_quaternion(state, sub)
             return
         if (data.getDataType() in state.buffers
-                or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH, DataType.NTF_EMG)
+                or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH,
+                                          DataType.NTF_EMG, DataType.NTF_MAG_ANGLE_DATA)
                 or (state.bio_buffers and data.getDataType() in state.bio_buffers)):
             self._append_sensor_data(addr, data)
         if data.getDataType() == DataType.NTF_QUATERNION:
@@ -2394,7 +2465,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if updated:
             self.canvas_eeg.draw_idle()
 
-    # ── Right-side EMG / EEG (+ ECG + BRTH) Waveform ──────────────────────────
+    # ── Right-side EMG / EEG (+ ECG + BRTH + MAG_ANGLE) Waveform ───────────────
 
     def _eeg_page_count(self) -> int:
         state = self._current_state()
@@ -2450,7 +2521,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         """按显示模式重建右侧共享图表的子图。
         fft_rows 为 None：单列布局，每行一个通宽波形子图；
         否则 fft_rows 为「左 FFT 频谱 + 右时域波形」各 50% 宽度的行号集合
-        （EEG/EMG 模式的通道行、EEG 页的 ECG 行、PPG 页的 EEG/PPG 行），
+        （EEG/EMG 模式的通道行、EEG 页的 ECG/MAG_ANGLE 行、EMG 页的 MAG_ANGLE 行、
+        PPG 页的 EEG/PPG 行），
         其余行（BRTH/SpO2/未用）为通宽波形。
         布局签名与当前一致时不做任何事，否则清空 figure 重新创建。"""
         signature = (count, None if fft_rows is None else tuple(sorted(fft_rows)))
@@ -2496,6 +2568,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         eeg_available = False
         ecg_available = False
         brth_available = False
+        mag_angle_available = False
         eeg_buffer_copy = None
         eeg_idx_buf_copy = None
         eeg_buffer_index = 0
@@ -2505,15 +2578,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         brth_buffer_copy = None
         brth_idx_buf_copy = None
         brth_buffer_index = 0
+        mag_angle_buffer_copy = None
+        mag_angle_idx_buf_copy = None
+        mag_angle_buffer_index = 0
 
         if state is not None:
             state.eeg_buffer_lock.lock()
             state.ecg_buffer_lock.lock()
             state.brth_buffer_lock.lock()
+            state.mag_angle_buffer_lock.lock()
             try:
                 eeg_available = state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None
                 ecg_available = state.has_ecg and state.ecg_buffer is not None and state.ecg_sample_index_buffer is not None
                 brth_available = state.has_brth and state.brth_buffer is not None and state.brth_sample_index_buffer is not None
+                mag_angle_available = (state.has_mag_angle and state.mag_angle_buffer is not None
+                                       and state.mag_angle_sample_index_buffer is not None)
                 if eeg_available:
                     eeg_buffer_copy = state.eeg_buffer.copy()
                     eeg_idx_buf_copy = state.eeg_sample_index_buffer.copy()
@@ -2526,7 +2605,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     brth_buffer_copy = state.brth_buffer.copy()
                     brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
                     brth_buffer_index = state.brth_buffer_index
+                if mag_angle_available:
+                    mag_angle_buffer_copy = state.mag_angle_buffer.copy()
+                    mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
+                    mag_angle_buffer_index = state.mag_angle_buffer_index
             finally:
+                state.mag_angle_buffer_lock.unlock()
                 state.brth_buffer_lock.unlock()
                 state.ecg_buffer_lock.unlock()
                 state.eeg_buffer_lock.unlock()
@@ -2545,9 +2629,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
             self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
             self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
             self.eeg_lines = []
             self.ecg_line = None
             self.brth_line = None
+            self.mag_angle_line = None
             self.emg_lines = []
             self.bio_lines = []
             self._eeg_display_channels = 0
@@ -2555,7 +2641,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._update_page_buttons()
             return
 
-        self.bio_title_label.setText("EEG + ECG + BRTH Waveform")
+        bio_title = "EEG + ECG + BRTH Waveform"
+        if mag_angle_available:
+            bio_title = "EEG + ECG + BRTH + MAG_ANGLE Waveform"
+        self.bio_title_label.setText(bio_title)
         self.emg_lines = []
         self.bio_lines = []
         self._last_plotted_sample_indices[DataType.NTF_EEG] = int(eeg_idx_buf_copy.max())
@@ -2567,18 +2656,27 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._last_plotted_sample_indices[DataType.NTF_BRTH] = int(brth_idx_buf_copy.max())
         else:
             self.brth_line = None
+        if mag_angle_available:
+            self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = int(mag_angle_idx_buf_copy.max())
+        else:
+            self.mag_angle_line = None
 
         start_ch, end_ch = self._eeg_page_range()
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
+        # 额外行从底部向上分配：BRTH 最后一行，ECG 其上，MAG_ANGLE 再上
         brth_axis_index = EEG_AXIS_COUNT - 1 if brth_available else None
         ecg_axis_index = EEG_AXIS_COUNT - 1 - int(brth_available) if ecg_available else None
+        mag_angle_axis_index = (EEG_AXIS_COUNT - 1 - int(brth_available) - int(ecg_available)
+                                if mag_angle_available else None)
 
-        # EEG 通道行与 ECG 行：左 50% FFT 频谱 + 右 50% 时域波形；BRTH/未用行通宽
+        # EEG 通道行与 ECG/MAG_ANGLE 行：左 50% FFT 频谱 + 右 50% 时域波形；BRTH/未用行通宽
         fft_rows = set(range(page_eeg_count))
         if ecg_axis_index is not None:
             fft_rows.add(ecg_axis_index)
+        if mag_angle_axis_index is not None:
+            fft_rows.add(mag_angle_axis_index)
         self._reset_eeg_axes(EEG_AXIS_COUNT, fft_rows)
         self.bio_fft_lines = [None] * len(self.axes_eeg)
 
@@ -2586,6 +2684,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, eeg_buffer_copy.shape[1])
         t_ecg = np.linspace(-BIO_BUFFER_SECONDS, 0, ecg_buffer_copy.shape[1]) if ecg_available else None
         t_brth = np.linspace(-BIO_BUFFER_SECONDS, 0, brth_buffer_copy.shape[1]) if brth_available else None
+        t_mag_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, mag_angle_buffer_copy.shape[1])
+                       if mag_angle_available else None)
 
         for ch, ax in enumerate(self.axes_eeg):
             ax.cla()
@@ -2638,6 +2738,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
+            elif ch == mag_angle_axis_index and mag_angle_available:
+                color = plt.cm.tab10(8)
+                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
+                (line,) = ax.plot(t_mag_angle, y_data, color=color, linewidth=0.8)
+                self.mag_angle_line = line
+                ax.tick_params(axis='both', labelsize=7)
+                ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+                ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
+                ax.set_ylim(0, 180)
+                ax.set_ylabel("MAG_ANGLE", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.yaxis.set_label_position("right")
+                for spine in ax.spines.values():
+                    spine.set_color(color)
+                ax.set_visible(True)
+                # 左半：MAG_ANGLE 的 FFT 频谱子图（数据由工作线程结果异步填充）
+                fax = self.axes_bio_fft[ch]
+                if fax is not None:
+                    fax.cla()
+                    (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                    self.bio_fft_lines[ch] = fft_line
+                    fax.tick_params(axis='both', labelsize=7)
+                    fax.set_ylabel("MAG_ANGLE", fontsize=8, color=color,
+                                   rotation=0, va='center', ha='right', labelpad=10)
+                    for spine in fax.spines.values():
+                        spine.set_color(color)
             elif ch == brth_axis_index and brth_available:
                 color = plt.cm.tab10(6)
                 y_data = np.roll(brth_buffer_copy[0], -brth_buffer_index)
@@ -2664,14 +2789,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _rebuild_emg_plot(self, state: DeviceDataState):
         """EMG 设备的右侧显示区：复用 EEG 的 8 行子图区，显示 EMG 通道（不分页），
-        每个通道行左 50% 为 FFT 频谱、右 50% 为时域波形。"""
+        每个通道行左 50% 为 FFT 频谱、右 50% 为时域波形；有磁角度流时
+        MAG_ANGLE 行（同样左 FFT 右波形）紧跟 EMG 通道行之后，无 EMG 的纯
+        磁角度设备（ORehabArm/ORehabLeg）只显示 MAG_ANGLE 行。"""
         emg_available = False
         emg_buffer_copy = None
         emg_idx_buf_copy = None
         emg_buffer_index = 0
         display_channels = 0
+        mag_angle_available = False
+        mag_angle_buffer_copy = None
+        mag_angle_idx_buf_copy = None
+        mag_angle_buffer_index = 0
 
         state.emg_buffer_lock.lock()
+        state.mag_angle_buffer_lock.lock()
         try:
             emg_available = state.emg_buffer is not None and state.emg_sample_index_buffer is not None
             if emg_available:
@@ -2679,19 +2811,27 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 emg_idx_buf_copy = state.emg_sample_index_buffer.copy()
                 emg_buffer_index = state.emg_buffer_index
                 display_channels = state.emg_display_channels
+            mag_angle_available = (state.has_mag_angle and state.mag_angle_buffer is not None
+                                   and state.mag_angle_sample_index_buffer is not None)
+            if mag_angle_available:
+                mag_angle_buffer_copy = state.mag_angle_buffer.copy()
+                mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
+                mag_angle_buffer_index = state.mag_angle_buffer_index
         finally:
+            state.mag_angle_buffer_lock.unlock()
             state.emg_buffer_lock.unlock()
 
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
+        self.mag_angle_line = None
         self.bio_lines = []
         self._eeg_display_channels = 0
         self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
         self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
         self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
 
-        if not emg_available:
+        if not emg_available and not mag_angle_available:
             self._reset_eeg_axes(EEG_AXIS_COUNT, set())
             self.bio_fft_lines = []
             for ax in self.axes_eeg:
@@ -2701,23 +2841,34 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.axes_eeg[0].set_title("EMG (Device not supported or disabled)")
             self.canvas_eeg.draw_idle()
             self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
             self.emg_lines = []
             self._update_page_label()
             self._update_page_buttons()
             return
 
-        self.bio_title_label.setText("EMG Waveform")
-        self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
+        self.bio_title_label.setText(
+            "EMG + MAG_ANGLE Waveform" if emg_available and mag_angle_available
+            else ("EMG Waveform" if emg_available else "MAG_ANGLE Waveform"))
+        if emg_available:
+            self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
+        if mag_angle_available:
+            self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = int(mag_angle_idx_buf_copy.max())
 
-        if display_channels == 0:
-            display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT)
+        if display_channels == 0 and emg_available:
+            display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT - int(mag_angle_available))
 
-        # 每个 EMG 通道行：左 50% FFT 频谱 + 右 50% 时域波形
-        self._reset_eeg_axes(EEG_AXIS_COUNT, set(range(display_channels)))
+        # 每个 EMG 通道行与 MAG_ANGLE 行：左 50% FFT 频谱 + 右 50% 时域波形
+        fft_rows = set(range(display_channels))
+        if mag_angle_available:
+            fft_rows.add(display_channels)
+        self._reset_eeg_axes(EEG_AXIS_COUNT, fft_rows)
         self.bio_fft_lines = [None] * len(self.axes_eeg)
 
         self.emg_lines = []
-        t = np.linspace(-BIO_BUFFER_SECONDS, 0, emg_buffer_copy.shape[1])
+        t = np.linspace(-BIO_BUFFER_SECONDS, 0, emg_buffer_copy.shape[1]) if emg_available else None
+        t_mag_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, mag_angle_buffer_copy.shape[1])
+                       if mag_angle_available else None)
         for ch, ax in enumerate(self.axes_eeg):
             ax.cla()
             if ch < display_channels:
@@ -2741,6 +2892,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
                     fax.set_ylabel(f"EMG-{ch + 1}", fontsize=8, color=color,
+                                   rotation=0, va='center', ha='right', labelpad=10)
+                    for spine in fax.spines.values():
+                        spine.set_color(color)
+            elif ch == display_channels and mag_angle_available:
+                color = plt.cm.tab10(8)
+                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
+                (line,) = ax.plot(t_mag_angle, y_data, color=color, linewidth=0.8)
+                self.mag_angle_line = line
+                ax.tick_params(axis='both', labelsize=7)
+                ax.ticklabel_format(axis='y', style='plain', useOffset=False)
+                ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
+                ax.set_ylim(0, 180)
+                ax.set_ylabel("MAG_ANGLE", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.yaxis.set_label_position("right")
+                for spine in ax.spines.values():
+                    spine.set_color(color)
+                ax.set_visible(True)
+                # 左半：MAG_ANGLE 的 FFT 频谱子图（数据由工作线程结果异步填充）
+                fax = self.axes_bio_fft[ch]
+                if fax is not None:
+                    fax.cla()
+                    (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
+                    self.bio_fft_lines[ch] = fft_line
+                    fax.tick_params(axis='both', labelsize=7)
+                    fax.set_ylabel("MAG_ANGLE", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2780,12 +2956,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         finally:
             state.bio_buffer_lock.unlock()
 
-        # PPG 布局不使用 EEG 分页与 EMG 线条，全部置空
+        # PPG 布局不使用 EEG 分页与 EMG/MAG_ANGLE 线条，全部置空
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
+        self.mag_angle_line = None
         self.emg_lines = []
         self._eeg_display_channels = 0
+        self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
 
         if not has_any_data:
             for ax in self.axes_eeg:
@@ -3131,9 +3309,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         brth_idx_buf_copy = None
         brth_impedance_copy = None
         brth_buffer_index = 0
+        mag_angle_buffer_copy = None
+        mag_angle_idx_buf_copy = None
+        mag_angle_buffer_index = 0
         state.eeg_buffer_lock.lock()
         state.ecg_buffer_lock.lock()
         state.brth_buffer_lock.lock()
+        state.mag_angle_buffer_lock.lock()
         try:
             if state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None:
                 eeg_buffer_copy = state.eeg_buffer.copy()
@@ -3150,13 +3332,27 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
                 brth_impedance_copy = list(state.brth_impedance)
                 brth_buffer_index = state.brth_buffer_index
+            if (state.has_mag_angle and state.mag_angle_buffer is not None
+                    and state.mag_angle_sample_index_buffer is not None):
+                mag_angle_buffer_copy = state.mag_angle_buffer.copy()
+                mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
+                mag_angle_buffer_index = state.mag_angle_buffer_index
         finally:
+            state.mag_angle_buffer_lock.unlock()
             state.brth_buffer_lock.unlock()
             state.ecg_buffer_lock.unlock()
             state.eeg_buffer_lock.unlock()
 
         brth_axis_index = len(self.axes_eeg) - 1 if state.has_brth else None
         ecg_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) if state.has_ecg else None
+        # MAG_ANGLE 行号与重建时一致：EMG 布局紧跟 EMG 通道行，
+        # EEG 布局在 ECG/BRTH 之上（PPG 固定 6 行布局无此行）
+        if not state.has_mag_angle or state.bio_kind == "ppg":
+            mag_angle_axis_index = None
+        elif state.bio_kind == "emg":
+            mag_angle_axis_index = len(self.emg_lines)
+        else:
+            mag_angle_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) - int(state.has_ecg)
         start_ch, _ = self._eeg_page_range()
 
         if eeg_buffer_copy is not None and eeg_idx_buf_copy is not None and self.eeg_lines:
@@ -3197,8 +3393,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         )
                         ax.yaxis.set_label_position("right")
 
-                # 每行 FFT（EEG 本页通道 + ECG 行）：重排后的快照提交工作线程，
-                # 结果经信号异步回填
+                # 每行 FFT（EEG 本页通道 + ECG/MAG_ANGLE 行）：重排后的快照提交
+                # 工作线程，结果经信号异步回填
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3219,6 +3415,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 ecg_axis_index,
                                 np.roll(ecg_buffer_copy[0], -ecg_buffer_index),
                                 sr_ecg))
+                    if (mag_angle_axis_index is not None and mag_angle_buffer_copy is not None
+                            and self.mag_angle_line is not None):
+                        sr_mag = (state.mag_angle_sample_rate
+                                  or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
+                        if sr_mag > 0:
+                            row_specs.append((
+                                mag_angle_axis_index,
+                                np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index),
+                                sr_mag))
                     if row_specs:
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(DataType.NTF_EEG, row_specs)
@@ -3329,21 +3534,61 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         )
                         ax.yaxis.set_label_position("right")
 
-                # 每通道 FFT：显示通道重排后的快照提交工作线程，结果经信号异步回填
+                # 每通道 FFT：显示通道（含 MAG_ANGLE 行）重排后的快照提交工作线程，
+                # 结果经信号异步回填
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
                     sr = state.emg_sample_rate or state.nominal_rates.get(DataType.NTF_EMG) or 0
+                    row_specs = []
                     if sr > 0 and self.emg_lines:
                         snapshot = np.roll(
                             emg_buffer_copy[:len(self.emg_lines)],
                             -emg_buffer_index, axis=1)
                         row_specs = [(row, snapshot[row], sr) for row in range(snapshot.shape[0])]
+                    if self.mag_angle_line is not None and mag_angle_buffer_copy is not None:
+                        sr_mag = (state.mag_angle_sample_rate
+                                  or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
+                        if sr_mag > 0:
+                            row_specs.append((
+                                len(self.emg_lines),
+                                np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index),
+                                sr_mag))
+                    if row_specs:
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(DataType.NTF_EMG, row_specs)
 
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EMG] = current_last_idx
+
+        if (mag_angle_buffer_copy is not None and mag_angle_idx_buf_copy is not None
+                and self.mag_angle_line is not None and mag_angle_axis_index is not None):
+            current_last_idx = int(mag_angle_idx_buf_copy.max())
+            last_plotted_idx = self._last_plotted_sample_indices.get(DataType.NTF_MAG_ANGLE_DATA, -1)
+            if current_last_idx != last_plotted_idx:
+                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
+                self.mag_angle_line.set_ydata(y_data)
+                ax = self.axes_eeg[mag_angle_axis_index]
+                if not ax.get_visible():
+                    ax.set_visible(True)
+                ax.set_ylim(0, 180)
+                self.canvas_eeg.draw_idle()
+                self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = current_last_idx
+
+                # MAG_ANGLE 行 FFT：本轮 EEG/EMG 主块已提交过（_bio_fft_pending 置位，
+                # 行快照已随其 row_specs 一起提交）时跳过；主块本轮未更新（或纯磁角度
+                # 设备无 EMG 行）时在这里单独提交本行
+                now_fft = time.time()
+                if (not self._bio_fft_pending
+                        and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
+                    sr_mag = (state.mag_angle_sample_rate
+                              or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
+                    if (sr_mag > 0 and mag_angle_axis_index < len(self.bio_fft_lines)
+                            and self.bio_fft_lines[mag_angle_axis_index] is not None):
+                        self._bio_fft_last_submit = now_fft
+                        self._submit_bio_fft(
+                            DataType.NTF_EMG if state.bio_kind == "emg" else DataType.NTF_EEG,
+                            [(mag_angle_axis_index, y_data, sr_mag)])
 
         try:
             state.quaternion_lock.lock()
@@ -3627,7 +3872,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         info = sensor.getDeviceInfo()
         channel_map = {
             "NTF_EMG":   info.EmgChannelCount if info else 0,
-            "NTF_GEST":  info.EmgChannelCount if info else 0,
+            # 手势可用性看手势通道数而非 EMG 通道数：gForceDual/gForceDuo 有 EMG 但无
+            # 手势（EmgChannelCount>0 会误判），gForce200 有手势但无 EMG（会漏判）
+            "NTF_GEST":  info.GestChannelCount if info else 0,
             "NTF_EEG":   info.EegChannelCount if info else 0,
             "NTF_ECG":   info.EcgChannelCount if info else 0,
             "NTF_PPG":   info.PpgChannelCount if info else 0,
@@ -3756,6 +4003,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             state.ppg_sample_rate_state = ppg_sample_rate_state
 
         if self.current_sensor == sensor:
+            # 无手势能力的设备（GestChannelCount=0，如 gForceDual/gForceDuo）隐藏手势面板；
+            # 设备信息不可用（None）时保持可见，与复选框的约定一致
+            self.gesture_box.setVisible(info is None or info.GestChannelCount > 0)
             self._apply_control_states(ntf_states, filter_states, sample_rate_state,
                                        emg_sample_rate_state, imu_sample_rate_state,
                                        ppg_sample_rate_state)
