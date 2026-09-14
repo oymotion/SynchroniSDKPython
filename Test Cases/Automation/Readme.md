@@ -9,7 +9,7 @@ Test Cases/Automation/
 ├── config.py               # 设备库 + 通用参数 + 当前目标设备（所有脚本共用的唯一配置）
 ├── smoke_test.py           # 冒烟测试（批量跑 config 中 enabled 的设备）
 ├── probe_device_info.py    # 设备能力探测（连接后 dump DeviceInfo 全字段）
-└── OYWW1100/               # 按设备隔离的脚本目录
+└── gForceUltra/               # 按设备隔离的脚本目录
     ├── 01_Control_Scan/    #   CTRL-* 控制器与扫描用例
     ├── 02_Connection_State/ #  DEV-SM-* 连接与状态机用例
     └── 03_Dataflow/        #   DATA-* 数据流用例
@@ -73,7 +73,7 @@ config.py 是**所有自动化脚本共用的唯一配置源**，集中管理三
 单设备用例直接运行脚本即可（目标设备由 `config.TARGET_IDENTITY` 决定）：
 
 ```powershell
-python OYWW1100/03_Dataflow/test_data_func_006.py
+python gForceUltra/03_Dataflow/test_data_func_006.py
 ```
 
 多设备用例需先把参与设备在 `config.DEVICES` 中设为 `enabled=True`。

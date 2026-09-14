@@ -23,7 +23,7 @@ POWER_REFRESH_INTERVAL_MS = 1000    # init(..., powerRefreshInterval)
 MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 
 # ---- 当前目标设备（逗号分隔，脚本统一从 common.py 读）----
-TARGET_IDENTITY = "851C"            # 多设备如 "80F9,6C6B"
+TARGET_IDENTITY = "80E1"            # 多设备如 "80F9,6C6B"
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
@@ -80,6 +80,12 @@ DEVICES = [
 
     {
         "name_prefix": "gForceUltra",
+        "mac": "F0:44:D3:00:B3:83",
+        "identity": "B383",
+    },
+
+    {
+        "name_prefix": "gForceUltra",
         "mac": "BC:93:2A:3F:80:EF",
         "identity": "80EF",
     },
@@ -111,6 +117,13 @@ DEVICES = [
     {
         "name_prefix": "Cerelax",
         "mac": "BC:93:2A:3F:85:1C",
-        "identity": "851C",
+        "identity": "851C"
     },
 ]
+
+# ---- 设备规格映射（name_prefix -> device_specs 下的文件名，不含 .py 后缀）----
+# 每个设备型号一份 spec（期望基线），测试脚本用 common.load_spec(name_prefix) 读取。
+# 同型号多台设备共用同一份 spec，避免逐次确认。新增型号：复制规格文件 + 在此注册映射。
+MODEL_SPEC = {
+    "gForceUltra": "gforce_ultra",
+}

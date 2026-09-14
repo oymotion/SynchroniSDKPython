@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Automation test common utilities — shared across all device scripts.
 
-Import this module in test scripts under OYWW1100/ (or future device directories):
+Import this module in test scripts under gForceUltra/ (or future device directories):
     import common
     from common import record, _identity_of, match_target
 
@@ -14,6 +14,7 @@ import sys
 import os
 import time
 import asyncio
+import importlib
 
 # Ensure the Automation directory is on sys.path so we can import config
 AUTOMATION_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,7 +87,7 @@ def resolve_target_identity():
 
 
 def _identity_of(name):
-    """Extract 4-hex identity from broadcast name like 'OYWW1100(80F3)' -> '80F3'."""
+    """Extract 4-hex identity from broadcast name like 'gForceUltra(80F3)' -> '80F3'."""
     m = re.search(r"\(([0-9A-Fa-f]{4})\)", name or "")
     return m.group(1).upper() if m else None
 
@@ -97,6 +98,32 @@ def _find_config(identity):
         if (c.get("identity") or "").strip().upper() == identity:
             return c
     return None
+
+
+def load_spec(name_prefix):
+    """按 name_prefix 读取设备规格（Spec）。
+
+    config.MODEL_SPEC 映射 name_prefix -> device_specs 目录下的 spec 文件名（不含 .py）。
+    返回该 spec 模块的 SPEC 字典（单一事实来源，测试据此硬断言）。
+
+    抛 KeyError：name_prefix 未在 config.MODEL_SPEC 中注册。
+    抛 ImportError：对应 spec 模块不存在或 device_specs 包不可导入。
+    """
+    filename = config.MODEL_SPEC.get(name_prefix)
+    if filename is None:
+        raise KeyError(
+            f"config.MODEL_SPEC 中未定义 name_prefix={name_prefix!r} 的规格映射"
+        )
+    module = importlib.import_module(f"device_specs.{filename}")
+    return module.SPEC
+
+
+def spec_for_identity(identity):
+    """由设备 identity 解析其 name_prefix 并加载对应规格。"""
+    cfg = _find_config(identity)
+    if cfg is None:
+        raise KeyError(f"identity {identity!r} 未在 config.DEVICES 中定义")
+    return load_spec(cfg.get("name_prefix"))
 
 
 def match_target(devices, target_identity=None):

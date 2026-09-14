@@ -1,6 +1,6 @@
 # OB6000C 脑电传感器 SDK 测试用例（总览）
 
-本目录针对 **OB6000C 脑电传感器**，参照 OYWW1100 测试结构和 SDK 测试计划，按模块拆分为多个用例文件。每个用例统一标注：测试目的、流程与逻辑、预期结果、有效性说明、是否可自动化、人工介入。用例 ID 沿用测试计划，便于追溯。
+本目录针对 **OB6000C 脑电传感器**，参照 gForceUltra 测试结构和 SDK 测试计划，按模块拆分为多个用例文件。每个用例统一标注：测试目的、流程与逻辑、预期结果、有效性说明、是否可自动化、人工介入。用例 ID 沿用测试计划，便于追溯。
 
 ## 设备信息
 
@@ -32,7 +32,7 @@
 | PPG/SpO2 | `PpgChannelCount`/`Spo2ChannelCount > 0` | 待确认 | 待确认 |
 | 呼吸 BRTH | `BrthChannelCount > 0` | 待确认 | 待确认 |
 
-> 与 OYWW1100 的关键差异：OB6000C 是 EEG 脑电设备，**不支持 EMG/GEST**，**不支持 NTF_GFORCE_*/NTF_IMU**。核心参数为 `EEG_SAMPLE_RATE`（OYWW1100 不适用）。
+> 与 gForceUltra 的关键差异：OB6000C 是 EEG 脑电设备，**不支持 EMG/GEST**，**不支持 NTF_GFORCE_*/NTF_IMU**。核心参数为 `EEG_SAMPLE_RATE`（gForceUltra 不适用）。
 
 ## 环境与前置条件
 

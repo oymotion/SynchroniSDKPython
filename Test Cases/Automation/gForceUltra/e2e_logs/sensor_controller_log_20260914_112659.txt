@@ -1,0 +1,45 @@
+2026-09-14 11:26:59.775 [INFO] [sensor_sdk] sensor-sdk version: 0.9.10
+2026-09-14 11:26:59.776 [INFO] [sensor_sdk] sensor-sdk version: 0.9.10
+2026-09-14 11:26:59.776 [INFO] [sensor_sdk_controller] [SensorController] scan called: period=5000
+2026-09-14 11:27:00.263 [INFO] [sensor_sdk] sensor-sdk version: 0.9.10
+2026-09-14 11:27:00.288 [INFO] [sensor_sdk] [BumbleDongle] Use bleak_bumble backend, transports=['usb:1-1']
+2026-09-14 11:27:00.298 [INFO] [sensor_sdk] [BleakProcess] dongle topology: usb:1-1=usb:10d7:b012@1:1
+2026-09-14 11:27:00.298 [INFO] [sensor_sdk] [BleakProcess] BLE backend: bumble (['usb:1-1'])
+2026-09-14 11:27:00.299 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: scan_once, mac=None
+2026-09-14 11:27:00.300 [INFO] [sensor_sdk_controller] [BleakProcess] scan_once: period=5000
+2026-09-14 11:27:00.301 [INFO] [sensor_sdk] [BumbleDongle] Dongle hotplug monitor started (polling, initial=['usb:1-1'])
+2026-09-14 11:27:00.334 [INFO] [sensor_sdk_controller] [SensorController] BLE backend: bumble usb:1-1
+2026-09-14 11:27:00.334 [INFO] [sensor_sdk_controller] [bumble.host] HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-14 11:27:00.334 [INFO] [sensor_sdk_controller] [bumble.host] Failed to read number of supported advertising sets
+2026-09-14 11:27:00.336 [INFO] [sensor_sdk_controller] [bumble.host] HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-14 11:27:00.336 [INFO] [sensor_sdk_controller] [bumble.host] Failed to read maximum advertising data length
+2026-09-14 11:27:05.352 [INFO] [sensor_sdk_controller] [BleakProcess] scan_once result: 6 device(s), spec=usb:1-1
+2026-09-14 11:27:05.353 [INFO] [sensor_sdk_controller] [SensorController] requireSensor called: BC:93:2A:3F:80:E1
+2026-09-14 11:27:05.354 [DEBUG] [sensor_sdk] [SensorProfile] connect called: BC:93:2A:3F:80:E1
+2026-09-14 11:27:05.502 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: connect, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:27:05.532 [INFO] [sensor_sdk_controller] [bumble.host] HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-14 11:27:05.533 [INFO] [sensor_sdk_controller] [bumble.host] Failed to read number of supported advertising sets
+2026-09-14 11:27:05.535 [INFO] [sensor_sdk_controller] [bumble.host] HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-14 11:27:05.535 [INFO] [sensor_sdk_controller] [bumble.host] Failed to read maximum advertising data length
+2026-09-14 11:27:05.694 [WARNING] [sensor_sdk] [bumble.host] [31m--- Ignoring event [35mHCI_READ_REMOTE_VERSION_INFORMATION_COMPLETE_EVENT[0m:
+  [36mstatus:           [0m SUCCESS
+  [36mconnection_handle:[0m 1536
+  [36mversion:          [0m 13
+  [36mmanufacturer_name:[0m 767
+  [36msubversion:       [0m 1488[0m
+2026-09-14 11:27:07.510 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: init, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:27:08.508 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: get_param, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:27:08.569 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: set_param, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:27:09.008 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: start_notification, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:28:09.122 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: stop_notification, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:28:09.490 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: get_param, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:28:09.554 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: cancel_reconnect, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:28:09.555 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: disconnect, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:28:09.556 [INFO] [sensor_sdk_controller] [BleakProcess] cancel_reconnect (user disconnect intent): BC:93:2A:3F:80:E1
+2026-09-14 11:28:10.591 [INFO] [sensor_sdk_controller] [BleakProcess] BLE link lost (disconnect callback): BC:93:2A:3F:80:E1
+2026-09-14 11:28:11.144 [INFO] [sensor_sdk_controller] [SensorController] parseBinToCsv called: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\gForceUltra\e2e_logs\gForceUltra_data_20260914_112708.bin -> None
+2026-09-14 11:28:16.135 [INFO] [sensor_sdk] [BinToCsv] bin_to_csv: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\gForceUltra\e2e_logs\gForceUltra_data_20260914_112708.bin -> D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\gForceUltra\e2e_logs\gForceUltra_data_20260914_112708.csv (8249 rows)
+2026-09-14 11:28:16.136 [INFO] [sensor_sdk_controller] [SensorController] replayBinFile called: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\gForceUltra\e2e_logs\gForceUltra_data_20260914_112708.bin realtime=False
+2026-09-14 11:28:16.181 [DEBUG] [sensor_sdk] [BleakProcess] main loop dequeued cmd: replay_bin, mac=BC:93:2A:3F:80:E1
+2026-09-14 11:29:16.146 [ERROR] [sensor_sdk] [BleakHost] send_command_sync timeout: replay_bin
+2026-09-14 11:29:16.149 [WARNING] [sensor_sdk] [SensorController] replayBinFile: no result within timeout=60.0s, replay may still be running
