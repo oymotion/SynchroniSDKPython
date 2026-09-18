@@ -66,7 +66,7 @@ echo Build demos with PyInstaller...
 echo ==========================================
 set "COMMON_OPTS=--clean --noconfirm --onefile"
 
-"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoMulti SynchroniSDKPython_DemoNewMulti.py
+"%VENV_PY%" -m PyInstaller %COMMON_OPTS% --name DemoMulti pyqt_demo.py
 if errorlevel 1 goto :error
 
 echo.
