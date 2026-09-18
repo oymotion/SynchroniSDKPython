@@ -1,8 +1,17 @@
+"""Multi-device GUI demo (PyQt5 + matplotlib + numpy) over the sensor
+ctypes binding (dist name sensor-sdk).
+
+Run (from the repo root, prebuilt lib/windows/x64/Debug/sensor.dll):
+    python example_py/pyqt_demo.py
+
+Requires: pip install PyQt5 matplotlib numpy
+Optional: pip install scipy   (enables the Live Filter band selector)
+"""
+
 import sys
 import signal
 import time
 import subprocess
-import multiprocessing
 import os
 import threading
 import collections
@@ -22,27 +31,43 @@ import numpy as np
 try:
     from scipy import signal as scipy_signal
 except ImportError:
-    scipy_signal = None    # 无 scipy 时实时滤波单选框禁用，其余功能不受影响
+    scipy_signal = None    # Live Filter combo disabled, everything else works
 
 from PyQt5 import QtWidgets, QtCore
 
+#sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bindings", "python"))
+
 from sensor import *
+from sensor.sensor_data import SAMPLE_SIZE
 
 
 SCAN_DEVICE_PERIOD_IN_MS   = 3000
 PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
-FFT_UPDATE_INTERVAL        = 0.5   # 秒，工作线程 FFT 频谱的计算间隔
-DEMO_VERSION               = "0.1.3"  # Demo 自身版本号：每次修改本 Demo 时 +0.0.1
+FFT_UPDATE_INTERVAL        = 0.5
+DEMO_VERSION               = "0.1.13"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
+POWER_STABLE_BAND          = 4
 
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 matplotlib.rcParams['lines.antialiased'] = False
 matplotlib.rcParams['agg.path.chunksize'] = 10000
+
+
+def _device_info_from_bin(d: Optional[dict]) -> DeviceInfo:
+    info = DeviceInfo()
+    for key, value in (d or {}).items():
+        if not hasattr(info, key):
+            continue
+        try:
+            setattr(info, key, value)
+        except (TypeError, ValueError):
+            pass
+    return info
 
 CHANNEL_LABELS = {
     DataType.NTF_ACC:        ["ACC-X", "ACC-Y", "ACC-Z"],
@@ -59,14 +84,14 @@ DATA_TYPE_NAMES = {
     DataType.NTF_MAG_ANGLE_DATA: "Mag Angle (MAG_ANGLE)",
 }
 
-# 实时频段滤波选项（右侧 EMG/EEG/ECG/BRTH/PPG 生物电波形）：(显示名, (下限, 上限))，None = 关闭
+# Live Filter band options: (display name, (low, high)), None = off
 FILTER_BANDS = (
     ("Off", None),
-    ("δ 0.5-4Hz", (0.5, 4.0)),
-    ("θ 4-8Hz", (4.0, 8.0)),
-    ("α 8-13Hz", (8.0, 13.0)),
-    ("β 13-30Hz", (13.0, 30.0)),
-    ("γ 30-45Hz", (30.0, 45.0)),
+    ("delta 0.5-4Hz", (0.5, 4.0)),
+    ("theta 4-8Hz", (4.0, 8.0)),
+    ("alpha 8-13Hz", (8.0, 13.0)),
+    ("beta 13-30Hz", (13.0, 30.0)),
+    ("gamma 30-45Hz", (30.0, 45.0)),
 )
 
 EEG_CHANNEL_COLORS = plt.cm.tab10(np.linspace(0, 1, 8))
@@ -78,7 +103,7 @@ FIXED_Y_RANGES = {
     DataType.NTF_QUATERNION: (-1, 1),
 }
 
-# NTF_IMU 聚合批（新 EMG 设备）的固定通道布局：acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12
+# NTF_IMU aggregate channel windows: acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12
 _IMU_AGGREGATE_SLICES = (
     (DataType.NTF_ACC,        0, 3),
     (DataType.NTF_GYRO,       3, 6),
@@ -88,26 +113,39 @@ _IMU_AGGREGATE_SLICES = (
 
 
 def split_imu_aggregate(data: SensorData) -> List[SensorData]:
-    """把 NTF_IMU 聚合批按固定通道布局拆成四路独立 SensorData 视图
-    （channelSamples 直接切片共享 Sample 引用，不复制）；
-    通道不足的类型跳过（非 QAT6 设备聚合流只有 acc+gyro 6 通道）。
-    lostPackageCount 只挂在第一路上，避免丢包统计重复上报。"""
-    n_ch = len(data.channelSamples)
+    """Split one NTF_IMU aggregate batch into per-segment batches."""
+    n_ch = data.channelCount
+    n = data.sampleCount
     subs = []
     for dt, start, end in _IMU_AGGREGATE_SLICES:
         if n_ch < end:
             continue
-        sub = SensorData()
-        # 拆分视图是应用侧构造的 SensorData，公有接口无写入口，只能写内部字段
-        sub._deviceMac = data.getDeviceMac()
-        sub._dataType = dt
-        sub._sampleRate = data.getSampleRate()
-        sub._channelCount = end - start
-        sub._packageSampleCount = data.getSampleCount()
-        sub._channelSamples = data.channelSamples[start:end]
-        sub._lostPackageCount = data.getLostPackageCount() if not subs else 0
+        sub = data.clone()
+        sub.dataType = dt
+        sub.channelCount = end - start
+        sub.lostPackageCount = data.lostPackageCount if not subs else 0
+        sub._buf = sub._buf[start * n * SAMPLE_SIZE:end * n * SAMPLE_SIZE]
         subs.append(sub)
     return subs
+
+
+def _ring_write(buf_row, idx_row, write_index, vals, indices):
+    """One channel circular-buffer write."""
+    buf_len = buf_row.shape[0]
+    n = len(vals)
+    if n == 0:
+        return
+    write_end = write_index + n
+    if write_end <= buf_len:
+        buf_row[write_index:write_end] = vals
+        idx_row[write_index:write_end] = indices
+    else:
+        first = buf_len - write_index
+        buf_row[write_index:] = vals[:first]
+        buf_row[:n - first] = vals[first:]
+        idx_row[write_index:] = indices[:first]
+        idx_row[:n - first] = indices[first:]
+
 
 GESTURE_DEFAULT_TEXT = (
     "Gesture:\n"
@@ -117,8 +155,7 @@ GESTURE_DEFAULT_TEXT = (
     "  strength: -- (0-100)"
 )
 
-# PPG 设备右侧共享图表配置：(数据类型, 通道索引, 标题, 颜色)：
-# 2×EEG fp1/fp2 + 2×PPG red/ir LED + 2×SpO2 spo2/heart_rate
+# PPG device right-side plot config: (data type, channel, title, color)
 BIO_PLOT_CONFIG = [
     (DataType.NTF_EEG,  0, "fp1",   plt.cm.tab10(0)),
     (DataType.NTF_EEG,  1, "fp2",   plt.cm.tab10(1)),
@@ -128,18 +165,17 @@ BIO_PLOT_CONFIG = [
     (DataType.NTF_SPO2, 1, "heart_rate", plt.cm.tab10(5)),
 ]
 
-EEG_AXIS_COUNT = 8                     # EEG/EMG 模式右侧子图数
-PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)  # PPG 模式右侧子图数
+EEG_AXIS_COUNT = 8
+PPG_AXIS_COUNT = len(BIO_PLOT_CONFIG)
 
 SAMPLE_RATE_CANDIDATES = (250, 500, 1000, 2000)
 EMG_SAMPLE_RATE_CANDIDATES = (500, 1000)
 IMU_SAMPLE_RATE_CANDIDATES = (50, 100, 200, 250, 400, 500, 1000, 2000)
-# 固件 PPG_SR_* 掩码全集；不支持的候选由 _apply_control_states 隐藏
 PPG_SAMPLE_RATE_CANDIDATES = (50, 100, 200, 400, 800, 1000, 1600, 3200)
 
 
 class DeviceDataState:
-    """单个已连接设备的数据缓冲与显示状态。多设备连接时每个设备各持有一份。"""
+    """Per-connected-device data buffers and display state."""
 
     def __init__(self, sensor: SensorProfile):
         self.sensor = sensor
@@ -149,10 +185,10 @@ class DeviceDataState:
         self.lost_counts: dict = {}
         self.ntf_states: dict = {}     # key -> (enabled, checked)
         self.filter_states: dict = {}  # key -> (enabled, checked)
-        self.sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) EEG/ECG
-        self.emg_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) EMG
-        self.imu_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) IMU
-        self.ppg_sample_rate_state: tuple = ([], 0)  # (可选采样率列表, 当前采样率) PPG
+        self.sample_rate_state: tuple = ([], 0)  # (options, current rate) EEG/ECG
+        self.emg_sample_rate_state: tuple = ([], 0)  # (options, current rate) EMG
+        self.imu_sample_rate_state: tuple = ([], 0)  # (options, current rate) IMU
+        self.ppg_sample_rate_state: tuple = ([], 0)  # (options, current rate) PPG
         self.gesture = None            # (gesture, raw_gesture, possiblity, strength)
 
         self.buffers: dict = {}
@@ -187,8 +223,6 @@ class DeviceDataState:
         self.brth_impedance: list = []
         self.brth_buffer_lock = QtCore.QMutex()
 
-        # 磁角度/关节角度流（新 EMG 设备真磁角度；ORehab 关节角度，Emg 字段为 0）：
-        # 单通道，在右侧生物电窗口占一行显示（含 FFT），缓冲结构与 BRTH 一致
         self.has_mag_angle = False
         self.mag_angle_buffer = None
         self.mag_angle_sample_index_buffer = None
@@ -205,8 +239,7 @@ class DeviceDataState:
         self.emg_impedance: list = []
         self.emg_buffer_lock = QtCore.QMutex()
 
-        # PPG 设备的生物电缓冲（EEG fp1/fp2 + PPG + SpO2，5s 环形缓冲，共用一把锁）；
-        # 仅 bio_kind == "ppg" 时由 init_buffers 建立
+        # PPG-mode bio buffers (EEG fp1/fp2 + PPG + SpO2)
         self.bio_buffers: dict = {}
         self.bio_sample_index_buffers: dict = {}
         self.bio_buffer_indices: dict = {}
@@ -214,67 +247,58 @@ class DeviceDataState:
         self.bio_impedance: dict = {}
         self.bio_buffer_lock = QtCore.QMutex()
 
-        # 实时频段滤波（Live Filter 单选框）：SDK 数据回调线程内在样本写入
-        # 环形缓冲前做因果带通（sosfilt + 跨批延续的 zi 状态），缓冲里直接
-        # 存滤波后数据，绘图路径无需改动；live_filter_band 由 UI 线程切换
-        self.live_filter_band = None           # (lo, hi) 或 None
-        self._filter_sos = None                # 当前 (band, 采样率) 对应的 sos
+        # Live Filter state
+        self.live_filter_band = None           # (lo, hi) or None
+        self._filter_sos = None
         self._filter_sos_key = None
-        self._filter_zi = {}                   # DataType -> (n_sections, n_ch, 2) 滤波器状态
+        self._filter_zi = {}
 
-        # 右侧生物电显示区类型：根据设备能力在 "eeg" / "emg" / "ppg" 间切换
+        # Right-side display mode: "eeg" / "emg" / "ppg"
         self.bio_kind: Optional[str] = None
 
         self.quaternion = [1.0, 0.0, 0.0, 0.0]
         self.quaternion_lock = QtCore.QMutex()
 
-        # 状态行显示项：(label, 通道数, 标称采样率, 数据类型)；数据批自带的
-        # sampleRate/通道数优先，未收到数据的项显示 "--"
+        # Status line entries: (label, channels, nominal rate, data type)
         self.status_parts = None
-        # 实际采样率收集：rate_counts 为当前统计窗口的样本数，actual_rates 为
-        # 结算后的实测速率（统计与结算都在 SDK 回调线程的 note_data_received 里做，
-        # UI 定时器只在数据停流时清过期显示）；nominal_rates/nominal_channels 记录批次自带标称值
         self.rate_lock = threading.Lock()
         self.rate_counts: dict = {}
         self.rate_window_start = time.time()
         self.actual_rates: dict = {}
         self.nominal_rates: dict = {}
         self.nominal_channels: dict = {}
-        # 本次起流的首包 delay（毫秒，数据批自带 getDelay()，0=未上报）
-        # 与起流墙钟时刻（Unix 秒，数据批自带 getStartTimeSec()，0=未知）
         self.stream_delay_ms = 0
         self.stream_start_time_sec = 0.0
 
     def note_data_received(self, data: SensorData):
-        """统计每种数据类型实际收到的样本数（不含丢包占位样本），
-        并记录数据批携带的标称采样率/通道数。"""
-        if not data.channelSamples:
+        if data.channelCount <= 0 or data.sampleCount <= 0:
             return
-        delay = data.getDelay()
+        delay = data.delay
         if delay:
             self.stream_delay_ms = delay
-        start_sec = data.getStartTimeSec()
+        start_sec = data.startTimeSec
         if start_sec > 0:
             self.stream_start_time_sec = start_sec
-        if data.getDataType() == DataType.NTF_IMU:
-            # 聚合批：按拆分后的子类型分别计数，状态栏实测速率与四路独立流一致
+        if data.dataType == DataType.NTF_IMU:
             for sub in split_imu_aggregate(data):
                 self.note_data_received(sub)
             return
-        n = sum(1 for s in data.channelSamples[0] if not getattr(s, "isLost", False))
+        arr = data.as_numpy()
+        n = int(np.count_nonzero(arr["isLost"][0] == 0))
+        dt = data.dataType
         now = time.time()
         with self.rate_lock:
             if n > 0:
-                self.rate_counts[data.getDataType()] = self.rate_counts.get(data.getDataType(), 0) + n
-            if data.getSampleRate() and data.getSampleRate() > 0:
-                self.nominal_rates[data.getDataType()] = data.getSampleRate()
-            ch = len(data.channelSamples)
+                self.rate_counts[dt] = self.rate_counts.get(dt, 0) + n
+            if data.sampleRate and data.sampleRate > 0:
+                self.nominal_rates[dt] = data.sampleRate
+            ch = data.channelCount
             if ch > 0:
-                self.nominal_channels[data.getDataType()] = ch
+                self.nominal_channels[dt] = ch
             self._settle_actual_rates(now)
 
     def _settle_actual_rates(self, now: float):
-        """统计窗口满 1s 即结算实测速率并重置计数；须在 rate_lock 内调用。"""
+        # Call under rate_lock
         elapsed = now - self.rate_window_start
         if elapsed < 1.0:
             return
@@ -283,7 +307,6 @@ class DeviceDataState:
         self.rate_window_start = now
 
     def expire_actual_rates(self):
-        """每秒由 UI 定时器调用：数据停流（统计窗口超 2s 未结算）时清空实测速率显示。"""
         now = time.time()
         with self.rate_lock:
             if now - self.rate_window_start > 2.0:
@@ -292,7 +315,6 @@ class DeviceDataState:
                 self.rate_window_start = now
 
     def build_status_text(self) -> str:
-        """组合状态行：连接名与各数据项的通道数、标称采样率。"""
         name = self.sensor.BLEDevice.Name if self.sensor is not None else ""
         parts = [f"Connected: {name}"]
         with self.rate_lock:
@@ -307,8 +329,6 @@ class DeviceDataState:
         return " | ".join(parts)
 
     def build_rate_text(self) -> str:
-        """组合实测采样率行（显示在状态行下一行）：各数据项每秒实测速率，
-        标称值作对照；尚无实测数据时返回空串。"""
         entries = []
         with self.rate_lock:
             actual_rates = dict(self.actual_rates)
@@ -386,7 +406,7 @@ class DeviceDataState:
         self.has_emg = info.EmgSampleRate > 0 and info.EmgChannelCount > 0
         if self.has_emg:
             self.emg_sample_rate = info.EmgSampleRate
-            # 有磁角度流时 EMG 通道让出生物电窗口最后一行给 MAG_ANGLE 行
+            # A mag-angle stream takes the last bio row from the EMG channels
             self.emg_display_channels = min(info.EmgChannelCount, eeg_axis_count - int(self.has_mag_angle))
             buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
             self.emg_buffer = np.zeros((self.emg_display_channels, buf_len))
@@ -394,15 +414,12 @@ class DeviceDataState:
             self.emg_buffer_index = 0
             self.emg_impedance = [None] * self.emg_display_channels
 
-        # PPG 设备（含 EEG fp1/fp2，在 PPG 布局内显示）优先按 PPG 显示；
-        # 否则有 EEG 能力优先按 EEG 显示，否则按 EMG 显示
+        # Bio display mode: PPG > EEG > EMG/MAG_ANGLE
         if info.PpgSampleRate > 0:
             self.bio_kind = "ppg"
         elif self.eeg_buffer is not None:
             self.bio_kind = "eeg"
         elif self.emg_buffer is not None or self.has_mag_angle:
-            # 无 EMG 但有磁角度流的设备（ORehabArm/ORehabLeg）也走 EMG 布局，
-            # 只显示 MAG_ANGLE 行
             self.bio_kind = "emg"
         else:
             self.bio_kind = None
@@ -426,10 +443,8 @@ class DeviceDataState:
         self.eeg_channels_per_page = eeg_axis_count - extra_axes
 
     def sync_bio_sample_rates(self, info: DeviceInfo) -> bool:
-        """采样率变更（setParam("EEG_SAMPLE_RATE")/"EMG_SAMPLE_RATE" 生效后由
-        device_info_update 推送）时按新速率重建生物电环形缓冲：缓冲长度 = 采样率 ×
-        窗口秒数，不重建的话横轴时间窗与实际数据速率不一致，波形会被拉伸/压缩
-        （如 10Hz 信号在 250→500 后显示成 5Hz）。返回是否有缓冲被重建（调用方需重建图表横轴）。"""
+        """Rebuild bio ring buffers after a sample-rate change. Returns True
+        when any buffer was rebuilt."""
         changed = False
         if (info.EegSampleRate > 0 and self.eeg_buffer is not None
                 and self.eeg_sample_rate != info.EegSampleRate):
@@ -443,20 +458,6 @@ class DeviceDataState:
                 self.eeg_buffer_index = 0
             finally:
                 self.eeg_buffer_lock.unlock()
-            changed = True
-
-        if (info.EmgSampleRate > 0 and self.emg_buffer is not None
-                and self.emg_sample_rate != info.EmgSampleRate):
-            ch = self.emg_buffer.shape[0]
-            buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.emg_buffer_lock.lock()
-            try:
-                self.emg_sample_rate = info.EmgSampleRate
-                self.emg_buffer = np.zeros((ch, buf_len))
-                self.emg_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
-                self.emg_buffer_index = 0
-            finally:
-                self.emg_buffer_lock.unlock()
             changed = True
 
         if (info.EcgSampleRate > 0 and self.has_ecg and self.ecg_buffer is not None
@@ -473,29 +474,78 @@ class DeviceDataState:
                 self.ecg_buffer_lock.unlock()
             changed = True
 
-        # PPG 模式下 EEG fp1/fp2 走 5s 的 bio_buffers
-        if (self.bio_kind == "ppg" and info.EegSampleRate > 0
-                and self.bio_sample_rates.get(DataType.NTF_EEG) not in (None, info.EegSampleRate)):
-            buf = self.bio_buffers.get(DataType.NTF_EEG)
-            if buf is not None:
+        if (info.EmgSampleRate > 0 and self.emg_buffer is not None
+                and self.emg_sample_rate != info.EmgSampleRate):
+            ch = self.emg_buffer.shape[0]
+            buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.emg_buffer_lock.lock()
+            try:
+                self.emg_sample_rate = info.EmgSampleRate
+                self.emg_buffer = np.zeros((ch, buf_len))
+                self.emg_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.emg_buffer_index = 0
+            finally:
+                self.emg_buffer_lock.unlock()
+            changed = True
+
+        if (info.BrthSampleRate > 0 and self.has_brth and self.brth_buffer is not None
+                and self.brth_sample_rate != info.BrthSampleRate):
+            ch = self.brth_buffer.shape[0]
+            buf_len = max(info.BrthSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.brth_buffer_lock.lock()
+            try:
+                self.brth_sample_rate = info.BrthSampleRate
+                self.brth_buffer = np.zeros((ch, buf_len))
+                self.brth_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.brth_buffer_index = 0
+            finally:
+                self.brth_buffer_lock.unlock()
+            changed = True
+
+        if (info.MagAngleSampleRate > 0 and self.has_mag_angle
+                and self.mag_angle_buffer is not None
+                and self.mag_angle_sample_rate != info.MagAngleSampleRate):
+            ch = self.mag_angle_buffer.shape[0]
+            buf_len = max(info.MagAngleSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.mag_angle_buffer_lock.lock()
+            try:
+                self.mag_angle_sample_rate = info.MagAngleSampleRate
+                self.mag_angle_buffer = np.zeros((ch, buf_len))
+                self.mag_angle_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.mag_angle_buffer_index = 0
+            finally:
+                self.mag_angle_buffer_lock.unlock()
+            changed = True
+
+        # PPG mode: EEG fp1/fp2 + PPG + SpO2 live in the 5 s bio buffers
+        if self.bio_kind == "ppg":
+            bio_rate_map = {
+                DataType.NTF_EEG:  info.EegSampleRate,
+                DataType.NTF_PPG:  info.PpgSampleRate,
+                DataType.NTF_SPO2: info.Spo2SampleRate,
+            }
+            for dt, sr in bio_rate_map.items():
+                if sr <= 0 or self.bio_sample_rates.get(dt) in (None, sr):
+                    continue
+                buf = self.bio_buffers.get(dt)
+                if buf is None:
+                    continue
                 ch = buf.shape[0]
-                buf_len = max(info.EegSampleRate * BUFFER_SECONDS, 1)
+                buf_len = max(sr * BUFFER_SECONDS, 1)
                 self.bio_buffer_lock.lock()
                 try:
-                    self.bio_buffers[DataType.NTF_EEG] = np.zeros((ch, buf_len))
-                    self.bio_sample_index_buffers[DataType.NTF_EEG] = np.zeros((ch, buf_len), dtype=np.int64)
-                    self.bio_buffer_indices[DataType.NTF_EEG] = 0
-                    self.bio_sample_rates[DataType.NTF_EEG] = info.EegSampleRate
+                    self.bio_buffers[dt] = np.zeros((ch, buf_len))
+                    self.bio_sample_index_buffers[dt] = np.zeros((ch, buf_len), dtype=np.int64)
+                    self.bio_buffer_indices[dt] = 0
+                    self.bio_sample_rates[dt] = sr
                 finally:
                     self.bio_buffer_lock.unlock()
                 changed = True
         return changed
 
     def sync_imu_sample_rates(self, info: DeviceInfo) -> list:
-        """IMU 采样率变化时（device_info_update 推送）按新速率重建四路 IMU 环形
-        缓冲（长度 = 采样率 × BUFFER_SECONDS），与 sync_bio_sample_rates 同理：
-        不重建则横轴时间窗与实际数据速率不一致，波形被拉伸/压缩。
-        返回被重建的数据类型列表（调用方按需重建 2D 图表横轴）。"""
+        """Rebuild the IMU ring buffers after a sample-rate change. Returns
+        the rebuilt data types."""
         configs = [
             (DataType.NTF_ACC,        info.AccSampleRate),
             (DataType.NTF_GYRO,       info.GyroSampleRate),
@@ -522,16 +572,13 @@ class DeviceDataState:
         return changed
 
     def set_live_filter_band(self, band):
-        """UI 线程切换频段：更新波段并让回调线程在下个数据批重建滤波器状态
-        （环形缓冲中的旧数据随新写入自然滚动替换，无需清空）。"""
         self.live_filter_band = band
         self._filter_sos_key = None
         self._filter_zi = {}
 
-    def apply_live_filter(self, dt, ch_idx: int, vals, sample_rate: int):
-        """SDK 数据回调线程内实时滤波：按当前选中频段对单通道样本批做因果带通
-        （4 阶 Butterworth，sosfilt），zi 状态跨数据批延续保证批间连续；
-        未开启/参数无效/计算出错时原样返回。"""
+    def apply_live_filter(self, dt, ch_idx: int, vals, sample_rate):
+        """Causal bandpass on one channel batch; pass-through when off or
+        the parameters are invalid."""
         band = self.live_filter_band
         if band is None or vals is None or len(vals) == 0:
             return vals
@@ -539,19 +586,18 @@ class DeviceDataState:
             return vals
         lo, hi = band
         if hi >= sample_rate / 2:
-            return vals  # 频段超过奈奎斯特频率
+            return vals
         try:
             key = (band, int(sample_rate))
             if self._filter_sos_key != key:
                 self._filter_sos = scipy_signal.butter(
                     4, [lo, hi], btype="band", fs=sample_rate, output="sos")
                 self._filter_sos_key = key
-                self._filter_zi = {}   # 频段/采样率变化：滤波器状态整体重置
+                self._filter_zi = {}
             sos = self._filter_sos
             zi = self._filter_zi.get(dt)
             if zi is None or zi.shape[1] <= ch_idx:
-                # 新数据类型/通道数变化：按当前通道数重建初始状态
-                zi0 = scipy_signal.sosfilt_zi(sos)      # (n_sections, 2)
+                zi0 = scipy_signal.sosfilt_zi(sos)
                 zi = np.repeat(zi0[:, None, :], ch_idx + 1, axis=1)
                 self._filter_zi[dt] = zi
             out, zi[:, ch_idx, :] = scipy_signal.sosfilt(sos, vals, zi=zi[:, ch_idx, :])
@@ -559,304 +605,180 @@ class DeviceDataState:
         except Exception:
             return vals
 
-    def filter_sensor_data(self, data: SensorData):
-        """onData 回调线程内的实时滤波（direct / queue 两种模式共用，queue 模式
-        在入队前完成）：对生物电批次逐通道带通滤波并把结果写回样本值，
-        之后的分发/写缓冲路径不再滤波；非生物电类型不处理。"""
-        if self.live_filter_band is None:
-            return
-        dt = data.getDataType()
-        if not (dt in (DataType.NTF_EMG, DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH)
-                or (self.bio_buffers and dt in self.bio_buffers)):
-            return
-        for ch_idx, ch_samples in enumerate(data.channelSamples):
-            if not ch_samples:
-                continue
-            vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-            vals = self.apply_live_filter(dt, ch_idx, vals, data.getSampleRate())
-            for s, v in zip(ch_samples, vals):
-                s._data = float(v)
-
     def append_data(self, data: SensorData):
-        # PPG 设备：EEG/PPG/SpO2 数据写入 5s 生物电环形缓冲（右侧 6 子图显示），
-        # 不再写入 1s 的 eeg 缓冲
-        if self.bio_buffers and data.getDataType() in self.bio_buffers:
+        dt = data.dataType
+
+        # PPG-mode bio buffers
+        if self.bio_buffers and dt in self.bio_buffers:
             self.bio_buffer_lock.lock()
             try:
-                buf = self.bio_buffers.get(data.getDataType())
-                idx_buf = self.bio_sample_index_buffers.get(data.getDataType())
-                if buf is None or idx_buf is None or not data.channelSamples:
+                buf = self.bio_buffers.get(dt)
+                idx_buf = self.bio_sample_index_buffers.get(dt)
+                if buf is None or idx_buf is None or data.channelCount == 0:
                     return
-                buffer_size = buf.shape[1]
-                n = len(data.channelSamples[0])
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
                 if n == 0:
                     return
-                if n > buffer_size:
-                    n = buffer_size
-                buf_idx = self.bio_buffer_indices.get(data.getDataType(), 0)
-                write_start = buf_idx
-                write_end = buf_idx + n
-
-                # Circular-buffer write: avoid rolling the whole buffer on every packet.
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    if len(new_vals) == 0:
-                        continue
-                    if len(new_vals) > n:
-                        new_vals = new_vals[-n:]
-                        new_indices = new_indices[-n:]
-
-                    if write_end <= buffer_size:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buffer_size - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-
-                    if data.getDataType() == DataType.NTF_EEG:
-                        while len(self.bio_impedance[data.getDataType()]) <= ch_idx:
-                            self.bio_impedance[data.getDataType()].append(0)
-                        self.bio_impedance[data.getDataType()][ch_idx] = ch_samples[-1].impedance
-
-                self.bio_buffer_indices[data.getDataType()] = (buf_idx + n) % buffer_size
+                buf_idx = self.bio_buffer_indices.get(dt, 0)
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    vals = self.apply_live_filter(dt, ch_idx, vals, data.sampleRate)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], buf_idx, vals[-n:], indices[-n:])
+                    if dt == DataType.NTF_EEG:
+                        imp = self.bio_impedance[dt]
+                        while len(imp) <= ch_idx:
+                            imp.append(0)
+                        imp[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                self.bio_buffer_indices[dt] = (buf_idx + n) % buf.shape[1]
             finally:
                 self.bio_buffer_lock.unlock()
             return
 
-        if data.getDataType() == DataType.NTF_EMG:
+        if dt == DataType.NTF_EMG:
             self.emg_buffer_lock.lock()
             try:
                 buf = self.emg_buffer
                 idx_buf = self.emg_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self.emg_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
+                if n == 0:
+                    return
+                write_start = self.emg_buffer_index
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    vals = self.apply_live_filter(dt, ch_idx, vals, data.sampleRate)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
                     while len(self.emg_impedance) <= ch_idx:
                         self.emg_impedance.append(None)
-                    if ch_samples:
-                        self.emg_impedance[ch_idx] = ch_samples[-1].impedance
-                self.emg_buffer_index = (self.emg_buffer_index + n) % buf_len
+                    self.emg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                self.emg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.emg_buffer_lock.unlock()
             return
 
-        if data.getDataType() == DataType.NTF_EEG:
+        if dt == DataType.NTF_EEG:
             self.eeg_buffer_lock.lock()
             try:
                 buf = self.eeg_buffer
                 idx_buf = self.eeg_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self.eeg_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
+                if n == 0:
+                    return
+                write_start = self.eeg_buffer_index
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    vals = self.apply_live_filter(dt, ch_idx, vals, data.sampleRate)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
                     while len(self.eeg_impedance) <= ch_idx:
                         self.eeg_impedance.append(0)
-                    if ch_samples:
-                        self.eeg_impedance[ch_idx] = ch_samples[-1].impedance
-                self.eeg_buffer_index = (self.eeg_buffer_index + n) % buf_len
+                    self.eeg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                self.eeg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.eeg_buffer_lock.unlock()
             return
 
-        if data.getDataType() == DataType.NTF_ECG:
+        if dt == DataType.NTF_ECG:
             self.ecg_buffer_lock.lock()
             try:
                 buf = self.ecg_buffer
                 idx_buf = self.ecg_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self.ecg_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
+                if n == 0:
+                    return
+                write_start = self.ecg_buffer_index
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    vals = self.apply_live_filter(dt, ch_idx, vals, data.sampleRate)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
                     while len(self.ecg_impedance) <= ch_idx:
                         self.ecg_impedance.append(0)
-                    if ch_samples:
-                        self.ecg_impedance[ch_idx] = ch_samples[-1].impedance
-                self.ecg_buffer_index = (self.ecg_buffer_index + n) % buf_len
+                    self.ecg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                self.ecg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.ecg_buffer_lock.unlock()
             return
 
-        if data.getDataType() == DataType.NTF_BRTH:
+        if dt == DataType.NTF_BRTH:
             self.brth_buffer_lock.lock()
             try:
                 buf = self.brth_buffer
                 idx_buf = self.brth_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self.brth_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
+                if n == 0:
+                    return
+                write_start = self.brth_buffer_index
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    vals = self.apply_live_filter(dt, ch_idx, vals, data.sampleRate)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
                     while len(self.brth_impedance) <= ch_idx:
                         self.brth_impedance.append(0)
-                    if ch_samples:
-                        self.brth_impedance[ch_idx] = ch_samples[-1].impedance
-                self.brth_buffer_index = (self.brth_buffer_index + n) % buf_len
+                    self.brth_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                self.brth_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.brth_buffer_lock.unlock()
             return
 
-        if data.getDataType() == DataType.NTF_MAG_ANGLE_DATA:
+        if dt == DataType.NTF_MAG_ANGLE_DATA:
             self.mag_angle_buffer_lock.lock()
             try:
                 buf = self.mag_angle_buffer
                 idx_buf = self.mag_angle_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
-                buf_len = buf.shape[1]
-                n = 0
-                for ch_idx, ch_samples in enumerate(data.channelSamples):
-                    if ch_idx >= buf.shape[0]:
-                        break
-                    new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                    new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                    n = min(len(new_vals), buf_len)
-                    if n == 0:
-                        continue
-                    write_start = self.mag_angle_buffer_index
-                    write_end = write_start + n
-                    new_vals = new_vals[-n:]
-                    new_indices = new_indices[-n:]
-                    if write_end <= buf_len:
-                        buf[ch_idx, write_start:write_end] = new_vals
-                        idx_buf[ch_idx, write_start:write_end] = new_indices
-                    else:
-                        first_part = buf_len - write_start
-                        buf[ch_idx, write_start:] = new_vals[:first_part]
-                        buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                        idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                        idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-                self.mag_angle_buffer_index = (self.mag_angle_buffer_index + n) % buf_len
+                arr = data.as_numpy()
+                n = min(data.sampleCount, buf.shape[1])
+                if n == 0:
+                    return
+                write_start = self.mag_angle_buffer_index
+                for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                    vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                    indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                    _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
+                self.mag_angle_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.mag_angle_buffer_lock.unlock()
             return
 
-        lock = self.get_buffer_lock(data.getDataType())
+        # IMU ring buffers
+        lock = self.get_buffer_lock(dt)
         lock.lock()
         try:
-            buf = self.buffers.get(data.getDataType())
-            idx_buf = self.sample_index_buffers.get(data.getDataType())
+            buf = self.buffers.get(dt)
+            idx_buf = self.sample_index_buffers.get(dt)
             if buf is None or idx_buf is None:
                 return
-            buf_len = buf.shape[1]
-            n = 0
-            buffer_index = self.buffer_indices.get(data.getDataType(), 0)
-            for ch_idx, ch_samples in enumerate(data.channelSamples):
-                if ch_idx >= buf.shape[0]:
-                    break
-                new_vals = np.array([s.data for s in ch_samples], dtype=np.float32)
-                new_indices = np.array([s.sampleIndex for s in ch_samples], dtype=np.int64)
-                n = min(len(new_vals), buf_len)
-                if n == 0:
-                    continue
-                write_start = buffer_index
-                write_end = write_start + n
-                new_vals = new_vals[-n:]
-                new_indices = new_indices[-n:]
-                if write_end <= buf_len:
-                    buf[ch_idx, write_start:write_end] = new_vals
-                    idx_buf[ch_idx, write_start:write_end] = new_indices
-                else:
-                    first_part = buf_len - write_start
-                    buf[ch_idx, write_start:] = new_vals[:first_part]
-                    buf[ch_idx, :n - first_part] = new_vals[first_part:]
-                    idx_buf[ch_idx, write_start:] = new_indices[:first_part]
-                    idx_buf[ch_idx, :n - first_part] = new_indices[first_part:]
-            self.buffer_indices[data.getDataType()] = (buffer_index + n) % buf_len
+            arr = data.as_numpy()
+            n = min(data.sampleCount, buf.shape[1])
+            if n == 0:
+                return
+            buffer_index = self.buffer_indices.get(dt, 0)
+            for ch_idx in range(min(arr.shape[0], buf.shape[0])):
+                vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
+                indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
+                _ring_write(buf[ch_idx], idx_buf[ch_idx], buffer_index, vals[-n:], indices[-n:])
+            self.buffer_indices[dt] = (buffer_index + n) % buf.shape[1]
         finally:
             lock.unlock()
 
     def clear_buffers(self):
-        """清空本设备所有数据缓冲区，等待新数据。"""
         for dt in list(self.buffers.keys()):
             lock = self.get_buffer_lock(dt)
             lock.lock()
@@ -918,20 +840,19 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     lost_packet_signal = QtCore.pyqtSignal(str, str, int)    # (address, type_name, count)
     gesture_signal = QtCore.pyqtSignal(str, int, int, int, int)   # (address, gesture, raw, possiblity, strength)
     device_disconnected_sig = QtCore.pyqtSignal(str)         # address
-    device_disconnected_sig = QtCore.pyqtSignal(str)         # address
     auto_reconnect_sig = QtCore.pyqtSignal(str, bool)        # (address, restore)
+    ui_call_sig = QtCore.pyqtSignal(object)                  # callable to run on the UI thread
     replay_done_sig = QtCore.pyqtSignal(str)
-    replay_member_done_sig = QtCore.pyqtSignal(object)       # (sensor) 多文件回放单个成员结束
+    replay_member_done_sig = QtCore.pyqtSignal(object)       # (sensor)
     analyze_done_sig = QtCore.pyqtSignal(str, str)
     dongle_check_sig = QtCore.pyqtSignal(str)
-    fft_done_sig = QtCore.pyqtSignal(int, object, object)   # (data_type, freqs, mags)，工作线程→UI 线程
-    bio_fft_done_sig = QtCore.pyqtSignal(int, object, object)   # 右侧生物电每行 FFT：(data_type, {行号: freqs}, {行号: mags})
 
     def __init__(self):
         super().__init__()
         self.discovered_devices = []
-        self.current_sensor: SensorProfile = None   # 当前在列表中选中、正在显示的设备
-        self.device_states: dict = {}               # Address -> DeviceDataState（已连接设备）
+        self._scan_missed_rounds: dict = {}     # Address -> consecutive absent scan rounds
+        self.current_sensor: SensorProfile = None
+        self.device_states: dict = {}               # Address -> DeviceDataState
         self.sensor_controller = SensorController()
 
         self.active_data_type = DataType.NTF_ACC
@@ -959,6 +880,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._updating_ppg_sample_rate_controls = False
         self._debug_log_checkbox = None
         self._data_debug_log_checkbox = None
+        self._dongle_debug_checkbox = None
         self._ntf_checkboxes: dict = {}
         self._filter_checkboxes: dict = {}
         self._sample_rate_radios: dict = {}
@@ -975,43 +897,50 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._ppg_sample_rate_group = None
         self._debug_log_enabled = True
         self._data_debug_log_enabled = True
-        # 每设备上次会话的日志/bin 导出路径：重连时优先续用上一条，而不是另起新文件
+        self._dongle_debug_enabled = True
         self._last_log_paths: dict = {}
         self._last_data_log_paths: dict = {}
-        self._replay_thread = None
+        self._saved_params_by_addr: dict = {}
         self._replay_sensor = None
-        # 多文件同步回放的全部成员（单文件回放时为空，仅 _replay_sensor）
-        self._replay_sensors = []
-        # 回放进行中标志：由 SDK 的 onDataTransferStateChange 事件驱动
-        # （数据流真正开始/结束），取代回放线程存活判断
         self._replay_active = False
         self._replay_paused = False
         self._replay_stop_requested = False
+        self._replay_done_fired = False
+        self._replay_path = ""
+        self._replay_sensors = []
+        self._replay_paths = []
+        self._replay_multi_counts = None
 
-        # FFT 频谱：UI 定时器把波形快照打包成闭包提交到工作线程计算，
-        # 结果经 fft_done_sig 回 UI 线程更新频谱子图；_fft_pending 防止任务堆积
+        # FFT spectrum state
         self.fft_lines = []
         self._fft_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="FFT")
         self._fft_pending = False
         self._fft_last_submit = 0.0
+        # Worker-thread results picked up by the plot timer (no queued signals)
+        self._fft_result_lock = threading.Lock()
+        self._fft_result = None        # (data_type, freqs, mags)
+        self._bio_fft_result = None    # (data_type, {row: freqs}, {row: mags})
 
-        # 右侧生物电每行 FFT（EEG/EMG/ECG/MAG_ANGLE/PPG 行：左 50% 频谱 + 右 50% 时域波形）：
-        # axes_bio_fft 与 axes_eeg 等长（无频谱的行为 None），bio_fft_lines 同理；
-        # 与 2D FFT 共用同一个单工作线程执行器，_bio_fft_pending 独立防堆积
+        # Bio per-row FFT state
         self.axes_bio_fft = []
         self.bio_fft_lines = []
         self._bio_fft_pending = False
         self._bio_fft_last_submit = 0.0
-        self._eeg_axes_signature = None   # (行数, fft 行号元组或 None)，布局不变时不重建子图
+        self._eeg_axes_signature = None
 
-        # 实时频段滤波选中项（Live Filter 单选框）：(lo, hi) 或 None；
-        # 经 _on_data 懒同步到各设备状态的回调线程滤波路径
+        # Live Filter selection: (lo, hi) or None
         self._filter_band = None
 
-        # Use Queue Data 模式（对齐 C++ Qt demo，默认关）：onData 回调线程只做
-        # 实时滤波 + clone 入队，分发处理（写缓冲/丢包统计/四元数/手势）由
-        # 数据 worker 线程从有界队列取出后执行；direct 模式则全部在回调线程内联完成
+        # Backend display in the SDK header label
+        self._shown_backend = ""
+        self._backend_query_pending = False
+        self._backend_query_ms = 0.0
+
+        # Data queue: the data callback only enqueues (a clone when Use Clone
+        # Data is checked, the borrowed batch otherwise), a worker thread
+        # dispatches into the display buffers
         self._use_clone_data = False
+        self._auto_reconnect_enabled = True
         self._data_queue = collections.deque()
         self._data_queue_lock = threading.Lock()
         self._data_queue_event = threading.Event()
@@ -1022,16 +951,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._init_ui()
 
-        # Debug Log 复选框默认勾选但启动时不触发 stateChanged，
-        # 这里按当前开关状态主动应用一次（建时间戳子目录 + 开启调试日志），
-        # 须在首次扫描/连接（BLE 子进程启动）之前执行
         if self._debug_log_enabled:
             self._apply_sdk_debug_log()
+
+        self._apply_dongle_debug()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._update_plots)
         self.timer.start(PLOT_UPDATE_INTERVAL)
-        self._rate_last_refresh = 0.0   # 实测采样率每秒刷新的时间戳
+        self._rate_last_refresh = 0.0
 
         self.add_device_sig.connect(self._add_device_item)
         self.update_device_sig.connect(self._update_device_rssi)
@@ -1041,17 +969,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.gesture_signal.connect(self._update_gesture_display)
         self.device_disconnected_sig.connect(self._on_device_disconnected)
         self.auto_reconnect_sig.connect(self._press_connect_for_address)
+        self.ui_call_sig.connect(self._run_ui_call)
         self.replay_done_sig.connect(self._on_replay_done)
         self.replay_member_done_sig.connect(self._finish_replay_member)
         self.analyze_done_sig.connect(self._on_analyze_done)
         self.dongle_check_sig.connect(self._on_dongle_check_result)
-        self.fft_done_sig.connect(self._on_fft_done)
-        self.bio_fft_done_sig.connect(self._on_bio_fft_done)
 
-        if not self.sensor_controller.hasDeviceFoundCallback:
-            self.sensor_controller.onDeviceFoundCallback = self._on_device_found
+        self.sensor_controller.on_sensor_scan_result = self._on_device_found
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # -- UI --------------------------------------------------------------------
 
     def _init_ui(self):
         main_layout = QtWidgets.QHBoxLayout()
@@ -1070,7 +996,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._setup_3d_plot()
 
         bottom_left_layout = QtWidgets.QVBoxLayout()
-        # 上：时域波形；下：工作线程 FFT 结果驱动的频谱
         self.figure_2d, (self.ax_2d, self.ax_fft) = plt.subplots(
             2, 1, gridspec_kw={"height_ratios": [3, 2]})
         self.figure_2d.subplots_adjust(hspace=0.45)
@@ -1100,18 +1025,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_disconnect.clicked.connect(self._disconnect_selected_device)
         self.btn_disconnect.setEnabled(False)
 
+        self.btn_multi_sync = QtWidgets.QPushButton("Multi Start")
+        self.btn_multi_sync.clicked.connect(self._multi_sync)
+        self.btn_multi_sync.setEnabled(False)
+
+        self.btn_multi_replay = QtWidgets.QPushButton("Multi Replay Bin")
+        self.btn_multi_replay.clicked.connect(self._multi_replay_bin)
+
         self.btn_check_dongle = QtWidgets.QPushButton("Check Setup Dongle")
         self.btn_check_dongle.clicked.connect(self._check_setup_dongle)
         _bold_font = self.btn_check_dongle.font()
         _bold_font.setBold(True)
         self.btn_check_dongle.setFont(_bold_font)
-
-        self.btn_multi_start = QtWidgets.QPushButton("Multi Start")
-        self.btn_multi_start.clicked.connect(self._multi_start)
-        self.btn_multi_start.setEnabled(False)
-
-        self.btn_multi_replay = QtWidgets.QPushButton("Multi Replay Bin")
-        self.btn_multi_replay.clicked.connect(self._multi_replay_bin)
 
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
@@ -1127,6 +1052,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_replay_stop.clicked.connect(self._stop_replay)
         self.btn_replay_stop.setEnabled(False)
 
+        sdk_header_layout = QtWidgets.QHBoxLayout()
+        self.sdk_label = QtWidgets.QLabel(
+            f"SDK: {self.sensor_controller.getVersion()} | Backend: --")
+        sdk_header_layout.addWidget(self.sdk_label)
+        sdk_header_layout.addStretch()
+        sdk_header_layout.addWidget(self.btn_multi_sync)
+        sdk_header_layout.addWidget(self.btn_multi_replay)
+        sdk_header_layout.addWidget(self.btn_check_dongle)
+        controls_layout.addLayout(sdk_header_layout)
+
         button_layout = QtWidgets.QVBoxLayout()
         button_layout.addWidget(self.btn_scan)
         button_layout.addWidget(self.btn_stop_scan)
@@ -1134,7 +1069,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         button_layout.addWidget(self.btn_disconnect)
         button_layout.addStretch()
 
-        # 回放按钮放在控制行最右边
         replay_button_layout = QtWidgets.QVBoxLayout()
         replay_button_layout.addWidget(self.btn_replay)
         replay_button_layout.addWidget(self.btn_analyze)
@@ -1148,21 +1082,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         device_layout = QtWidgets.QVBoxLayout()
         device_header_layout = QtWidgets.QHBoxLayout()
-        # Auto Reconnect 总开关：选中则所有 SensorProfile 的 autoReconnect 为 True
         self.chk_auto_reconnect = QtWidgets.QCheckBox("Auto Reconnect")
-        self.chk_auto_reconnect.setChecked(True)   # SensorProfile.autoReconnect 默认 True
+        self.chk_auto_reconnect.setChecked(True)
         self.chk_auto_reconnect.toggled.connect(self._on_auto_reconnect_toggled)
         device_header_layout.addWidget(self.chk_auto_reconnect)
-        # Use Clone Data 开关（对齐 C++ Qt demo，默认不勾 = 不Clone,高性能）：
         self.chk_use_clone_data = QtWidgets.QCheckBox("Use Clone Data")
         self.chk_use_clone_data.setChecked(False)
         self.chk_use_clone_data.toggled.connect(self._on_use_clone_data_toggled)
         device_header_layout.addWidget(self.chk_use_clone_data)
         device_header_layout.addWidget(QtWidgets.QLabel("Discovered Devices:"))
         device_header_layout.addStretch()
-        device_header_layout.addWidget(self.btn_multi_start)
-        device_header_layout.addWidget(self.btn_multi_replay)
-        device_header_layout.addWidget(self.btn_check_dongle)
         device_layout.addLayout(device_header_layout)
         device_layout.addWidget(self.device_list)
 
@@ -1180,8 +1109,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         type_layout.addWidget(self.type_combo)
 
-        # 实时频段滤波下拉框（作用于右侧 EMG/EEG/ECG/BRTH/PPG 波形，
-        # 在 SDK 数据回调线程内滤波后写入显示缓冲）
         type_layout.addWidget(QtWidgets.QLabel("Live Filter:"))
         self.filter_combo = QtWidgets.QComboBox()
         for name, band in FILTER_BANDS:
@@ -1253,6 +1180,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._data_debug_log_checkbox.setChecked(True)
         self._data_debug_log_checkbox.stateChanged.connect(self._on_data_debug_log_toggled)
         debug_log_layout.addWidget(self._data_debug_log_checkbox)
+        self._dongle_debug_checkbox = QtWidgets.QCheckBox("Enable debug dongle")
+        self._dongle_debug_checkbox.setChecked(True)
+        self._dongle_debug_checkbox.stateChanged.connect(self._on_dongle_debug_toggled)
+        debug_log_layout.addWidget(self._dongle_debug_checkbox)
         debug_log_group.setLayout(debug_log_layout)
 
         ntf_group = QtWidgets.QGroupBox("Data Notification")
@@ -1264,6 +1195,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             "NTF_PPG":  QtWidgets.QCheckBox("PPG"),
             "NTF_SPO2": QtWidgets.QCheckBox("SpO2"),
             "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
+            "NTF_MAG_ANGLE": QtWidgets.QCheckBox("Angle"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)
@@ -1393,11 +1325,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=7)
         self.setLayout(main_layout)
-        self.setWindowTitle(f"SynchroniSDKPython IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{self.sensor_controller.getVersion()}, demo v{DEMO_VERSION})")
+        self.setWindowTitle(f"SensorSDKCXX IMU + Quaternion + EMG + EEG Demo (sensor-sdk v{self.sensor_controller.getVersion()}, demo v{DEMO_VERSION})")
         self.resize(1600, 900)
         self.show()
 
-    # ── Scan / Connect ────────────────────────────────────────────────────────
+    # -- Scan / Connect ----------------------------------------------------------
 
     def _start_scan(self):
         if not self.sensor_controller.isEnable:
@@ -1417,14 +1349,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_stop_scan.setEnabled(False)
 
     def _check_setup_dongle(self):
-        # 检查/安装 dongle 驱动（Windows 弹 UAC，Linux 需终端 sudo 密码），
-        # 后台线程执行避免阻塞 UI，结果经信号回到主线程提示
         self._app_log("User: check setup dongle")
         self.btn_check_dongle.setEnabled(False)
         self.btn_check_dongle.setText("Checking Dongle...")
 
-        # Linux 非 root 时安装 udev 规则需要 sudo：密码要输到启动本程序的
-        # shell（或 SDK 弹出的终端窗口），先弹提示避免用户以为程序卡死
         if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() != 0:
             shell = os.path.basename(os.environ.get("SHELL") or "") or "shell"
             QtWidgets.QMessageBox.information(
@@ -1433,15 +1361,38 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         def work():
             try:
-                result = checkSetupDongle()
+                result = self.sensor_controller.checkSetupDongle()
             except Exception as e:
                 result = f"Error: {e}"
             self.dongle_check_sig.emit(result)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _on_dongle_check_result(self, result: str):
+        self._app_log(f"App: check dongle result: {result.splitlines()[0] if result else result}")
+        self.btn_check_dongle.setEnabled(True)
+        self.btn_check_dongle.setText("Check Setup Dongle")
+        if result.startswith("OK"):
+            first_line, _, extra = result.partition("\n")
+            count = first_line.split(":", 1)[1].strip() if ":" in first_line else None
+            msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
+            if count is not None:
+                msg += f"\nUsable dongle count: {count}"
+            if extra:
+                msg += f"\n{extra.strip()}"
+            QtWidgets.QMessageBox.information(self, "Check Setup Dongle", msg)
+        else:
+            QtWidgets.QMessageBox.warning(self, "Check Setup Dongle", result)
+
+    def _multi_sync(self):
+        streaming = any(state.sensor.isDataTransfering
+                        for state in self.device_states.values())
+        if streaming:
+            self._multi_stop()
+        else:
+            self._multi_start()
+
     def _multi_start(self):
-        # 停掉所有已连接设备的传输，再用 controller 的同步起流对齐启动：
         sensors = [state.sensor for state in self.device_states.values()
                    if state.sensor.isReady
                    and state.sensor.hasInited]
@@ -1450,7 +1401,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.status_label.setText("No connected device to sync-start")
             return
         self._app_log(f"User: multi start on {len(sensors)} device(s)")
-        self.btn_multi_start.setEnabled(False)
+        self.btn_multi_sync.setEnabled(False)
         try:
             transferring = [s for s in sensors if s.isDataTransfering]
             if transferring:
@@ -1474,86 +1425,118 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         finally:
             self._update_button_states()
 
+    def _multi_stop(self):
+        sensors = [state.sensor for state in self.device_states.values()
+                   if state.sensor.isReady
+                   and state.sensor.hasInited]
+        if not sensors:
+            self._app_log("User: multi stop rejected (no connected device)", "W")
+            self.status_label.setText("No connected device to sync-stop")
+            return
+        self._app_log(f"User: multi stop on {len(sensors)} device(s)")
+        self.btn_multi_sync.setEnabled(False)
+        try:
+            results = self.sensor_controller.multiStopDataNotification(sensors)
+            failed = [mac for mac, ok in results.items() if not ok]
+            if failed:
+                self._app_log(f"App: multi stop failed on: {', '.join(failed)}", "W")
+                self.status_label.setText(
+                    f"Multi stop failed on: {', '.join(failed)}")
+            else:
+                self._app_log(f"App: multi stop OK: {len(results)} device(s) stopped")
+                self.status_label.setText(
+                    f"Multi stop: {len(results)} device(s) stopped")
+        finally:
+            self._update_button_states()
+
     def _start_with_model_params(self, sensors):
-        # 同型号设备用默认对齐参数，混合型号不做首包时差校验、重试 5 次
+        # Same model for all devices -> defaults; mixed models -> no
+        # dispersion check, longer timeout, more attempts
         model_names = set()
         for s in sensors:
             info = s.getDeviceInfo()
             model_names.add(info.ModelName if info else None)
         if len(model_names) == 1 and None not in model_names:
-            return self.sensor_controller.multiStartDataNotification(sensors)
-        return self.sensor_controller.multiStartDataNotification(
-            sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
+            results = self.sensor_controller.multiStartDataNotification(sensors)
+        else:
+            results = self.sensor_controller.multiStartDataNotification(
+                sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
+        return results
 
     def _on_auto_reconnect_toggled(self, checked: bool):
+        self._auto_reconnect_enabled = bool(checked)
         self._app_log(f"User: auto reconnect {'ON' if checked else 'OFF'}")
-        # 同步到所有已创建的 SensorProfile（含回放虚拟设备）
         for state in self.device_states.values():
-            state.sensor.autoReconnect = checked
+            state.sensor.setAutoReconnect(checked)
 
     def _on_use_clone_data_toggled(self, checked: bool):
-        # direct / queue 模式切换：队列中残留批次继续由 worker 消费，
-        # 两模式的缓冲写入路径相同，无需清空
         self._use_clone_data = checked
-        self._app_log(f"User: use queue data {'ON' if checked else 'OFF'}")
-
-    def _on_dongle_check_result(self, result: str):
-        self._app_log(f"App: check dongle result: {result.splitlines()[0] if result else result}")
-        self.btn_check_dongle.setEnabled(True)
-        self.btn_check_dongle.setText("Check Setup Dongle")
-        if result.startswith("OK"):
-            first_line, _, extra = result.partition("\n")
-            count = first_line.split(":", 1)[1].strip() if ":" in first_line else None
-            msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
-            if count is not None:
-                msg += f"\nUsable dongle count: {count}"
-            if extra:
-                msg += f"\n{extra.strip()}"
-            QtWidgets.QMessageBox.information(self, "Check Setup Dongle", msg)
-        else:
-            QtWidgets.QMessageBox.warning(self, "Check Setup Dongle", result)
+        self._app_log(f"User: use clone data {'ON' if checked else 'OFF'}")
 
     def _on_device_found(self, device_list: List[BLEDevice]):
-        self._stop_scan()
-        # 不过滤设备名，扫描到的所有设备都列入列表
+        # Every batch is a full scan-round snapshot; merge it into the list in
+        # place and keep scanning until the user presses Stop Scan.
+        present = set()
         for d in device_list:
+            present.add(d.Address)
             existing = next((x for x in self.discovered_devices if x.Address == d.Address), None)
             if existing is None:
                 self.discovered_devices.append(d)
+                self._scan_missed_rounds[d.Address] = 0
                 self.add_device_sig.emit(f"RSSI: {d.RSSI}, Name: {d.Name}, Address: {d.Address}")
             else:
-                # SDK 在回调前已更新共享 BLEDevice 的 RSSI（同一对象，比较无意义），
-                # 每次扫描返回都刷新一次列表项显示并重排
                 existing.RSSI = d.RSSI
+                self._scan_missed_rounds[d.Address] = 0
                 self.update_device_sig.emit(d.Address, d.RSSI)
+        self._evict_stale_devices(present)
+
+    def _evict_stale_devices(self, present):
+        # Rows absent from four consecutive scan rounds are dropped; connected
+        # devices and replay rows are exempt.
+        evicted = []
+        for x in list(self.discovered_devices):
+            if x.Address in present or x.Address in self.device_states:
+                continue
+            missed = self._scan_missed_rounds.get(x.Address, 0) + 1
+            self._scan_missed_rounds[x.Address] = missed
+            if missed < 4:
+                continue
+            self.discovered_devices.remove(x)
+            self._scan_missed_rounds.pop(x.Address, None)
+            evicted.append(x.Address)
+        for addr in evicted:
+            self._ui(lambda a=addr: self._remove_device_item(a))
 
     def _add_device_item(self, text: str):
         item = QtWidgets.QListWidgetItem(text)
-        # 记录 RSSI 到 UserRole，插入后按信号强度从大到小排序
         try:
             rssi = int(text.split("RSSI: ")[1].split(",")[0])
         except (IndexError, ValueError):
             rssi = None
         item.setData(QtCore.Qt.UserRole, rssi)
-        self.device_list.addItem(item)
-        self._sort_device_list()
+        # Insert by RSSI descending; existing rows keep their place, rows
+        # without an RSSI sort last.
+        pos = self.device_list.count()
+        if rssi is not None:
+            for i in range(self.device_list.count()):
+                other = self.device_list.item(i).data(QtCore.Qt.UserRole)
+                if not isinstance(other, int) or other < rssi:
+                    pos = i
+                    break
+        self.device_list.insertItem(pos, item)
 
-    def _sort_device_list(self):
-        """按 RSSI 从大到小重排设备列表项（未记录 RSSI 的排最后）。"""
-
-        def rssi_of(it):
-            rssi = it.data(QtCore.Qt.UserRole)
-            return rssi if isinstance(rssi, int) else -999
-
-        items = []
-        while self.device_list.count():
-            items.append(self.device_list.takeItem(0))
-        items.sort(key=rssi_of, reverse=True)
-        for it in items:
-            self.device_list.addItem(it)
+    def _remove_device_item(self, addr: str):
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            if f"Address: {addr}" not in item.text():
+                continue
+            was_current = self.device_list.currentItem() is item
+            self.device_list.takeItem(i)
+            if was_current:
+                self.device_list.setCurrentItem(None)
+            break
 
     def _update_device_rssi(self, addr: str, rssi: int):
-        """扫描到新 RSSI 时更新列表项文本（保留 [Connected] 前缀）并重排。"""
         for i in range(self.device_list.count()):
             item = self.device_list.item(i)
             text = item.text()
@@ -1568,7 +1551,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             item.setText(new_text)
             item.setData(QtCore.Qt.UserRole, rssi)
             break
-        self._sort_device_list()
 
     def _selected_address(self) -> Optional[str]:
         item = self.device_list.currentItem()
@@ -1583,13 +1565,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         return next((d for d in self.discovered_devices if d.Address == addr), None)
 
     def _current_state(self) -> Optional[DeviceDataState]:
-        """当前显示设备对应的 DeviceDataState，未连接时返回 None。"""
         if self.current_sensor is None:
             return None
         return self.device_states.get(self.current_sensor.BLEDevice.Address)
 
     def _on_device_selected(self, item):
-        """单击设备列表只切换当前显示的设备，不触发连接。"""
         addr = item.text().split("Address: ")[1].strip() if "Address: " in item.text() else None
         state = self.device_states.get(addr) if addr else None
         self.current_sensor = state.sensor if state is not None else None
@@ -1601,7 +1581,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         connected = addr is not None and addr in self.device_states
         self.btn_connect.setEnabled(addr is not None and not connected)
         self.btn_disconnect.setEnabled(connected)
-        self.btn_multi_start.setEnabled(len(self.device_states) >= 1)
+        streaming = any(state.sensor.isDataTransfering
+                        for state in self.device_states.values())
+        self.btn_multi_sync.setText("Multi Stop" if streaming else "Multi Start")
+        self.btn_multi_sync.setEnabled(len(self.device_states) >= 1)
 
     def _update_device_item_text(self, addr: str, connected: bool):
         for i in range(self.device_list.count()):
@@ -1616,50 +1599,66 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             item.setText(text)
             break
 
+    def _run_ui_call(self, fn):
+        fn()
+
+    def _ui(self, fn):
+        app = QtWidgets.QApplication.instance()
+        if app is not None and QtCore.QThread.currentThread() is app.thread():
+            fn()
+        else:
+            self.ui_call_sig.emit(fn)
+
     def _connect_selected_device(self):
-        """连接列表中选中的设备，支持同时连接多台设备。"""
         device = self._selected_list_device()
+        self._connect_device(device, self.chk_auto_reconnect.isChecked())
+
+    def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None):
         if device is None:
             self._app_log("User: connect rejected (no device selected)", "W")
-            self.status_label.setText("Please select a device in the list first")
+            self._ui(lambda: self.status_label.setText("Please select a device in the list first"))
             return
         addr = device.Address
         if addr in self.device_states:
             return
 
         self._app_log(f"User: connect {device.Name} ({addr})")
+        if self.sensor_controller.isScanning:
+            self._stop_scan()
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
             self._app_log(f"App: failed to create SensorProfile for {addr}", "E")
-            self.status_label.setText("Failed to create SensorProfile")
+            self._ui(lambda: self.status_label.setText("Failed to create SensorProfile"))
             return
 
-        sensor.onDataCallback  = self._on_data
-        sensor.onStateChanged  = self._on_state_changed
-        sensor.onErrorCallback = self._on_error
-        sensor.onPowerChanged  = self._on_power_changed
-        sensor.onDeviceInfoUpdate = self._on_device_info_update
-        # 自动重连找回设备时：等效于按下 Connect 按钮（走本方法完整流程）
-        sensor.onAutoReconnect = self._on_auto_reconnect
-        sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
+        sensor.on_sensor_notify_data = self._on_data
+        sensor.on_state_change = self._on_state_changed
+        sensor.on_error_callback = self._on_error
+        sensor.on_power_changed = self._on_power_changed
+        sensor.on_device_info_update = self._on_device_info_update
+        sensor.on_auto_reconnect = self._on_auto_reconnect
+        sensor.setAutoReconnect(auto_reconnect)
 
-        self.status_label.setText(f"Connecting: {device.Name} ...")
-        self.btn_connect.setEnabled(False)
+        self._ui(lambda: self.status_label.setText(f"Connecting: {device.Name} ..."))
+        self._ui(lambda: self.btn_connect.setEnabled(False))
 
         if not sensor.isReady:
-            if not sensor.connect():
+            ok = sensor.connect()
+            if not ok:
                 self._app_log(f"App: failed to connect to {device.Name} ({addr})", "E", sensor)
-                self.status_label.setText(f"Failed to connect to {device.Name}")
-                self._update_button_states()
+                self._ui(lambda: self.status_label.setText(f"Failed to connect to {device.Name}"))
+                self._ui(self._update_button_states)
                 return
 
         state = DeviceDataState(sensor)
 
         if not sensor.hasInited:
-            if not sensor.init(PACKAGE_COUNT, POWER_REFRESH_PERIOD_IN_MS):
+            ok = sensor.init(PACKAGE_COUNT,
+                             POWER_REFRESH_PERIOD_IN_MS)
+            if not ok:
                 self._app_log(f"App: failed to initialize {device.Name} ({addr})", "E", sensor)
-                self.status_label.setText(f"Failed to initialize {device.Name}")
-                self._update_button_states()
+                self._ui(lambda: self.status_label.setText(f"Failed to initialize {device.Name}"))
+                self._ui(self._update_button_states)
                 return
 
             info = sensor.getDeviceInfo()
@@ -1671,7 +1670,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ("Quat",  info.QuatChannelCount,  info.QuatSampleRate,  DataType.NTF_QUATERNION),
             ]
             if state.bio_kind == "emg":
-                # ORehab 等纯磁角度设备 bio_kind 也为 "emg" 但无 EMG 流，不显示 EMG 状态项
                 if info.EmgChannelCount > 0:
                     state.status_parts.append(
                         ("EMG", info.EmgChannelCount, info.EmgSampleRate, DataType.NTF_EMG))
@@ -1687,65 +1685,58 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     ("ECG",  info.EcgChannelCount,  info.EcgSampleRate,  DataType.NTF_ECG),
                     ("BRTH", info.BrthChannelCount, info.BrthSampleRate, DataType.NTF_BRTH),
                 ])
-            # 无手势能力的设备（如 gForceDual/gForceDuo）GestChannelCount=0，
-            # 不显示 GEST 状态项
             if info.GestChannelCount > 0:
                 state.status_parts.append(("GEST", info.GestChannelCount, info.GestSampleRate, DataType.NTF_GEST))
-            # 无磁角度能力的设备 MagAngleChannelCount=0，不显示 MAG_ANGLE 状态项
-            # （新 EMG 设备真磁角度 40Hz；ORehabArm/ORehabLeg 关节角度 250Hz）
             if info.MagAngleChannelCount > 0:
-                state.status_parts.append(("MAG_ANGLE", info.MagAngleChannelCount, info.MagAngleSampleRate, DataType.NTF_MAG_ANGLE_DATA))
+                state.status_parts.append(("Angle", info.MagAngleChannelCount, info.MagAngleSampleRate, DataType.NTF_MAG_ANGLE_DATA))
             state.status_text = state.build_status_text()
 
         if not sensor.isDataTransfering:
-            if not sensor.startDataNotification():
+            ok = sensor.startDataNotification()
+            if not ok:
                 self._app_log(f"App: failed to start data stream on {addr}", "E", sensor)
-                self.status_label.setText("Failed to start data stream")
-                self._update_button_states()
+                self._ui(lambda: self.status_label.setText("Failed to start data stream"))
+                self._ui(self._update_button_states)
                 return
 
         self._app_log(f"App: device connected and streaming: {device.Name} ({addr})", sensor=sensor)
         self.device_states[addr] = state
-        self._update_device_item_text(addr, connected=True)
+        self._ui(lambda: self._update_device_item_text(addr, connected=True))
 
-        # 初始电量发布发生在 state 注册之前（子进程 init 成功后立即发布），
-        # 这里显式补取一次，避免切换显示时电量显示 "--"
         try:
             power = sensor.getBatteryLevel()
-            if power is not None and power >= 0:
+            if (power >= 0 and (state.last_power is None
+                                or abs(power - state.last_power) >= POWER_STABLE_BAND)):
                 state.last_power = power
         except Exception:
             pass
 
-        # 若连接的是当前选中的设备，将其设为当前显示设备
-        if self._selected_address() == addr:
+        if select_current is None:
+            select_current = self._selected_address() == addr
+        if select_current:
             self.current_sensor = sensor
 
-        # 根据全局 Debug Log 开关状态初始化新设备的日志设置：
-        # 重连时优先续用上次的日志/bin 文件（默认追加，而不是另起新文件）
         if self._debug_log_enabled:
             log_path = self._last_log_paths.get(addr) or "True"
             sensor.setParam("DEBUG_LOG_PATH", log_path)
             current = sensor.getParam("DEBUG_LOG_PATH")
-            if current:
+            if current and not str(current).startswith("Error"):
                 self._last_log_paths[addr] = current
         if self._data_debug_log_enabled:
             data_path = self._last_data_log_paths.get(addr) or "True"
             sensor.setParam("DEBUG_BLE_DATA_PATH", data_path)
             current = sensor.getParam("DEBUG_BLE_DATA_PATH")
-            if current:
+            if current and not str(current).startswith("Error"):
                 self._last_data_log_paths[addr] = current
 
-        # 查询并缓存设备 NTF/FILTER 状态
-        self._refresh_control_states(sensor)
+        self._ui(lambda: self._refresh_control_states(sensor))
 
         if self.current_sensor == sensor:
-            self._refresh_display_for_state(state)
+            self._ui(lambda: self._refresh_display_for_state(state))
 
-        self._update_button_states()
+        self._ui(self._update_button_states)
 
     def _disconnect_selected_device(self):
-        """断开当前选中（显示）的设备，其余已连接设备不受影响。"""
         sensor = self.current_sensor
         if sensor is None:
             return
@@ -1758,21 +1749,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             cb.setEnabled(False)
         self.status_label.setText("Disconnecting...")
         sensor.disconnect()
-        # 后续清理由 onStateChanged -> _on_device_disconnected 完成
 
-    # ── Bin 文件回放 ────────────────────────────────────────────────────────────
+    # -- Bin replay ----------------------------------------------------------------
 
     def _set_replay_mode_ui(self, replaying: bool):
-        """回放期间禁用扫描 / 连接设备 / 调试日志等实时设备控件，回放结束后恢复。
-        已连接的设备不受影响（回放开始前会拒绝在有设备连接时进入回放）。"""
         if replaying:
-            # 回放不经过实时链路：停掉进行中的扫描
             if self.sensor_controller.isScanning:
                 self.sensor_controller.stopScan()
             self.btn_stop_scan.setEnabled(False)
             self.btn_connect.setEnabled(False)
             self.btn_disconnect.setEnabled(False)
-            self.btn_multi_start.setEnabled(False)
+            self.btn_multi_sync.setEnabled(False)
             self.btn_multi_replay.setEnabled(False)
         else:
             self._update_button_states()
@@ -1781,9 +1768,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_list.setEnabled(not replaying)
         self._debug_log_checkbox.setEnabled(not replaying)
         self._data_debug_log_checkbox.setEnabled(not replaying)
+        self._dongle_debug_checkbox.setEnabled(not replaying)
 
     def _replay_bin_file(self):
-        """选择一个 bin 文件并按原始时间节奏回放，数据显示流程与实时数据一致。"""
         if self.device_states:
             self.status_label.setText("Please disconnect all devices before replaying a bin file")
             return
@@ -1797,9 +1784,35 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         )
         if not path:
             return
+        self._start_replay(path)
 
+    def _multi_replay_bin(self):
+        if self.device_states:
+            self.status_label.setText("Please disconnect all devices before replaying bin files")
+            return
+        if self._replay_active:
+            return
+
+        default_dir = Path.home() / "Documents" / "sensorsdklog"
+        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select Bin Files", start_dir, "Bin Files (*.bin)"
+        )
+        if not paths:
+            return
+        if len(paths) == 1:
+            self._start_replay(paths[0])
+        else:
+            self._start_multi_replay(paths)
+
+    def _start_replay(self, path: str):
         self._app_log(f"User: replay bin file: {path}")
-        config = self.sensor_controller.getBinFileInfo(path)
+        try:
+            config = self.sensor_controller.getBinFileInfo(path)
+        except Exception as e:
+            self._app_log(f"App: replay failed to read bin info: {e}", "E")
+            self.status_label.setText(f"Replay failed: {e}")
+            return
         if config is None:
             self._app_log(f"App: invalid bin file (no config record): {path}", "W")
             self.status_label.setText("Invalid bin file: no config record found")
@@ -1811,35 +1824,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         name = config.get("device_name") or ""
 
-        # 用 bin 配置记录中的设备信息初始化显示缓冲区
-        info = DeviceInfo()
-        for key, value in (config.get("device_info") or {}).items():
-            if hasattr(info, key):
-                try:
-                    setattr(info, key, value)
-                except Exception:
-                    pass
+        info = _device_info_from_bin(config.get("device_info"))
 
-        sensor = self.sensor_controller.requireSensor(BLEDevice(name, mac, 0))
-        if sensor is None:
-            self.status_label.setText("Failed to create SensorProfile for replay")
+        # The replay profile is created by the controller
+        try:
+            sensor = self.sensor_controller.replayBinFile(path, None, realtime=True, block=False)
+        except Exception as e:
+            self._app_log(f"App: replay failed to start: {e}", "E")
+            self.status_label.setText(f"Replay failed to start: {e}")
             return
-        sensor.onDataCallback = self._on_data
-        sensor.onErrorCallback = self._on_error
-        # 回放中配置记录切换可能改变采样率，SDK 会推 device_info_update，
-        # 据此重建生物电/IMU 缓冲与横轴
-        sensor.onDeviceInfoUpdate = self._on_device_info_update
-        # 回放的数据流开关事件：回放开始/结束（含异常终止）时驱动 _replay_active
-        sensor.onDataTransferStateChange = self._on_replay_transfer_state
-        sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
+        if sensor is None:
+            self.status_label.setText("Replay failed to start")
+            return
+        sensor.on_sensor_notify_data = self._on_data
+        sensor.on_error_callback = self._on_error
+        sensor.on_device_info_update = self._on_device_info_update
+        sensor.on_data_transfer_state_change = self._on_replay_transfer_state
+        sensor.setAutoReconnect(self.chk_auto_reconnect.isChecked())
 
         self._replay_sensor = sensor
-        # 单文件回放不属于任何组：清空组成员表，
-        # transfer OFF 事件走单回放分支直接复位 _replay_active
-        self._replay_sensors = []
 
-        # 回放传感器作为一台虚拟设备进入 device_states：
-        # _on_data 按地址路由到它的 DeviceDataState，显示流程与实时设备一致
         state = DeviceDataState(sensor)
         state.info = info
         state.init_buffers(info, EEG_AXIS_COUNT)
@@ -1850,7 +1854,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_states[mac] = state
         self.current_sensor = sensor
         self._refresh_display_for_state(state)
-        # 回放起始速率来自 bin 首条配置记录，单选框选中态同步（保持禁用态不变）
         if info.EegSampleRate > 0:
             state.sample_rate_state = ([], int(info.EegSampleRate))
             self._set_sample_rate_checked(int(info.EegSampleRate))
@@ -1863,158 +1866,112 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._replay_paused = False
         self._replay_stop_requested = False
-        # 先在点击路径上置位，挡住事件到达前的重复点击；之后由
-        # onDataTransferStateChange 事件与 _on_replay_done 维护
+        self._replay_done_fired = False
+        self._replay_path = path
+        self._replay_sensors = []
+        self._replay_paths = []
+        self._replay_multi_counts = None
         self._replay_active = True
         self.btn_replay.setEnabled(False)
-        self.btn_multi_replay.setEnabled(False)
         self.btn_replay_pause.setEnabled(True)
         self.btn_replay_pause.setText("Pause Replay")
         self.btn_replay_stop.setEnabled(True)
         self._set_replay_mode_ui(True)
 
-        def _do_replay():
-            try:
-                result = self.sensor_controller.replayBinFile(
-                    path, sensor, realtime=True)
-                if result is None:
-                    self.replay_done_sig.emit("Replay failed to start")
-                elif self._replay_stop_requested:
-                    self.replay_done_sig.emit("Replay stopped")
-                else:
-                    self.replay_done_sig.emit(f"Replay finished: {Path(path).name}")
-            except Exception as e:
-                self.replay_done_sig.emit(f"Replay error: {e}")
-
-        self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinReplay")
-        self._replay_thread.start()
-
-    def _multi_replay_bin(self):
-        """选择多个 bin 文件，按共享时钟对齐同步回放（SDK multiReplayBinFile）：
-        全组最早首条数据记录为 t=0，保留采集时的相对偏移；暂停任一成员整组暂停。"""
-        if self.device_states:
-            self.status_label.setText("Please disconnect all devices before replaying bin files")
-            return
-        if self._replay_active:
-            return
-
-        default_dir = Path.home() / "Documents" / "sensorsdklog"
-        start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Select Bin Files (Multi Replay)", start_dir, "Bin Files (*.bin)"
-        )
-        if not paths:
-            return
-        self._app_log(f"User: multi replay bin files: {paths}")
-
-        members = []  # (path, sensor, state)
-        seen_macs = set()
+    def _start_multi_replay(self, paths: list):
+        self._app_log(f"User: replay bin files: {'; '.join(paths)}")
+        members = []
+        macs = []
         for path in paths:
-            config = self.sensor_controller.getBinFileInfo(path)
+            try:
+                config = self.sensor_controller.getBinFileInfo(path)
+            except Exception as e:
+                self._app_log(f"App: invalid bin file ({e}): {path}", "W")
+                continue
+            mac = config.get("device_mac") if config is not None else None
             if config is None:
                 self._app_log(f"App: invalid bin file (no config record): {path}", "W")
                 continue
-            mac = config.get("device_mac")
             if not mac:
                 self._app_log(f"App: invalid bin file (config missing device_mac): {path}", "W")
                 continue
-            if mac in seen_macs:
+            if mac in macs:
                 self._app_log(f"App: duplicate device mac skipped: {mac}", "W")
                 continue
-            seen_macs.add(mac)
-            name = config.get("device_name") or ""
+            macs.append(mac)
+            members.append((path, config))
+        if len(members) < 2:
+            self.status_label.setText("Multi replay needs at least 2 valid bin files")
+            return
 
-            # 用 bin 配置记录中的设备信息初始化显示缓冲区
-            info = DeviceInfo()
-            for key, value in (config.get("device_info") or {}).items():
-                if hasattr(info, key):
-                    try:
-                        setattr(info, key, value)
-                    except Exception:
-                        pass
+        member_paths = [p for p, _ in members]
 
-            sensor = self.sensor_controller.requireSensor(BLEDevice(name, mac, 0))
+        # The replay profiles are created by the controller
+        try:
+            profiles = self.sensor_controller.multiReplayBinFile(member_paths, macs, realtime=True, block=False)
+        except Exception as e:
+            self._app_log(f"App: multi replay failed to start: {e}", "E")
+            self.status_label.setText(f"Multi replay failed to start: {e}")
+            return
+
+        started = []
+        for (path, config), sensor in zip(members, profiles):
             if sensor is None:
-                self._app_log(f"App: failed to create SensorProfile for {mac}", "E")
+                self._app_log(f"App: replay member failed to start: {path}", "W")
                 continue
-            sensor.onDataCallback = self._on_data
-            sensor.onErrorCallback = self._on_error
-            sensor.onDeviceInfoUpdate = self._on_device_info_update
-            sensor.onDataTransferStateChange = self._on_replay_transfer_state
-            sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
+            sensor.on_sensor_notify_data = self._on_data
+            sensor.on_error_callback = self._on_error
+            sensor.on_device_info_update = self._on_device_info_update
+            sensor.on_data_transfer_state_change = self._on_replay_transfer_state
+            sensor.setAutoReconnect(self.chk_auto_reconnect.isChecked())
 
+            info = _device_info_from_bin(config.get("device_info"))
             state = DeviceDataState(sensor)
             state.info = info
             state.init_buffers(info, EEG_AXIS_COUNT)
             duration = config.get("replay_duration", 0.0)
             state.status_text = (
                 f"Replaying: {Path(path).name} (duration {duration:.1f}s, multi-sync) ...")
-            members.append((path, sensor, state))
-        if len(members) < 2:
-            self.status_label.setText("Multi replay needs at least 2 valid bin files")
+            self.device_states[config.get("device_mac")] = state
+            if info.EegSampleRate > 0:
+                state.sample_rate_state = ([], int(info.EegSampleRate))
+            if info.EmgSampleRate > 0:
+                state.emg_sample_rate_state = ([], int(info.EmgSampleRate))
+            if info.AccSampleRate > 0:
+                state.imu_sample_rate_state = ([], int(info.AccSampleRate))
+            started.append(sensor)
+
+        if not started:
+            self.status_label.setText("Multi replay failed to start")
             return
 
-        # 回放成员作为虚拟设备进入 device_states：_on_data 按地址路由到各自的
-        # DeviceDataState，显示流程与实时设备一致
-        self._replay_sensors = [sensor for _, sensor, _ in members]
-        # 组回放没有“主”成员：Pause/Stop 对全部成员下发（组时钟语义下幂等），
-        # 成员级收尾按各自的 transfer OFF 事件逐个进行
         self._replay_sensor = None
-        for _, sensor, state in members:
-            self.device_states[sensor.BLEDevice.Address] = state
-            if state.info.EegSampleRate > 0:
-                state.sample_rate_state = ([], int(state.info.EegSampleRate))
-            if state.info.EmgSampleRate > 0:
-                state.emg_sample_rate_state = ([], int(state.info.EmgSampleRate))
-            if state.info.AccSampleRate > 0:
-                state.imu_sample_rate_state = ([], int(state.info.AccSampleRate))
-        self.current_sensor = members[0][1]
-        self._refresh_display_for_state(members[0][2])
-        if members[0][2].info.EegSampleRate > 0:
-            self._set_sample_rate_checked(int(members[0][2].info.EegSampleRate))
-        if members[0][2].info.EmgSampleRate > 0:
-            self._set_emg_sample_rate_checked(int(members[0][2].info.EmgSampleRate))
-        if members[0][2].info.AccSampleRate > 0:
-            self._set_imu_sample_rate_checked(int(members[0][2].info.AccSampleRate))
+        self._replay_sensors = started
+        self._replay_paths = member_paths
+        self._replay_multi_counts = (len(started), len(member_paths))
+        self._replay_path = ""
+
+        first_state = self.device_states[started[0].BLEDevice.Address]
+        self.current_sensor = started[0]
+        self._refresh_display_for_state(first_state)
+        if first_state.sample_rate_state[1] > 0:
+            self._set_sample_rate_checked(first_state.sample_rate_state[1])
+        if first_state.emg_sample_rate_state[1] > 0:
+            self._set_emg_sample_rate_checked(first_state.emg_sample_rate_state[1])
+        if first_state.imu_sample_rate_state[1] > 0:
+            self._set_imu_sample_rate_checked(first_state.imu_sample_rate_state[1])
 
         self._replay_paused = False
         self._replay_stop_requested = False
-        # 先在点击路径上置位，挡住事件到达前的重复点击；之后由
-        # onDataTransferStateChange 事件与 _on_replay_done 维护
+        self._replay_done_fired = False
         self._replay_active = True
         self.btn_replay.setEnabled(False)
-        self.btn_multi_replay.setEnabled(False)
         self.btn_replay_pause.setEnabled(True)
         self.btn_replay_pause.setText("Pause Replay")
         self.btn_replay_stop.setEnabled(True)
         self._set_replay_mode_ui(True)
 
-        member_paths = [p for p, _, _ in members]
-        member_sensors = [s for _, s, _ in members]
-
-        def _do_replay():
-            try:
-                results = self.sensor_controller.multiReplayBinFile(
-                    member_paths, sensors=member_sensors, realtime=True)
-                ok_count = sum(1 for r in results if r is not None)
-                if self._replay_stop_requested:
-                    self.replay_done_sig.emit("Multi replay stopped")
-                elif ok_count == 0:
-                    self.replay_done_sig.emit("Multi replay failed to start")
-                else:
-                    self.replay_done_sig.emit(
-                        f"Multi replay finished: {ok_count}/{len(results)} device(s) ok")
-            except Exception as e:
-                self.replay_done_sig.emit(f"Multi replay error: {e}")
-
-        self._replay_thread = threading.Thread(target=_do_replay, daemon=True, name="BinMultiReplay")
-        self._replay_thread.start()
-
     def _on_replay_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
-        """回放会话的数据流开关事件（SDK 回调线程，对齐 C++ demo_multi）：
-        开始只刷新 _replay_active；结束时多文件回放按成员逐个收尾
-        （_finish_replay_member），单文件回放直接复位 _replay_active——
-        最终结果消息统一由回放线程的 replay_done_sig 携带。"""
         if is_transferring:
             self._replay_active = True
         self._app_log(
@@ -2025,11 +1982,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.replay_member_done_sig.emit(sensor)
             else:
                 self._replay_active = False
+                self._fire_replay_done()
 
     def _finish_replay_member(self, sensor: SensorProfile):
-        """多文件回放的单个成员结束（UI 线程）：立即移除它的虚拟设备状态，
-        显示切到剩余成员；全部成员结束后复位 _replay_active，
-        最终收尾仍由回放线程的 replay_done_sig 完成。"""
         if sensor not in self._replay_sensors:
             return
         mac = sensor.BLEDevice.Address
@@ -2043,9 +1998,25 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._refresh_display_for_state(next_state)
         if not self._replay_sensors:
             self._replay_active = False
+            self._fire_replay_done()
+
+    def _fire_replay_done(self, message: str = None):
+        if self._replay_done_fired:
+            return
+        self._replay_done_fired = True
+        if message is None:
+            if self._replay_stop_requested:
+                message = ("Multi replay stopped" if self._replay_paths
+                           else "Replay stopped")
+            elif self._replay_paths:
+                ok, total = self._replay_multi_counts or (
+                    len(self._replay_paths), len(self._replay_paths))
+                message = f"Multi replay finished: {ok}/{total} device(s) ok"
+            else:
+                message = f"Replay finished: {Path(self._replay_path).name}"
+        self.replay_done_sig.emit(message)
 
     def _toggle_replay_pause(self):
-        """暂停/恢复当前回放（多文件回放对每个成员下发——组时钟语义下幂等）。"""
         sensors = list(self._replay_sensors) if self._replay_sensors else (
             [self._replay_sensor] if self._replay_sensor is not None else [])
         if not sensors:
@@ -2071,7 +2042,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.status_label.setText("Replaying ...")
 
     def _stop_replay(self):
-        """停止当前回放（多文件回放时逐个停止所有成员）。"""
         sensors = list(self._replay_sensors) if self._replay_sensors else (
             [self._replay_sensor] if self._replay_sensor is not None else [])
         if not sensors:
@@ -2081,10 +2051,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_replay_pause.setEnabled(False)
         results = []
         for sensor in sensors:
-            result = self.sensor_controller.stopBinReplay(sensor)
-            results.append(result)
-            self._app_log(f"User: stop replay -> {result}",
-                          "I" if result == "OK" else "W", sensor)
+            r = self.sensor_controller.stopBinReplay(sensor)
+            results.append(r)
+            self._app_log(f"User: stop replay -> {r}",
+                          "I" if r == "OK" else "W", sensor)
         if all(r != "OK" for r in results):
             self.status_label.setText(f"Stop replay failed: {results[0]}")
             return
@@ -2092,8 +2062,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _on_replay_done(self, message: str):
         self._app_log(f"App: replay done: {message}")
-        # 回放结束：移除回放用的虚拟设备状态（成员级收尾可能已移除一部分），
-        # 恢复实时设备控件
         sensors = list(self._replay_sensors)
         if self._replay_sensor is not None and self._replay_sensor not in sensors:
             sensors.append(self._replay_sensor)
@@ -2106,21 +2074,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._refresh_display_for_state(None)
         self.status_label.setText(message)
         self.btn_replay.setEnabled(True)
-        self.btn_multi_replay.setEnabled(True)
         self.btn_replay_pause.setEnabled(False)
         self.btn_replay_pause.setText("Pause Replay")
         self.btn_replay_stop.setEnabled(False)
         self._set_replay_mode_ui(False)
         self._replay_paused = False
         self._replay_stop_requested = False
-        # 回放未成功启动时不会有数据流事件，这里兜底复位
         self._replay_active = False
+        self._replay_paths = []
+        self._replay_multi_counts = None
 
-    # ── Bin 文件离线解析 ──────────────────────────────────────────────────────
+    # -- Bin analyze -----------------------------------------------------------------
 
     def _analyze_bin_file(self):
-        """选择 bin 文件并在同目录解析为 CSV，完成后用系统默认编辑器打开。"""
-        if getattr(self, "_analyze_thread", None) is not None and self._analyze_thread.is_alive():
+        if getattr(self, "_analyze_busy", False):
             return
         default_dir = Path.home() / "Documents" / "sensorsdklog"
         start_dir = str(default_dir) if default_dir.exists() else str(Path.home())
@@ -2129,20 +2096,26 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         )
         if not path:
             return
+        self._start_analyze(path)
 
+    def _start_analyze(self, path: str):
         self._app_log(f"User: analyze bin file: {path}")
+        self._analyze_busy = True
         self.btn_analyze.setEnabled(False)
         self.status_label.setText(f"Analyzing: {Path(path).name} ...")
 
-        def _do_analyze():
+        def work():
             try:
-                csv_path = self.sensor_controller.parseBinToCsv(path)
-                self.analyze_done_sig.emit(csv_path, "")
+                result = self.sensor_controller.parseBinToCsv(path)
             except Exception as e:
-                self.analyze_done_sig.emit("", str(e))
+                result = f"Error: {e}"
+            self._analyze_busy = False
+            if result.startswith("Error"):
+                self.analyze_done_sig.emit("", result)
+            else:
+                self.analyze_done_sig.emit(result, "")
 
-        self._analyze_thread = threading.Thread(target=_do_analyze, daemon=True, name="BinAnalyze")
-        self._analyze_thread.start()
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_analyze_done(self, csv_path: str, error: str):
         self.btn_analyze.setEnabled(True)
@@ -2156,7 +2129,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     @staticmethod
     def _open_in_system_editor(path: str):
-        """用系统默认应用打开文件（macOS open / Windows startfile / Linux xdg-open）。"""
         try:
             if sys.platform == "darwin":
                 subprocess.Popen(["open", path])
@@ -2167,76 +2139,53 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         except Exception:
             pass
 
-    # ── Data Routing ──────────────────────────────────────────────────────────
+    # -- Data routing ------------------------------------------------------------------
 
     def _on_data(self, sensor: SensorProfile, data_list: list):
-        """SDK 数据回调（回调线程）：一批 SensorData 列表一次性交付。
-
-        实时滤波一律在本回调线程完成（queue 模式下也在入队前）；之后
-        direct 模式（Use Queue Data 未勾选）内联分发处理，queue 模式
-        clone 入队、由数据 worker 线程分发。缓冲区写入有各缓冲区锁保护，
-        Qt 界面更新经信号/状态锁。
-        """
         addr = sensor.BLEDevice.Address
         state = self.device_states.get(addr)
         if state is None:
             return
         use_clone = self._use_clone_data
         for data in data_list:
-            if not (data and data.channelSamples):
+            if data is None or data.channelCount == 0 or data.sampleCount == 0:
                 continue
-            # 实际采样率收集：覆盖所有收到的数据类型
             state.note_data_received(data)
-            # 实时滤波频段懒同步：UI 切换后下个数据批把新频段带到回调线程
-            # （引用比较即可——切换时 _filter_band 整体替换，identity 必然变化）
-            if state.live_filter_band is not self._filter_band:
-                state.set_live_filter_band(self._filter_band)
-            # 实时滤波必须在 onData 中完成：queue 模式入队的数据已是滤波结果
-            state.filter_sensor_data(data)
-            if use_clone:
-                # 回调返回后 SDK 对象池会复用这批 SensorData，入队必须深拷贝
-                self._enqueue_data(addr, data.clone())
-            else:
-                # 回调返回后 SDK 对象池会复用这批 SensorData，处理必须要快,否则会丢数据,表现为isDataValid()返回False
-                self._enqueue_data(addr, data) 
+            self._enqueue_data(addr, data.clone() if use_clone else data)
 
     def _dispatch_sensor_data(self, addr: str, data: SensorData):
-        """单批数据的分发处理（写环形缓冲/丢包统计/四元数/手势）：
-        queue 模式由数据 worker 线程调用。"""
         state = self.device_states.get(addr)
         if state is None:
             return
         if not data.isDataValid():
-            self._app_log(f"App: Your data process runs too slow: {data}", "W", data.getDeviceName())
+            self._app_log("App: Your data process runs too slow", "W", state.sensor)
             return
+        if state.live_filter_band is not self._filter_band:
+            state.set_live_filter_band(self._filter_band)
 
-        #获得数据批的绝对时间戳（秒为单位），用于计算数据批间隔、绘图横轴等,与LSL标准相同
-        LSLTimeStamp = data.getAbsTimeStampInSec(0,0)
-        
-        if data.getDataType() == DataType.NTF_IMU:
-            # 新 EMG 设备的 IMU 聚合批：拆成四路独立批走原有分发/显示路径
+        # Batch absolute timestamp (LSL)
+        lsl_timestamp = data.getAbsTimeStampInSec(0, 0)
+
+        if data.dataType == DataType.NTF_IMU:
             for sub in split_imu_aggregate(data):
-                if sub.getDataType() in state.buffers:
+                if sub.dataType in state.buffers:
                     self._append_sensor_data(addr, sub)
-                if sub.getDataType() == DataType.NTF_QUATERNION:
+                if sub.dataType == DataType.NTF_QUATERNION:
                     self._update_quaternion(state, sub)
             return
-        if (data.getDataType() in state.buffers
-                or data.getDataType() in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH,
-                                          DataType.NTF_EMG, DataType.NTF_MAG_ANGLE_DATA)
-                or (state.bio_buffers and data.getDataType() in state.bio_buffers)):
+        if (data.dataType in state.buffers
+                or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH,
+                                     DataType.NTF_EMG, DataType.NTF_MAG_ANGLE_DATA)
+                or (state.bio_buffers and data.dataType in state.bio_buffers)):
             self._append_sensor_data(addr, data)
-        if data.getDataType() == DataType.NTF_QUATERNION:
+        if data.dataType == DataType.NTF_QUATERNION:
             self._update_quaternion(state, data)
-        if data.getDataType() == DataType.NTF_GEST:
+        if data.dataType == DataType.NTF_GEST:
             self._handle_gesture_data(addr, data)
 
-    # queue 模式数据队列上限：消费跟不上时丢最旧的批次，避免内存无界增长
-    # （对齐 C++ Qt demo 的 1000 批上限）
     DATA_QUEUE_MAX_BATCHES = 1000
 
     def _enqueue_data(self, addr: str, data: SensorData):
-        """queue 模式入队（onData 回调线程）：有界队列，满了丢最旧。"""
         with self._data_queue_lock:
             while len(self._data_queue) >= self.DATA_QUEUE_MAX_BATCHES:
                 self._data_queue.popleft()
@@ -2244,8 +2193,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._data_queue_event.set()
 
     def _drain_data_queue(self):
-        """数据 worker 线程：批量取出队列数据并分发到显示缓冲；
-        收到停止标记且队列排空后退出。"""
         while True:
             self._data_queue_event.wait()
             with self._data_queue_lock:
@@ -2262,19 +2209,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 return
 
     def _append_sensor_data(self, addr: str, data: SensorData):
-        """丢包统计上报 + 写环形缓冲区（append_data 内部有各缓冲区锁）。"""
         state = self.device_states.get(addr)
         if state is None:
             return
-        if data.getLostPackageCount() > 0:
-            type_name = DataType(data.getDataType()).name if data.getDataType() is not None else "Unknown"
-            self.lost_packet_signal.emit(addr, type_name, data.getLostPackageCount())
+        if data.lostPackageCount > 0:
+            dt = data.dataType
+            type_name = dt.name if isinstance(dt, DataType) else "Unknown"
+            self.lost_packet_signal.emit(addr, type_name, data.lostPackageCount)
         state.append_data(data)
 
     def closeEvent(self, event):
         self._app_log("App: demo window closing")
         self.timer.stop()
-        # 停数据 worker：置停止标记并唤醒，等其排空队列后退出
         self._data_worker_stop = True
         self._data_queue_event.set()
         self._data_worker.join(timeout=2)
@@ -2288,7 +2234,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             print(f"[closeEvent] terminate error: {e}")
         event.accept()
 
-    # ── Bottom-left 2D Waveform ───────────────────────────────────────────────
+    # -- Bottom-left 2D waveform -----------------------------------------------------
 
     def _on_type_changed(self, _):
         self.active_data_type = self.type_combo.currentData()
@@ -2350,7 +2296,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.ax_2d.set_ylabel("Value")
         self.ax_2d.legend(loc="upper right")
 
-        # 频谱子图：通道线与波形一致，数据由工作线程 FFT 闭包的结果异步填充
         self.ax_fft.cla()
         self.fft_lines = []
         for line in self.lines_2d:
@@ -2363,21 +2308,19 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.ax_fft.legend(loc="upper right")
         self.canvas_2d.draw_idle()
 
-    # ── FFT 频谱（工作线程闭包计算，信号回 UI 线程更新）─────────────────────────
+    # -- FFT spectrum -------------------------------------------------------------------
 
     def _submit_fft(self, dt, sample_rate: int, buf_snapshot):
-        """UI 线程调用：把 FFT 计算连同数据快照打包成闭包提交到工作线程，
-        计算不占用 UI 线程；快照为已按时间序重排的副本，闭包运行期间不被改写。"""
         self._fft_pending = True
 
         def _compute_fft():
             try:
-                # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
                 window = np.hanning(buf_snapshot.shape[1])
                 windowed = buf_snapshot * window
                 mags = np.abs(np.fft.rfft(windowed, axis=1)) / max(window.sum(), 1e-12) * 2
                 freqs = np.fft.rfftfreq(buf_snapshot.shape[1], d=1.0 / sample_rate)
-                self.fft_done_sig.emit(int(dt), freqs, mags)
+                with self._fft_result_lock:
+                    self._fft_result = (int(dt), freqs, mags)
             except Exception as e:
                 print(f"[FFT] compute error: {e}")
             finally:
@@ -2386,12 +2329,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         try:
             self._fft_executor.submit(_compute_fft)
         except RuntimeError:
-            # 窗口关闭后执行器已 shutdown，退出途中的最后一次定时器触发
             self._fft_pending = False
 
-    def _on_fft_done(self, dt_value: int, freqs, mags):
-        """工作线程 FFT 结果（经 fft_done_sig 回到 UI 线程）：刷新频谱子图。
-        期间用户可能已切换数据类型，类型不匹配的结果直接丢弃。"""
+    def _poll_fft_results(self):
+        result = None
+        bio_result = None
+        with self._fft_result_lock:
+            result, self._fft_result = self._fft_result, None
+            bio_result, self._bio_fft_result = self._bio_fft_result, None
+        if result is not None:
+            self._apply_fft_result(*result)
+        if bio_result is not None:
+            self._apply_bio_fft_result(*bio_result)
+
+    def _apply_fft_result(self, dt_value: int, freqs, mags):
         if dt_value != int(self.active_data_type) or not self.fft_lines:
             return
         for ch, line in enumerate(self.fft_lines):
@@ -2404,10 +2355,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.canvas_2d.draw_idle()
 
     def _submit_bio_fft(self, dt, row_specs):
-        """右侧生物电每行频谱：row_specs 为 [(行号, 已按时间序重排的 1-D 波形快照,
-        采样率), ...]，各行采样率可不同（ECG/PPG 行与 EEG 行混排）。
-        打包成闭包提交到工作线程（与 2D FFT 共用同一个单线程执行器，任务串行执行），
-        计算不占用 UI 线程；结果（按行号索引的字典）经 bio_fft_done_sig 回 UI 线程。"""
+        # row_specs: [(row, time-ordered 1-D snapshot, sample_rate), ...]
         self._bio_fft_pending = True
 
         def _compute_bio_fft():
@@ -2417,12 +2365,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for row, data, sr in row_specs:
                     if sr <= 0 or data.size == 0:
                         continue
-                    # Hann 窗抑制频谱泄漏，幅值按窗增益归一化（峰值≈真实幅值）
                     window = np.hanning(data.size)
                     windowed = data * window
                     mags_map[row] = np.abs(np.fft.rfft(windowed)) / max(window.sum(), 1e-12) * 2
                     freqs_map[row] = np.fft.rfftfreq(data.size, d=1.0 / sr)
-                self.bio_fft_done_sig.emit(int(dt), freqs_map, mags_map)
+                with self._fft_result_lock:
+                    self._bio_fft_result = (int(dt), freqs_map, mags_map)
             except Exception as e:
                 print(f"[FFT] bio compute error: {e}")
             finally:
@@ -2431,13 +2379,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         try:
             self._fft_executor.submit(_compute_bio_fft)
         except RuntimeError:
-            # 窗口关闭后执行器已 shutdown，退出途中的最后一次定时器触发
             self._bio_fft_pending = False
 
-    def _on_bio_fft_done(self, dt_value: int, freqs_map, mags_map):
-        """工作线程生物电 FFT 结果（经 bio_fft_done_sig 回到 UI 线程）：
-        按行号刷新各行左侧的频谱子图。结果到达期间显示模式可能已切换
-        （EMG↔EEG↔PPG、翻页），类型或行号不匹配的结果直接丢弃。"""
+    def _apply_bio_fft_result(self, dt_value: int, freqs_map, mags_map):
         state = self._current_state()
         expected = DataType.NTF_EEG
         if state is not None:
@@ -2465,7 +2409,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if updated:
             self.canvas_eeg.draw_idle()
 
-    # ── Right-side EMG / EEG (+ ECG + BRTH + MAG_ANGLE) Waveform ───────────────
+    # -- Right-side EMG / EEG (+ ECG + BRTH + Angle) waveform ---------------------------
 
     def _eeg_page_count(self) -> int:
         state = self._current_state()
@@ -2518,13 +2462,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._update_page_buttons()
 
     def _reset_eeg_axes(self, count: int, fft_rows=None):
-        """按显示模式重建右侧共享图表的子图。
-        fft_rows 为 None：单列布局，每行一个通宽波形子图；
-        否则 fft_rows 为「左 FFT 频谱 + 右时域波形」各 50% 宽度的行号集合
-        （EEG/EMG 模式的通道行、EEG 页的 ECG/MAG_ANGLE 行、EMG 页的 MAG_ANGLE 行、
-        PPG 页的 EEG/PPG 行），
-        其余行（BRTH/SpO2/未用）为通宽波形。
-        布局签名与当前一致时不做任何事，否则清空 figure 重新创建。"""
+        # fft_rows: rows with a left FFT spectrum + right waveform split;
+        # None = all rows full-width
         signature = (count, None if fft_rows is None else tuple(sorted(fft_rows)))
         if self._eeg_axes_signature == signature:
             return
@@ -2643,7 +2582,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         bio_title = "EEG + ECG + BRTH Waveform"
         if mag_angle_available:
-            bio_title = "EEG + ECG + BRTH + MAG_ANGLE Waveform"
+            bio_title = "EEG + ECG + BRTH + Angle Waveform"
         self.bio_title_label.setText(bio_title)
         self.emg_lines = []
         self.bio_lines = []
@@ -2665,13 +2604,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         page_eeg_count = max(0, end_ch - start_ch)
         self._eeg_display_channels = page_eeg_count
 
-        # 额外行从底部向上分配：BRTH 最后一行，ECG 其上，MAG_ANGLE 再上
+        # Extra rows are assigned from the bottom up: BRTH last, ECG above it, Angle above that
         brth_axis_index = EEG_AXIS_COUNT - 1 if brth_available else None
         ecg_axis_index = EEG_AXIS_COUNT - 1 - int(brth_available) if ecg_available else None
         mag_angle_axis_index = (EEG_AXIS_COUNT - 1 - int(brth_available) - int(ecg_available)
                                 if mag_angle_available else None)
 
-        # EEG 通道行与 ECG/MAG_ANGLE 行：左 50% FFT 频谱 + 右 50% 时域波形；BRTH/未用行通宽
+        # EEG channel rows and the ECG/Angle rows get the left FFT + right waveform split
         fft_rows = set(range(page_eeg_count))
         if ecg_axis_index is not None:
             fft_rows.add(ecg_axis_index)
@@ -2703,7 +2642,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
-                # 左半：该通道的 FFT 频谱子图（数据由工作线程结果异步填充）
                 fax = self.axes_bio_fft[ch]
                 if fax is not None:
                     fax.cla()
@@ -2727,7 +2665,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
-                # 左半：ECG 的 FFT 频谱子图（数据由工作线程结果异步填充）
                 fax = self.axes_bio_fft[ch]
                 if fax is not None:
                     fax.cla()
@@ -2747,19 +2684,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
                 ax.set_ylim(0, 180)
-                ax.set_ylabel("MAG_ANGLE", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("Angle", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
-                # 左半：MAG_ANGLE 的 FFT 频谱子图（数据由工作线程结果异步填充）
                 fax = self.axes_bio_fft[ch]
                 if fax is not None:
                     fax.cla()
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("MAG_ANGLE", fontsize=8, color=color,
+                    fax.set_ylabel("Angle", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2788,10 +2724,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.canvas_eeg.draw_idle()
 
     def _rebuild_emg_plot(self, state: DeviceDataState):
-        """EMG 设备的右侧显示区：复用 EEG 的 8 行子图区，显示 EMG 通道（不分页），
-        每个通道行左 50% 为 FFT 频谱、右 50% 为时域波形；有磁角度流时
-        MAG_ANGLE 行（同样左 FFT 右波形）紧跟 EMG 通道行之后，无 EMG 的纯
-        磁角度设备（ORehabArm/ORehabLeg）只显示 MAG_ANGLE 行。"""
         emg_available = False
         emg_buffer_copy = None
         emg_idx_buf_copy = None
@@ -2848,8 +2780,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
 
         self.bio_title_label.setText(
-            "EMG + MAG_ANGLE Waveform" if emg_available and mag_angle_available
-            else ("EMG Waveform" if emg_available else "MAG_ANGLE Waveform"))
+            "EMG + Angle Waveform" if emg_available and mag_angle_available
+            else ("EMG Waveform" if emg_available else "Angle Waveform"))
         if emg_available:
             self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
         if mag_angle_available:
@@ -2858,7 +2790,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if display_channels == 0 and emg_available:
             display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT - int(mag_angle_available))
 
-        # 每个 EMG 通道行与 MAG_ANGLE 行：左 50% FFT 频谱 + 右 50% 时域波形
+        # EMG channel rows and the Angle row get the left FFT + right waveform split
         fft_rows = set(range(display_channels))
         if mag_angle_available:
             fft_rows.add(display_channels)
@@ -2884,7 +2816,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
-                # 左半：该通道的 FFT 频谱子图（数据由工作线程结果异步填充）
                 fax = self.axes_bio_fft[ch]
                 if fax is not None:
                     fax.cla()
@@ -2904,19 +2835,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
                 ax.set_ylim(0, 180)
-                ax.set_ylabel("MAG_ANGLE", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("Angle", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
                 ax.set_visible(True)
-                # 左半：MAG_ANGLE 的 FFT 频谱子图（数据由工作线程结果异步填充）
                 fax = self.axes_bio_fft[ch]
                 if fax is not None:
                     fax.cla()
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("MAG_ANGLE", fontsize=8, color=color,
+                    fax.set_ylabel("Angle", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2932,9 +2862,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.canvas_eeg.draw_idle()
 
     def _rebuild_ppg_plot(self, state: DeviceDataState):
-        """PPG 设备的右侧显示区：6 行（2×EEG fp1/fp2 + 2×PPG red/ir + 2×SpO2），
-        EEG/PPG 行左 50% 为 FFT 频谱、右 50% 为时域波形；SpO2/heart_rate 为
-        低频派生量，保持通宽波形不做 FFT。"""
+        # EEG fp1/fp2 and PPG red/ir rows get the left FFT + right waveform split
         fft_rows = {i for i, (dt, _, _, _) in enumerate(BIO_PLOT_CONFIG)
                     if dt in (DataType.NTF_EEG, DataType.NTF_PPG)}
         self._reset_eeg_axes(PPG_AXIS_COUNT, fft_rows)
@@ -2949,14 +2877,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 idx_buf = state.bio_sample_index_buffers.get(dt)
                 if buf is not None and idx_buf is not None:
                     buf_idx = state.bio_buffer_indices.get(dt, 0)
-                    # Reassemble the circular buffer into chronological order for plotting.
                     buffers_copy[dt] = np.roll(buf.copy(), -buf_idx, axis=1)
                     idx_buffers_copy[dt] = idx_buf.copy()
                     has_any_data = True
         finally:
             state.bio_buffer_lock.unlock()
 
-        # PPG 布局不使用 EEG 分页与 EMG/MAG_ANGLE 线条，全部置空
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
@@ -3005,7 +2931,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             ax.yaxis.set_label_position("right")
             for spine in ax.spines.values():
                 spine.set_color(color)
-            # 左半：该行的 FFT 频谱子图（数据由工作线程结果异步填充）
             fax = self.axes_bio_fft[plot_idx]
             if fax is not None:
                 fax.cla()
@@ -3025,7 +2950,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
 
-    # ── 3D Quaternion ─────────────────────────────────────────────────────────
+    # -- 3D quaternion -----------------------------------------------------------------------
 
     def _setup_3d_plot(self):
         self.ax_3d.clear()
@@ -3102,32 +3027,28 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _update_quaternion(self, state: DeviceDataState, data: SensorData):
         try:
-            if data.getDataType() == DataType.NTF_QUATERNION:
-                if len(data.channelSamples) == 4 and len(data.channelSamples[0]) > 0:
-                    quaternion = [
-                        data.channelSamples[0][0].data,
-                        data.channelSamples[1][0].data,
-                        data.channelSamples[2][0].data,
-                        data.channelSamples[3][0].data,
-                    ]
+            if data.dataType == DataType.NTF_QUATERNION:
+                if data.channelCount == 4 and data.sampleCount > 0:
+                    quaternion = [data.getData(ch, 0) for ch in range(4)]
                     state.quaternion_lock.lock()
                     state.quaternion = quaternion
                     state.quaternion_lock.unlock()
         except Exception as e:
             print(f"Quaternion update exception: {e}")
 
-    # ── Periodic Refresh ──────────────────────────────────────────────────────
+    # -- Periodic refresh -----------------------------------------------------------------
 
     def _update_plots(self):
         if self.windowState() & QtCore.Qt.WindowMinimized:
             return
 
+        self._poll_fft_results()
+        self._refresh_sdk_label()
+
         state = self._current_state()
         if state is None:
             return
 
-        # 实测采样率的统计与结算已在 SDK 回调线程（note_data_received）完成，
-        # 这里每秒只清停流后的过期显示并刷新两行状态文本
         now = time.time()
         if now - self._rate_last_refresh >= 1.0:
             self._rate_last_refresh = now
@@ -3155,9 +3076,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             current_last_idx = int(idx_buf_copy.max())
             last_plotted_idx = self._last_plotted_sample_indices.get(dt, -1)
             if current_last_idx != last_plotted_idx:
-                # Reassemble the circular buffer once for all channels.
                 buf_copy = np.roll(buf_copy, -buffer_index, axis=1)
-                # FFT 频谱：重排后的快照打包成闭包提交工作线程，结果经信号回 UI 线程
                 now_fft = time.time()
                 if (not self._fft_pending
                         and now_fft - self._fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3183,7 +3102,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     mn, mx = all_data.min(), all_data.max()
                     margin = max((mx - mn) * 0.1, 0.01)
                     new_ylim = (mn - margin, mx + margin)
-                    # Avoid tiny y-limit changes that force a full redraw.
                     cur_ylim = self.ax_2d.get_ylim()
                     y_range = cur_ylim[1] - cur_ylim[0]
                     if (abs(new_ylim[0] - cur_ylim[0]) > 0.05 * y_range or
@@ -3192,8 +3110,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.canvas_2d.draw_idle()
                 self._last_plotted_sample_indices[dt] = current_last_idx
 
-        # PPG 设备：右侧 6 子图（EEG fp1/fp2 + PPG + SpO2）按 BIO_PLOT_CONFIG 逐条刷新；
-        # 下方 EEG/ECG/BRTH/EMG 分支在 ppg 模式下线条均为空，自动跳过
+        # PPG mode: refresh the fixed 6 plots
         if state.bio_kind == "ppg":
             state.bio_buffer_lock.lock()
             try:
@@ -3205,7 +3122,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     idx_buf = state.bio_sample_index_buffers.get(dt)
                     if buf is not None and idx_buf is not None:
                         buf_idx = state.bio_buffer_indices.get(dt, 0)
-                        # Reassemble the circular buffer into chronological order for plotting.
                         bio_buffers_copy[dt] = np.roll(buf.copy(), -buf_idx, axis=1)
                         bio_idx_buffers_copy[dt] = idx_buf.copy()
                         if dt in state.bio_impedance:
@@ -3252,7 +3168,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 else:
                                     imp_color = "red"
                                 ax.set_ylabel(
-                                    f"{title}\n{current_impedance:.2f} KΩ",
+                                    f"{title}\n{current_impedance:.2f} KOhm",
                                     fontsize=8, color=imp_color, rotation=0,
                                     va='center', ha='left', labelpad=10
                                 )
@@ -3269,8 +3185,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 va='center', ha='left', labelpad=10
                             )
 
-                # EEG/PPG 行 FFT：重排后的快照按行（各行采样率可不同）提交
-                # 工作线程，结果经信号异步回填
+                # Per-row FFT snapshots for the EEG/PPG rows
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3278,8 +3193,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     for plot_idx, (dt, ch_idx, _title, _color) in enumerate(BIO_PLOT_CONFIG):
                         if dt not in (DataType.NTF_EEG, DataType.NTF_PPG):
                             continue
-                        buf_copy = bio_buffers_copy.get(dt)
-                        if buf_copy is None or ch_idx >= buf_copy.shape[0]:
+                        fft_buf_copy = bio_buffers_copy.get(dt)
+                        if fft_buf_copy is None or ch_idx >= fft_buf_copy.shape[0]:
                             continue
                         if (plot_idx >= len(self.bio_fft_lines)
                                 or self.bio_fft_lines[plot_idx] is None):
@@ -3287,7 +3202,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         sr = state.bio_sample_rates.get(dt) or state.nominal_rates.get(dt) or 0
                         if sr <= 0:
                             continue
-                        row_specs.append((plot_idx, buf_copy[ch_idx], sr))
+                        row_specs.append((plot_idx, fft_buf_copy[ch_idx], sr))
                     if row_specs:
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(DataType.NTF_PPG, row_specs)
@@ -3345,8 +3260,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         brth_axis_index = len(self.axes_eeg) - 1 if state.has_brth else None
         ecg_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) if state.has_ecg else None
-        # MAG_ANGLE 行号与重建时一致：EMG 布局紧跟 EMG 通道行，
-        # EEG 布局在 ECG/BRTH 之上（PPG 固定 6 行布局无此行）
+        # Angle row matches the rebuild layout: after the EMG channel rows
+        # in EMG mode, above ECG/BRTH in EEG mode (no row in PPG mode)
         if not state.has_mag_angle or state.bio_kind == "ppg":
             mag_angle_axis_index = None
         elif state.bio_kind == "emg":
@@ -3387,14 +3302,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         else:
                             color = "red"
                         ax.set_ylabel(
-                            f"EEG-{eeg_ch + 1}\n{current_impedance:.2f} KΩ",
+                            f"EEG-{eeg_ch + 1}\n{current_impedance:.2f} KOhm",
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
 
-                # 每行 FFT（EEG 本页通道 + ECG/MAG_ANGLE 行）：重排后的快照提交
-                # 工作线程，结果经信号异步回填
+                # Per-row FFT snapshots for this EEG page and the ECG/Angle rows
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3476,7 +3390,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     else:
                         color = "red"
                     ax.set_ylabel(
-                        f"ECG\n{current_impedance:.2f} KΩ",
+                        f"ECG\n{current_impedance:.2f} KOhm",
                         fontsize=8, color=color, rotation=0,
                         va='center', ha='left', labelpad=10
                     )
@@ -3528,14 +3442,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         else:
                             color = "red"
                         ax.set_ylabel(
-                            f"EMG-{ch + 1}\n{current_impedance:.2f} KΩ",
+                            f"EMG-{ch + 1}\n{current_impedance:.2f} KOhm",
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
 
-                # 每通道 FFT：显示通道（含 MAG_ANGLE 行）重排后的快照提交工作线程，
-                # 结果经信号异步回填
+                # Per-channel FFT snapshots for the displayed EMG channels and the Angle row
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3575,9 +3488,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = current_last_idx
 
-                # MAG_ANGLE 行 FFT：本轮 EEG/EMG 主块已提交过（_bio_fft_pending 置位，
-                # 行快照已随其 row_specs 一起提交）时跳过；主块本轮未更新（或纯磁角度
-                # 设备无 EMG 行）时在这里单独提交本行
+                # Angle row FFT, submitted here when the EEG/EMG block above
+                # did not submit this round (its row specs already include this row)
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
@@ -3608,11 +3520,34 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         except Exception as e:
             print(f"3D update exception: {e}")
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def _refresh_sdk_label(self):
+        now = time.time()
+        if self._backend_query_pending or now - self._backend_query_ms < 1.0:
+            return
+        self._backend_query_pending = True
+        self._backend_query_ms = now
+
+        def work():
+            try:
+                result = str(self.sensor_controller.getParam("BACK_END"))
+            except Exception as e:
+                result = f"Error: {e}"
+
+            def apply():
+                self._backend_query_pending = False
+                if not result or result.startswith("Error") or result == self._shown_backend:
+                    return
+                self._shown_backend = result
+                self.sdk_label.setText(
+                    f"SDK: {self.sensor_controller.getVersion()} | Backend: {result}")
+
+            self._ui(apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- Callbacks ---------------------------------------------------------------------------
 
     def _app_log(self, message: str, level: str = "I", sensor=None):
-        """把一条应用事件写进 SDK 日志：给定（或当前显示）设备时进其 profile
-        日志，否则进 controller 日志——与 SDK 内部日志共用同一时间线。"""
         target = sensor if sensor is not None else self.current_sensor
         if target is not None:
             target.log(message, level)
@@ -3624,39 +3559,40 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if state == DeviceStateEx.Disconnected:
             self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
-    def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer) -> None:
-        """onAutoReconnect 回调（SDK 恢复线程）：自动重连找回设备时，
-        等效于按下 Connect 按钮——转到 UI 线程执行完整连接流程。
-        restore=True 时流程结束后回放上次会话的参数（保留和恢复原有设置）。
-        异步应答 answer(True) 表示由本流程接管（SDK 不再执行默认的参数回放恢复）。"""
+    def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer):
         sensor.log(f"App: auto reconnect callback received, restore={restore}")
         self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
+        submit(self._auto_reconnect_recovery, sensor.BLEDevice.Address, restore)
+        self._app_log("App: auto reconnect recovery submitted via sensor.submit", sensor=sensor)
         answer(True)
 
-    def _press_connect_for_address(self, addr: str, restore: bool = True):
-        """在设备列表中选中该地址，并执行与按下 Connect 按钮完全相同的流程。
-        restore=True 时，流程结束后把上次会话的 setParam 参数回放一遍。"""
-        # 流程开始先快照上次会话参数（排除 demo 自管的 DEBUG 日志参数）
+    def _auto_reconnect_recovery(self, addr: str, restore: bool):
         sensor = self.sensor_controller.getSensor(addr)
-        saved = {}
-        if restore and sensor is not None:
-            saved = {k: v for k, v in (sensor._saved_params or {}).items()
-                     if k not in ("DEBUG_LOG_PATH", "DEBUG_BLE_DATA_PATH")}
-        for i in range(self.device_list.count()):
-            item = self.device_list.item(i)
-            if f"Address: {addr}" in item.text():
-                self.device_list.setCurrentItem(item)
-                break
-        self._connect_selected_device()
-        # 回放上次会话参数，恢复原有设置
+        if sensor is None:
+            self._app_log(f"App: auto reconnect recovery failed, unknown device: {addr}", "E")
+            return
+        device = sensor.BLEDevice
+        self._connect_device(device, self._auto_reconnect_enabled, select_current=True)
+        saved = dict(self._saved_params_by_addr.get(addr, {})) if restore else {}
         if saved and addr in self.device_states:
             sensor = self.device_states[addr].sensor
             for key, value in saved.items():
                 result = sensor.setParam(key, value)
                 print(f"[AutoReconnect] restore setParam({key}, {value}) -> {result}")
                 sensor.log(f"App: restore setParam({key}, {value}) -> {result}")
-            # 参数回放后同步复选框显示
-            self._refresh_control_states(sensor)
+            self._ui(lambda: self._refresh_control_states(sensor))
+
+    def _press_connect_for_address(self, addr: str, restore: bool = True):
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            if f"Address: {addr}" in item.text():
+                self.device_list.setCurrentItem(item)
+                break
+
+    def _record_saved_param(self, sensor: SensorProfile, key: str, value: str, result: str):
+        if sensor is None or str(result).startswith("Error"):
+            return
+        self._saved_params_by_addr.setdefault(sensor.BLEDevice.Address, {})[key] = value
 
     def _on_device_disconnected(self, addr: str):
         self._app_log(f"App: device disconnected, removed from UI: {addr}")
@@ -3683,12 +3619,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.lost_packet_label.setText("Packet Loss Stats: " + text)
 
     def _handle_gesture_data(self, addr: str, data: SensorData):
-        if not data.channelSamples:
+        if data.channelCount == 0 or data.sampleCount == 0:
             return
-        samples = data.channelSamples[0]
-        if not samples:
-            return
-        sample = samples[-1]
+        sample = data.getChannelSample(0, data.sampleCount - 1)
         gesture = int(sample.data)
         raw_gesture = int(sample.rawData)
         possiblity = int(sample.impedance)
@@ -3716,7 +3649,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.gesture_label.setText(self._gesture_text((gesture, raw_gesture, possiblity, strength)))
 
     def _on_power_changed(self, sensor: SensorProfile, power: int):
-        # SDK 回调线程：只做日志与信号转发，控件更新交给 GUI 线程（Qt 控件只允许在 GUI 线程访问）
         print(f"[Power] {sensor.BLEDevice.Name}: {power}%")
         self.power_changed_sig.emit(sensor, power)
 
@@ -3728,11 +3660,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     @staticmethod
     def _link_text(info: Optional[DeviceInfo]) -> str:
+        backend = getattr(info, "Backend", "") if info is not None else ""
+        backend_part = f" | backend {backend}" if backend else ""
         if info is None or info.PeripheralLatency < 0 or info.ConnectionIntervalMs <= 0:
-            return "Link: --"
+            return "Link: --" + backend_part
         return (f"Link: {info.ConnectionIntervalMs}ms / "
                 f"latency {info.PeripheralLatency} / "
-                f"timeout {info.SupervisionTimeoutMs}ms")
+                f"timeout {info.SupervisionTimeoutMs}ms") + backend_part
 
     @staticmethod
     def _mtu_text(info: Optional[DeviceInfo]) -> str:
@@ -3741,7 +3675,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         return f"MTU: {info.MTUSize}"
 
     def _update_link_info_display(self, sensor: SensorProfile, info: Optional[DeviceInfo] = None):
-        # info 由 onDeviceInfoUpdate 携带（回放 profile 未 init，getDeviceInfo() 返回 None）
         if info is None:
             info = sensor.getDeviceInfo()
         state = self.device_states.get(sensor.BLEDevice.Address)
@@ -3751,8 +3684,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 (label, ch, rate_map.get(dt) or sr, dt)
                 for label, ch, sr, dt in state.status_parts
             ]
-        # 采样率变更后重建生物电/IMU 缓冲（横轴时间窗才能与新速率一致），当前显示
-        # 设备还需重建图表线的 x 数据；非当前设备只重建缓冲，切换过去时会整体重画
         if state is not None and info is not None:
             if state.sync_bio_sample_rates(info) and self.current_sensor == sensor:
                 self._rebuild_eeg_plot()
@@ -3760,7 +3691,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if (imu_changed and self.current_sensor == sensor
                     and self.active_data_type in imu_changed):
                 self._rebuild_2d_plot()
-            # 单选框选中态跟随当前速率（回放等不经 _refresh_control_states 的路径）
             if info.EegSampleRate > 0:
                 rate = int(info.EegSampleRate)
                 options, cur = state.sample_rate_state
@@ -3797,6 +3727,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.rate_label.setText(state.build_rate_text())
 
     def _update_power_display(self, sensor: SensorProfile, power: int):
+        if power < 0:
+            return
         state = self.device_states.get(sensor.BLEDevice.Address)
         if state is not None:
             state.last_power = power
@@ -3804,23 +3736,19 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.power_label.setText(f"Power: {power}%")
 
     def _check_set_param_result(self, key: str, result: str) -> bool:
-        """检查 setParam 结果，若报错则弹出 QMessageBox。返回 True 表示成功。"""
         if str(result).startswith("Error"):
             QtWidgets.QMessageBox.warning(self, "Set Parameter Failed", f"Failed to set {key}:\n{result}")
             return False
         return True
 
     def _apply_sdk_debug_log(self):
-        # 开启时把日志目录设为 sensorsdklog 下以「当前时间戳_SDK版本」命名的
-        # 子目录：本次会话的 controller log、各设备 profile log 与 bin 导出
-        # 都归到该子目录（须在 setDebugEnabled(True) 之前设置）
         log_dir = os.path.join(
             str(Path.home() / "Documents" / "sensorsdklog"),
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.sensor_controller.getVersion().replace('.', '_')}",
         )
-        self.sensor_controller.setLogPath(True, log_dir)
-        print(f"[Debug Log] setLogPath -> {log_dir}")
-        self.sensor_controller.setDebugEnabled(True)
+        self.sensor_controller.setParam("LOG_PATH", log_dir)
+        print(f"[Debug Log] LOG_PATH -> {log_dir}")
+        self.sensor_controller.setParam("DEBUG_ENABLED", "True")
 
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -3829,7 +3757,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if enabled:
             self._apply_sdk_debug_log()
         else:
-            self.sensor_controller.setDebugEnabled(False)
+            self.sensor_controller.setParam("DEBUG_ENABLED", "False")
         value = "True" if enabled else "False"
         for sensor in self.sensor_controller.getConnectedSensors():
             if sensor.isReady and sensor.hasInited:
@@ -3837,6 +3765,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 print(f"[Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_LOG_PATH, {value}) -> {result}")
                 sensor.log(f"App: setParam(DEBUG_LOG_PATH, {value}) -> {result}")
                 self._check_set_param_result("DEBUG_LOG_PATH", result)
+
+    def _apply_dongle_debug(self):
+        value = "True" if self._dongle_debug_enabled else "False"
+        result = self.sensor_controller.setParam("BLE_TRACE_ENABLED", value)
+        print(f"[Dongle Debug] setParam(BLE_TRACE_ENABLED, {value}) -> {result}")
+
+    def _on_dongle_debug_toggled(self, state: int):
+        enabled = (state == QtCore.Qt.Checked)
+        self._app_log(f"User: dongle debug {'ON' if enabled else 'OFF'}")
+        self._dongle_debug_enabled = enabled
+        self._apply_dongle_debug()
 
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -3863,17 +3802,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = self.current_sensor.setParam(key, value)
         print(f"[NTF] setParam({key}, {value}) -> {result}")
         self._app_log(f"User: setParam({key}, {value}) -> {result}")
+        self._record_saved_param(self.current_sensor, key, value, result)
         if self._check_set_param_result(key, result):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
 
     def _refresh_control_states(self, sensor: SensorProfile):
-        """查询设备当前 NTF/FILTER 参数并缓存到对应设备状态；若为当前显示设备则同步刷新 UI。"""
         info = sensor.getDeviceInfo()
         channel_map = {
             "NTF_EMG":   info.EmgChannelCount if info else 0,
-            # 手势可用性看手势通道数而非 EMG 通道数：gForceDual/gForceDuo 有 EMG 但无
-            # 手势（EmgChannelCount>0 会误判），gForce200 有手势但无 EMG（会漏判）
             "NTF_GEST":  info.GestChannelCount if info else 0,
             "NTF_EEG":   info.EegChannelCount if info else 0,
             "NTF_ECG":   info.EcgChannelCount if info else 0,
@@ -4003,8 +3940,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             state.ppg_sample_rate_state = ppg_sample_rate_state
 
         if self.current_sensor == sensor:
-            # 无手势能力的设备（GestChannelCount=0，如 gForceDual/gForceDuo）隐藏手势面板；
-            # 设备信息不可用（None）时保持可见，与复选框的约定一致
             self.gesture_box.setVisible(info is None or info.GestChannelCount > 0)
             self._apply_control_states(ntf_states, filter_states, sample_rate_state,
                                        emg_sample_rate_state, imu_sample_rate_state,
@@ -4013,12 +3948,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _apply_control_states(self, ntf_states: dict, filter_states: dict, sample_rate_state: tuple = ([], 0),
                               emg_sample_rate_state: tuple = ([], 0), imu_sample_rate_state: tuple = ([], 0),
                               ppg_sample_rate_state: tuple = ([], 0)):
-        """把缓存的 NTF/FILTER 状态应用到 UI 复选框（不触发 setParam）；设备不支持的 NTF 选项直接隐藏。"""
         self._updating_ntf_controls = True
         try:
             for key, cb in self._ntf_checkboxes.items():
                 enabled, checked = ntf_states.get(key, (False, False))
-                # 无状态信息（未选设备/查询失败）时保持全部可见，仅置灰
                 cb.setVisible(enabled or not ntf_states)
                 cb.setEnabled(enabled)
                 cb.setChecked(checked)
@@ -4033,7 +3966,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         finally:
             self._updating_filter_controls = False
         options, current_rate = sample_rate_state
-        # 无可选采样率时整组隐藏（不占布局空间）；有选项时不可选的候选单选框也隐藏
+        # A group with no options is hidden entirely; an unsupported radio is hidden too
         self._sample_rate_group.setVisible(bool(options))
         self._updating_sample_rate_controls = True
         try:
@@ -4087,7 +4020,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._updating_ppg_sample_rate_controls = False
 
     def _set_sample_rate_checked(self, rate: int):
-        """仅更新采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
         self._updating_sample_rate_controls = True
         try:
             if rate not in self._sample_rate_radios:
@@ -4099,7 +4031,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._updating_sample_rate_controls = False
 
     def _set_emg_sample_rate_checked(self, rate: int):
-        """仅更新 EMG 采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
         self._updating_emg_sample_rate_controls = True
         try:
             if rate not in self._emg_sample_rate_radios:
@@ -4111,7 +4042,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._updating_emg_sample_rate_controls = False
 
     def _set_imu_sample_rate_checked(self, rate: int):
-        """仅更新 IMU 采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
         self._updating_imu_sample_rate_controls = True
         try:
             if rate not in self._imu_sample_rate_radios:
@@ -4123,7 +4053,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._updating_imu_sample_rate_controls = False
 
     def _set_ppg_sample_rate_checked(self, rate: int):
-        """仅更新 PPG 采样率单选框选中态（不触碰启用状态、不触发 setParam）。"""
         self._updating_ppg_sample_rate_controls = True
         try:
             if rate not in self._ppg_sample_rate_radios:
@@ -4135,8 +4064,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._updating_ppg_sample_rate_controls = False
 
     def _on_filter_combo_changed(self, _index: int):
-        """Live Filter 频段下拉框切换：更新选中项；各设备的回调线程滤波路径
-        在下个数据批懒同步（set_live_filter_band 会重置滤波器状态）。"""
         self._filter_band = self.filter_combo.currentData()
         self._app_log(f"User: live filter -> {self.filter_combo.currentText()}")
         for state in self.device_states.values():
@@ -4155,6 +4082,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = self.current_sensor.setParam(key, value)
         print(f"[Filter] setParam({key}, {value}) -> {result}")
         self._app_log(f"User: setParam({key}, {value}) -> {result}")
+        self._record_saved_param(self.current_sensor, key, value, result)
         if self._check_set_param_result(key, result):
             self._refresh_control_states(self.current_sensor)
             self._clear_ui_data()
@@ -4166,9 +4094,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if self._updating_sample_rate_controls:
             return
-        # 先把控件状态应用到用户选择（toggled 返回后单选组才完全定型），
-        # 再把速率设置投递回 UI 线程执行：setParam 走停流→设置→起流耗时较长，
-        # 在 toggled 里直接阻塞会卡住控件状态迁移
         self._set_sample_rate_checked(rate)
         QtCore.QTimer.singleShot(0, lambda r=rate: self._apply_sample_rate(r))
 
@@ -4181,6 +4106,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = sensor.setParam("EEG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(EEG_SAMPLE_RATE, {value}) -> {result}")
+        self._record_saved_param(sensor, "EEG_SAMPLE_RATE", value, result)
         self._check_set_param_result("EEG_SAMPLE_RATE", result)
         self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
@@ -4205,6 +4131,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = sensor.setParam("EMG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(EMG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(EMG_SAMPLE_RATE, {value}) -> {result}")
+        self._record_saved_param(sensor, "EMG_SAMPLE_RATE", value, result)
         self._check_set_param_result("EMG_SAMPLE_RATE", result)
         self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
@@ -4229,6 +4156,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = sensor.setParam("IMU_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(IMU_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(IMU_SAMPLE_RATE, {value}) -> {result}")
+        self._record_saved_param(sensor, "IMU_SAMPLE_RATE", value, result)
         self._check_set_param_result("IMU_SAMPLE_RATE", result)
         self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
@@ -4253,13 +4181,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         result = sensor.setParam("PPG_SAMPLE_RATE", value)
         print(f"[Sample Rate] setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
         self._app_log(f"User: setParam(PPG_SAMPLE_RATE, {value}) -> {result}")
+        self._record_saved_param(sensor, "PPG_SAMPLE_RATE", value, result)
         self._check_set_param_result("PPG_SAMPLE_RATE", result)
         self._refresh_control_states(sensor)
         if not str(result).startswith("Error"):
             self._clear_ui_data()
 
     def _refresh_display_for_state(self, state: Optional[DeviceDataState]):
-        """切换显示设备时，刷新设备信息、丢包统计、手势、开关状态与图表。"""
         self._last_plotted_sample_indices.clear()
         self._last_drawn_quaternion = None
 
@@ -4314,7 +4242,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._rebuild_eeg_plot()
 
     def _clear_ui_data(self):
-        """清除当前显示设备的数据缓冲区并重建图表，等待新数据。"""
         self._last_plotted_sample_indices.clear()
 
         state = self._current_state()
@@ -4326,8 +4253,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
 
 if __name__ == "__main__":
-    # PyInstaller 打包后，multiprocessing 子进程必须调用 freeze_support()
-    multiprocessing.freeze_support()
     app = QtWidgets.QApplication(sys.argv)
     window = IMUQuaternionEMGEEGDemo()
 
