@@ -19,8 +19,12 @@ MIT
 ## Installation
 
 ```sh
-pip install sensor-sdk 
+pip install sensor-sdk>=1.3.0
 ```
+
+Requires Python >= 3.10. One wheel per platform covers every supported
+Python version: Windows x64, Linux x86_64 / arm64 (manylinux_2_28), and
+macOS arm64.
 
 ### USB Bluetooth dongle (bumble backend)
 
@@ -28,9 +32,9 @@ When a compatible USB Bluetooth dongle is plugged in and usable, the SDK automat
 
 Behavior and controls:
 
-- With a usable dongle present, the backend is selected automatically when the SDK starts (the native OS stack is used otherwise). Check the active backend with `SensorController.getBLEBackendName()` (`"bumble"` / `"bleak"`).
-- `SensorController.checkSetupDongle()` checks dongle readiness and, when no dongle is usable, runs the bundled one-time setup (driver binding on Windows, permission setup on Linux, with an elevation prompt) and re-checks. It returns `"OK"` on success or an `"Error: ..."` string on failure, and blocks while waiting for the elevation prompt. macOS needs no setup. The same helper is also exported at package top level as `sensor.checkSetupDongle()`.
-- `SENSOR_SDK_BLE_BACKEND=bleak` forces the native backend; `SENSOR_SDK_BLE_BACKEND=bumble` forces the dongle backend.
+- With a usable dongle present, the backend is selected automatically when the SDK starts (the native OS stack is used otherwise). Check the active backend with `SensorController.getBLEBackendName()` — `"dongle"` when the USB dongle drives BLE, otherwise the OS-stack name (`"winrt"` on Windows, `"bluez"` on Linux, `"darwin"` on macOS).
+- `SensorController.checkSetupDongle()` checks dongle readiness and, when no dongle is usable, runs the bundled one-time setup (driver binding on Windows, permission setup on Linux, with an elevation prompt) and re-checks. It returns `"OK"` (or `"OK: N"` with the usable dongle count) on success or an `"Error: ..."` string on failure, and blocks while waiting for the elevation prompt. macOS needs no setup.
+- `SENSOR_SDK_BLE_BACKEND=dongle` forces the dongle backend; `SENSOR_SDK_BLE_BACKEND=winrt` (Windows) / `bluez` (Linux) / `darwin` (macOS) forces the native backend.
 
 ## 1. Permission
 
@@ -463,7 +467,7 @@ Please check console.py in examples directory
 
 All methods starting with `async` are async methods; they have the same params and return result as the sync methods:
 
-- `SensorController`: `asyncScan`, `asyncMultiStartDataNotification`, `asyncMultiStopDataNotification`
+- `SensorController`: `asyncScan`, `asyncMultiStartDataNotification`, `asyncMultiStopDataNotification`, `asyncGetParam`, `asyncSetParam`
 - `SensorProfile`: `asyncConnect`, `asyncDisconnect`, `asyncInit`, `asyncStartDataNotification`, `asyncStopDataNotification`, `asyncSetParam`, `asyncGetParam`, `asyncGetBatteryLevel`
 
 Please check async_console.py in examples directory
@@ -474,7 +478,7 @@ Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor
 
 The asynchronous variant is `asyncSetParam(self, key: str, value: str) -> str`.
 
-If the device is already streaming when you change an `NTF_*` or `FILTER_*` key, the SDK will stop and restart the data notification so the new setting takes effect immediately.
+If the device is already streaming when you change an `NTF_*` key, the SDK stops and restarts the data notification so the new setting takes effect immediately. `FILTER_*` keys are applied by the firmware on the fly — no stream restart. The `*_SAMPLE_RATE` keys stop the stream before the setting command and always restore it afterwards, whether the setting succeeded or failed.
 
 Below is available key and value:
 
@@ -510,6 +514,29 @@ result = sensorProfile.setParam("EEG_SAMPLE_RATE", "500")
 # getParam("EEG_SAMPLE_RATE_LIST")); an unsupported value returns
 # "Error: unsupported sample rate ...". While streaming, the stream is
 # restarted so the new rate takes effect.
+
+# EMG sample rate (new EMG devices only)
+result = sensorProfile.setParam("EMG_SAMPLE_RATE", "500")
+# Validated against getParam("EMG_SAMPLE_RATE_LIST"); command failure returns
+# "ERROR: set_emg_sample_rate fail".
+
+# IMU sample rate (only devices that report the extended IMU capability;
+# old firmware has a fixed 50 Hz and an empty IMU_SAMPLE_RATE_LIST)
+result = sensorProfile.setParam("IMU_SAMPLE_RATE", "100")
+
+# PPG sample rate (PPG devices only)
+result = sensorProfile.setParam("PPG_SAMPLE_RATE", "50")
+
+# EMG resolution (legacy RAW-signal EMG devices only; new EMG / envelope /
+# angle devices answer "Error: not supported ..." and EMG_RESOLUTION_LIST is
+# empty there). "8" or "12"; "12:<batch_len>" picks an explicit batch length,
+# plain "12" takes the largest payload for the negotiated MTU.
+result = sensorProfile.setParam("EMG_RESOLUTION", "12")
+
+# Flush the session's pending bin capture records and the SDK log queue to
+# disk (the same durability step the SDK runs when the app goes to
+# background). Answers "OK".
+result = sensorProfile.setParam("FLUSH_BLE_DATA", "")
 
 result = sensorProfile.setParam("FILTER_60HZ", "ON")
 # set 60Hz notch filter to ON or OFF, result is "OK" if succeed
@@ -565,9 +592,65 @@ result = sensorProfile.getParam("EEG_SAMPLE_RATE_LIST")
 # Returns the device-reported selectable sample rates (EEG/ECG bound, pipe-
 # separated), e.g. "250|500"; "Error: Not supported" when the device did not
 # report a capability
+
+# The same pair exists for the other stream families, each answering the
+# current rate and the pipe-separated option list ("0" / "Error: Not
+# supported" when the stream does not exist or the capability was never
+# reported):
+result = sensorProfile.getParam("EMG_SAMPLE_RATE")        # + EMG_SAMPLE_RATE_LIST
+result = sensorProfile.getParam("IMU_SAMPLE_RATE")        # + IMU_SAMPLE_RATE_LIST
+result = sensorProfile.getParam("PPG_SAMPLE_RATE")        # + PPG_SAMPLE_RATE_LIST
+
+# EMG resolution (legacy RAW-signal EMG devices only): the current resolution
+# in bits ("8" / "12") and the option list "8|12" (empty on devices without
+# the feature)
+result = sensorProfile.getParam("EMG_RESOLUTION")
+result = sensorProfile.getParam("EMG_RESOLUTION_LIST")
+
+# Session output paths: the current per-profile log / bin export path
+result = sensorProfile.getParam("DEBUG_LOG_PATH")
+result = sensorProfile.getParam("DEBUG_BLE_DATA_PATH")
 ```
 
 If the key is not supported, the result starts with `"Error"`.
+
+### Controller getParam / setParam
+
+The controller has its own device-independent parameter pair (async variants `asyncGetParam` / `asyncSetParam`):
+
+```python
+# Active BLE backend: getParam answers "dongle" when a USB dongle drives BLE,
+# otherwise the OS-stack name ("winrt" / "bluez" / "darwin" / ...).
+# setParam forces the selection like the SENSOR_SDK_BLE_BACKEND env var
+# ("auto" clears the override) and is accepted only while BLE is idle (not
+# scanning, no devices registered).
+value = SensorControllerInstance.getParam("BACK_END")
+result = SensorControllerInstance.setParam("BACK_END", "dongle")
+
+# SDK log switches (see the Logging controls section; setDebugEnabled /
+# setLogPath are thin wrappers over these). getParam answers "True"/"False"
+# for the booleans, the current log directory or "False" for LOG_PATH;
+# setParam takes "True"/"False" for the booleans, a directory / "True"
+# (default dir) / "False" (off) for LOG_PATH.
+result = SensorControllerInstance.setParam("DEBUG_ENABLED", "True")
+result = SensorControllerInstance.setParam("DATA_LOG_ENABLED", "True")
+result = SensorControllerInstance.setParam("LOG_PATH", "d:/temp/sdklogs")
+
+# Per-packet BLE trace logging of the dongle backends ("True"/"False",
+# default "False")
+result = SensorControllerInstance.setParam("BLE_TRACE_ENABLED", "True")
+
+# Operation-timeout tunables (positive decimal milliseconds, applied to the
+# next operation without a restart; getParam answers the current value):
+#   CMD_TIMEOUT_MS            per-command answer timeout (default 10000)
+#   CONNECT_TIMEOUT_MS        connect link-wait cap (default 25000)
+#   REPLAY_DELEGATE_WAIT_MS   bin-replay delegate wait (default 30000)
+#   RECONNECT_MAX_ATTEMPTS    auto-reconnect budget (default 5)
+#   RECONNECT_DELAY_MS        delay between reconnect attempts (default 1000)
+result = SensorControllerInstance.setParam("CMD_TIMEOUT_MS", "15000")
+```
+
+Unknown keys answer `"Error: Not supported"`; an invalid value answers `"Error: invalid value: <v>"`.
 
 ## Bin file recording and replay
 
