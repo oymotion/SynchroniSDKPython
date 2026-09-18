@@ -12,11 +12,11 @@ def main():
 
     target = None
     for d in devices:
-        if d.Name and d.Name.startswith("OYWW"):
+        if d.Name and d.Name.startswith("gForceUltra"):
             target = d
             break
     if target is None:
-        print("no OYWW target", flush=True)
+        print("no gForceUltra target", flush=True)
         ctrl.terminate()
         return
 

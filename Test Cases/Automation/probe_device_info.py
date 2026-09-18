@@ -67,23 +67,75 @@ NTF_KEYS = [
     "NTF_GFORCE_EULER", "NTF_GFORCE_QUAT", "NTF_GFORCE_ACC", "NTF_GFORCE_GYRO",
 ]
 
+# 候选滤波参数 key。注意：setParam 单个 key（ON/OFF）是支持的，
+# 但 getParam 单个 FILTER key 通常返回 "Error: Not supported"，
+# SDK 只提供聚合查询 getParam("FILTER")。
+FILTER_KEYS = [
+    "FILTER_50HZ", "FILTER_60HZ", "FILTER_HPF", "FILTER_LPF",
+]
+
+# 候选采样率参数 key（EEG/EMG/IMU/PPG 四套，每套含当前值 + 可选列表）。
+# 来自 examples/SynchroniSDKPython_DemoNewMulti.py 的 getParam/setParam 用法。
+SAMPLE_RATE_KEYS = [
+    "EEG_SAMPLE_RATE", "EEG_SAMPLE_RATE_LIST",
+    "EMG_SAMPLE_RATE", "EMG_SAMPLE_RATE_LIST",
+    "IMU_SAMPLE_RATE", "IMU_SAMPLE_RATE_LIST",
+    "PPG_SAMPLE_RATE", "PPG_SAMPLE_RATE_LIST",
+]
+
 
 def dump_params(sensor):
     """dump getParam 聚合状态 + 逐个 NTF key 探测，确认设备真实支持的 setParam key。"""
     lines = []
 
-    # 聚合查询
-    for agg in ["NTF", "FILTER", "EEG_SAMPLE_RATE", "EEG_SAMPLE_RATE_LIST"]:
+    # 聚合查询（NTF/FILTER 整体状态）
+    for agg in ["NTF", "FILTER"]:
         try:
             v = sensor.getParam(agg)
         except Exception as e:
             v = f"<{type(e).__name__}: {e}>"
         lines.append(f"getParam({agg!r}) = {v!r}")
 
+    # 解析聚合 getParam("FILTER")（格式 key|value|key|value|...）
+    lines.append("")
+    lines.append("--- getParam('FILTER') 聚合解析 ---")
+    try:
+        fv = sensor.getParam("FILTER")
+    except Exception as e:
+        fv = f"<{type(e).__name__}: {e}>"
+    if isinstance(fv, str) and not fv.startswith("Error") and "|" in fv:
+        items = fv.split("|")
+        for i in range(0, len(items) - 1, 2):
+            lines.append(f"  {items[i]} = {items[i+1]}")
+    else:
+        lines.append(f"  getParam('FILTER') = {fv!r}（无聚合内容）")
+
+    # 逐个 FILTER key 探测：证明单个 key 的 getParam 是否被 SDK 支持
+    lines.append("")
+    lines.append("--- 逐个 FILTER key 探测（Error 开头 = 单个 key 不可读）---")
+    for key in FILTER_KEYS:
+        try:
+            v = sensor.getParam(key)
+        except Exception as e:
+            v = f"<{type(e).__name__}: {e}>"
+        supported = not (isinstance(v, str) and v.startswith("Error"))
+        lines.append(f"getParam({key!r}) = {v!r}  ->  {'可读' if supported else '单个key不可读'}")
+
     # 逐个 NTF key 探测（只读 getParam，不改变设备状态）
     lines.append("")
     lines.append("--- 逐个 NTF key 探测（Error 开头 = 不支持）---")
     for key in NTF_KEYS:
+        try:
+            v = sensor.getParam(key)
+        except Exception as e:
+            v = f"<{type(e).__name__}: {e}>"
+        supported = not (isinstance(v, str) and v.startswith("Error"))
+        lines.append(f"getParam({key!r}) = {v!r}  ->  {'支持' if supported else '不支持'}")
+
+    # 采样率参数探测（EEG/EMG/IMU/PPG 四套，只读 getParam，不改变设备状态）
+    lines.append("")
+    lines.append("--- 采样率参数探测（Error 开头 = 不支持）---")
+    for key in SAMPLE_RATE_KEYS:
         try:
             v = sensor.getParam(key)
         except Exception as e:
