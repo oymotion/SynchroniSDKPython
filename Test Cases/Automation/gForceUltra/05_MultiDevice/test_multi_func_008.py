@@ -14,7 +14,7 @@
 前置条件：
   - 主机(电脑)：蓝牙已开启
   - 待测设备：≥2 台 gForceUltra 上电、在范围内
-  - 需有 USB dongle 且驱动已绑定（运行过 checkSetupDongle()）
+  - 需 ≥2 个 USB dongle 且驱动已绑定（dongle 后端连两台各需一个）
 """
 
 import os
@@ -128,7 +128,7 @@ print(f"SUBPROCESS_ISENABLE={ctrl.isEnable}", flush=True)
 if backend != "__TARGET_BACKEND__":
     print(f"SUBPROCESS_DIAG=环境变量已设 __TARGET_BACKEND__ 但实际后端为 {backend}", flush=True)
     try:
-        import sensor.bumble_dongle as _bd
+        import sensor.bumble_backend.bumble_dongle as _bd
         print(f"SUBPROCESS_DIAG=_known_dongle_plugged={_bd._known_dongle_plugged()}", flush=True)
         print(f"SUBPROCESS_DIAG=detect_usb_dongle_specs={_bd.detect_usb_dongle_specs()}", flush=True)
         print(f"SUBPROCESS_DIAG=checkSetupDongle={ctrl.checkSetupDongle()}", flush=True)
@@ -216,7 +216,7 @@ def main():
     print("\n[前置条件]", flush=True)
     print("  - 主机(电脑)：蓝牙已开启", flush=True)
     print("  - 待测设备：≥2 台 gForceUltra 上电、在范围内", flush=True)
-    print("  - 需有 USB dongle 且驱动已绑定（运行过 checkSetupDongle()）", flush=True)
+    print("  - 需 ≥2 个 USB dongle 且驱动已绑定（dongle 后端连两台各需一个）", flush=True)
 
     print("\n[配置检查]", flush=True)
     print(f"  TARGET_IDENTITY = {config.TARGET_IDENTITY}", flush=True)
@@ -228,7 +228,7 @@ def main():
     print("\n  请确认:", flush=True)
     print("  1. config.py 中 TARGET_IDENTITY 已正确配置", flush=True)
     print("  2. 所有目标设备已【开机】且在范围内", flush=True)
-    print("  3. USB dongle 已插入且驱动已绑定", flush=True)
+    print("  3. ≥2 个 USB dongle 已插入且驱动已绑定", flush=True)
 
     input("\n>>> [人工操作] 确认以上无误后，按回车继续 ...")
 
@@ -247,12 +247,12 @@ def main():
     spread1 = run_one_backend(ctrl, results, backend1)
 
     # ---- 后端 2：子进程切换 ----
-    target_backend = "bumble" if backend1 == "bleak" else "bleak"
+    target_backend = "dongle" if backend1 == "winrt" else "winrt"
     print(f"\n{'=' * 60}", flush=True)
     print(f"当前后端为 {backend1}，将用子进程 + SENSOR_SDK_BLE_BACKEND={target_backend} 测试另一后端", flush=True)
     print(f"{'=' * 60}", flush=True)
 
-    input("\n>>> [人工操作] 确认 dongle 已插入且驱动已绑定，按回车继续（子进程测试）...")
+    input("\n>>> [人工操作] 确认 ≥2 个 USB dongle 已插入且驱动已绑定，按回车继续（子进程测试）...")
 
     script = (_SUBPROCESS_SCRIPT
               .replace("__AUTOMATION_DIR__", AUTOMATION_DIR)
@@ -317,12 +317,12 @@ def main():
                 print(f"  {d}", flush=True)
 
         if "后端未切换" in sub_result:
-            print("\n[结论] bumble 后端在当前环境无法启用（环境变量已设置但 SensorController 仍返回 bleak）", flush=True)
-            print("  已确认 dongle 硬件与驱动正常（见上方诊断）。此为 SDK 0.9.1 的后端选择/强制逻辑未生效，", flush=True)
-            print("  建议将该现象反馈给 SDK 开发者排查。本用例（两后端）在当前环境跳过 bumble 侧。", flush=True)
+            print("\n[结论] dongle 后端在当前环境无法启用（环境变量已设置但 SensorController 仍返回 winrt）", flush=True)
+            print("  已确认 dongle 硬件与驱动正常（见上方诊断）。此为 SDK 的后端选择/强制逻辑未生效，", flush=True)
+            print("  建议将该现象反馈给 SDK 开发者排查。本用例（两后端）在当前环境跳过 dongle 侧。", flush=True)
             record(results, "两后端对齐下发(后端2)", None,
-                   "bumble 后端可用",
-                   f"bumble 后端不可用，SensorController 返回 {backend2}（{sub_result}）")
+                   "dongle 后端可用",
+                   f"dongle 后端不可用，SensorController 返回 {backend2}（{sub_result}）")
         else:
             record(results, "两后端对齐下发(后端2)", None,
                    "子进程完成测试",

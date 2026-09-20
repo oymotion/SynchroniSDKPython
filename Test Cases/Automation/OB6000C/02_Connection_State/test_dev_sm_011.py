@@ -151,12 +151,10 @@ def main():
             items = data if isinstance(data, list) else [data]
             n = 0
             for dd in items:
-                cs = getattr(dd, 'channelSamples', None)
-                if cs:
-                    try:
-                        n += sum(len(ch) for ch in cs)
-                    except TypeError:
-                        n += len(cs)
+                try:
+                    n += dd.getChannelCount() * dd.getSampleCount()
+                except Exception:
+                    pass
             data_counts[tag] = data_counts.get(tag, 0) + n
         return on_data
 

@@ -136,11 +136,16 @@ async def main_async():
     def on_data(s, data_list):
         nonlocal captured_sample
         for d in data_list:
-            cs = getattr(d, 'channelSamples', None)
-            if cs and len(cs) > 0 and len(cs[0]) > 0:
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount/getChannelSample
+            try:
+                n_ch = d.getChannelCount()
+                n_s = d.getSampleCount()
+            except Exception:
+                n_ch = n_s = 0
+            if n_ch > 0 and n_s > 0:
                 with sample_lock:
                     if captured_sample is None:
-                        captured_sample = cs[0][0]
+                        captured_sample = d.getChannelSample(0, 0)
                         print(f"[数据] 捕获到一个 Sample, type={type(captured_sample).__name__}", flush=True)
 
     sensor.onDataCallback = on_data

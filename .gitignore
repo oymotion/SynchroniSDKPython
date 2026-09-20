@@ -10,6 +10,7 @@
 .idea/
 *.pyc
 *.pyd
+*.bin
 sensor/**/*.c
 examples/build/
 examples/dist/

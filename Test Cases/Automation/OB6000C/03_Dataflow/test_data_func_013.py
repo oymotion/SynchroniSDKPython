@@ -55,13 +55,10 @@ class BatchCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             if self.first_batch is None and n > 0:
                 self.first_batch = d
@@ -84,14 +81,10 @@ def check_new_fields(data, results):
     def add(name, ok, expect, actual):
         record(results, name, ok, expect, actual)
 
-    cs = getattr(data, 'channelSamples', None)
-    if not cs:
-        add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0", "channelSamples 为空/无数据")
-        return
     try:
-        n_ch = len(cs)
-        n_s = len(cs[0]) if n_ch else 0
-    except TypeError:
+        n_ch = data.getChannelCount()
+        n_s = data.getSampleCount()
+    except Exception:
         n_ch = n_s = 0
     if n_ch == 0 or n_s == 0:
         add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0",
@@ -105,7 +98,7 @@ def check_new_fields(data, results):
         for ci in range(n_ch):
             for si in range(n_s):
                 try:
-                    s = cs[ci][si]
+                    s = data.getChannelSample(ci, si)
                     bad = check_fn(ci, si, s)
                 except Exception as e:
                     bad = f"抛异常 {type(e).__name__}: {e}"

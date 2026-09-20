@@ -49,14 +49,10 @@ class BatchSizeCollector:
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
         for d in items:
-            cs = getattr(d, 'channelSamples', None)
-            n_s = 0
-            if cs:
-                try:
-                    n_ch = len(cs)
-                    n_s = len(cs[0]) if n_ch else 0
-                except TypeError:
-                    n_s = len(cs)
+            try:
+                n_s = d.getSampleCount()
+            except Exception:
+                n_s = 0
             self.batch_sizes.append(n_s)
             self.total_samples += n_s
 

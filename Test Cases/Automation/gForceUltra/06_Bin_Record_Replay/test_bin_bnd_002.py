@@ -15,6 +15,8 @@
      无效成员返回 None；重复 MAC 成员返回 None，不拖垮整组）
 
 说明：
+  1.3.0 起 multiReplayBinFile(file_paths, sensors, ...) 的 sensors 为必填，且须与
+  file_paths 等长（元素为 MAC 字符串或 SensorProfile，不可为 None）。
   SDK multiReplayBinFile 返回与 file_paths 对齐的列表，失败成员（文件不存在/无配置/
   MAC 重复/正在传输）为 None。本用例聚焦入参容错：任何输入都不应导致 SDK 崩溃或抛异常。
   具体"空列表/单文件是否被拒绝"以 SDK 实际行为记录，硬门槛是"不崩溃 + 返回列表"。
@@ -38,11 +40,15 @@ from sensor import *
 from common import record
 
 
-def _call(ctrl, paths, label):
-    """调用 multiReplayBinFile 并返回 (返回列表, 异常信息)。"""
-    print(f"\n[{label}] multiReplayBinFile({paths!r}) ...", flush=True)
+def _call(ctrl, paths, sensors, label):
+    """调用 multiReplayBinFile 并返回 (返回列表, 异常信息)。
+
+    1.3.0 起 multiReplayBinFile(file_paths, sensors, ...) 的 sensors 为必填，
+    且必须与 file_paths 等长（元素为 MAC 字符串或 SensorProfile，不可为 None）。
+    """
+    print(f"\n[{label}] multiReplayBinFile(paths={len(paths)}, sensors={len(sensors)}) ...", flush=True)
     try:
-        r = ctrl.multiReplayBinFile(paths)
+        r = ctrl.multiReplayBinFile(paths, sensors)
         return r, None
     except Exception as e:
         return None, f"抛异常 {type(e).__name__}: {e}"
@@ -69,10 +75,20 @@ def main():
     valid_paths = [p for p in raw_paths if os.path.isfile(p)]
     print(f"\n[输入] 命令行 {len(raw_paths)} 个路径，其中有效文件 {len(valid_paths)} 个: {valid_paths}", flush=True)
 
+    # 1.3.0 起 sensors 必填：为每个 file_path 读 device_mac（无效路径用占位 MAC）
+    def _mac_of(path):
+        try:
+            info = ctrl.getBinFileInfo(path)
+            return (info or {}).get("device_mac") or "00:00:00:00:00:00"
+        except Exception:
+            return "00:00:00:00:00:00"
+
+    valid_macs = [_mac_of(p) for p in valid_paths]
+
     results = []
 
     # a) 空列表
-    ret, err = _call(ctrl, [], "空列表")
+    ret, err = _call(ctrl, [], [], "空列表")
     _assert_no_crash(results, "空列表 multiReplayBinFile([]) 不崩溃", ret, err)
     if err is None:
         empty_ok = ret is None or (isinstance(ret, list) and len(ret) == 0)
@@ -82,7 +98,7 @@ def main():
     # b) 单文件（不足 2 个）
     if valid_paths:
         one = valid_paths[:1]
-        ret, err = _call(ctrl, one, "单文件")
+        ret, err = _call(ctrl, one, valid_macs[:1], "单文件")
         _assert_no_crash(results, "单文件 multiReplayBinFile 不崩溃", ret, err)
         if err is None:
             # SDK 可能返回单成员列表（正常回放）或拒绝；记录实际行为
@@ -95,18 +111,22 @@ def main():
     # c) 含不存在路径
     fake = r"Z:\__no_such_dir__\not_exist.bin"
     if valid_paths:
-        ret, err = _call(ctrl, valid_paths[:1] + [fake], "含无效路径")
+        ret, err = _call(ctrl, valid_paths[:1] + [fake],
+                         valid_macs[:1] + ["00:00:00:00:00:00"], "含无效路径")
     else:
-        ret, err = _call(ctrl, [fake], "仅无效路径")
+        ret, err = _call(ctrl, [fake], ["00:00:00:00:00:00"], "仅无效路径")
     if not _assert_no_crash(results, "含无效路径 multiReplayBinFile 不崩溃", ret, err):
         pass
-    elif err is None and isinstance(ret, list):
-        record(results, "无效成员返回 None", True,
-               "无效路径成员为 None", f"ret={ret!r}")
+    elif err is None and isinstance(ret, list) and len(ret) >= 1:
+        # fake 路径固定在列表末尾，断言该成员为 None（SDK 失败成员返回 None 语义）
+        invalid_member = ret[-1]
+        record(results, "无效成员返回 None", invalid_member is None,
+               "无效路径成员为 None", f"无效成员={invalid_member!r} ret={ret!r}")
 
     # d) 重复 device_mac（同一文件传两次）
     if valid_paths:
-        ret, err = _call(ctrl, [valid_paths[0], valid_paths[0]], "重复 MAC")
+        ret, err = _call(ctrl, [valid_paths[0], valid_paths[0]],
+                         [valid_macs[0], valid_macs[0]], "重复 MAC")
         _assert_no_crash(results, "重复 MAC multiReplayBinFile 不崩溃", ret, err)
         if err is None and isinstance(ret, list):
             record(results, "重复 MAC 成员返回 None", ret[1] is None,

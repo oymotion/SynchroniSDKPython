@@ -61,23 +61,25 @@ class RateCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            if cs:
-                try:
-                    n_ch = len(cs)
-                    self.total_samples += len(cs[0]) if n_ch else 0
-                    # 记录通道0样本的 sampleIndex 首末（交叉验证样本唯一性）
-                    if n_ch:
-                        for s in cs[0]:
-                            idx = getattr(s, 'sampleIndex', None)
-                            if idx is None:
-                                continue
-                            if self.min_sample_index is None or idx < self.min_sample_index:
-                                self.min_sample_index = idx
-                            if self.max_sample_index is None or idx > self.max_sample_index:
-                                self.max_sample_index = idx
-                except TypeError:
-                    self.total_samples += len(cs)
+            try:
+                n_ch = d.getChannelCount()
+                n_smp = d.getSampleCount()
+            except Exception:
+                n_ch = 0
+                n_smp = 0
+            if n_ch and n_smp:
+                # 1.3.0 已移除 channelSamples；getSampleCount() 即每通道样本数
+                self.total_samples += n_smp
+                # 记录通道0样本的 sampleIndex 首末（交叉验证样本唯一性）
+                for si in range(n_smp):
+                    try:
+                        idx = d.getSampleIndex(0, si)
+                    except Exception:
+                        continue
+                    if self.min_sample_index is None or idx < self.min_sample_index:
+                        self.min_sample_index = idx
+                    if self.max_sample_index is None or idx > self.max_sample_index:
+                        self.max_sample_index = idx
                 if self.first_batch is None:
                     self.first_batch = d
 

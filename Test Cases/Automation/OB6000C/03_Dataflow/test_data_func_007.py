@@ -52,13 +52,11 @@ class MetaCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             if self.first_batch is None and n > 0:
                 self.first_batch = d
@@ -75,20 +73,16 @@ def check_accessors(data, results):
     def add(name, ok, expect, actual):
         record(results, name, ok, expect, actual)
 
-    cs = getattr(data, 'channelSamples', None)
-    if not cs:
-        add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0", "channelSamples 为空/无数据")
-        return
     try:
-        n_ch = len(cs)
-        n_s = len(cs[0]) if n_ch else 0
-    except TypeError:
+        n_ch = data.getChannelCount()
+        n_s = data.getSampleCount()
+    except Exception:
         n_ch = n_s = 0
     if n_ch == 0 or n_s == 0:
-        add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0",
+        add("结构合法", False, "通道数>0 且每通道样本数>0",
             f"通道数={n_ch} 每通道样本数={n_s}")
         return
-    add("channelSamples 结构合法", True, "通道数>0 且每通道样本数>0",
+    add("结构合法", True, "通道数>0 且每通道样本数>0",
         f"通道数={n_ch} 每通道样本数={n_s}")
 
     # 全量遍历，返回首个不一致描述；None 表示全部一致
@@ -96,27 +90,13 @@ def check_accessors(data, results):
         for ci in range(n_ch):
             for si in range(n_s):
                 try:
-                    s = cs[ci][si]
+                    s = data.getChannelSample(ci, si)
                     bad = check_fn(ci, si, s)
                 except Exception as e:
                     bad = f"抛异常 {type(e).__name__}: {e}"
                 if bad is not None:
                     return f"ci={ci} si={si} {bad}"
         return None
-
-    # getChannelSample(ci, si) 返回 Sample，字段与 channelSamples 一致
-    def chk_channel_sample(ci, si, s):
-        s2 = data.getChannelSample(ci, si)
-        for f in SAMPLE_FIELDS:
-            if getattr(s2, f, None) != getattr(s, f, None):
-                return (f"getChannelSample().{f}={getattr(s2, f, None)!r} "
-                        f"!= channelSamples.{f}={getattr(s, f, None)!r}")
-        return None
-
-    bad = scan(chk_channel_sample)
-    add("getChannelSample 字段与 channelSamples 一致", bad is None,
-        "getChannelSample(ci,si) 各字段 == channelSamples[ci][si] 各字段",
-        bad if bad else "全部一致")
 
     # 单点字段访问器与 Sample 字段一致
     acc_map = [
@@ -147,7 +127,10 @@ def check_accessors(data, results):
     def chk_mono(ci, si, s):
         if si == 0:
             return None
-        prev = cs[ci][si - 1].sampleIndex
+        try:
+            prev = data.getSampleIndex(ci, si - 1)
+        except Exception as e:
+            return f"取前一样本 sampleIndex 抛异常 {type(e).__name__}: {e}"
         cur = s.sampleIndex
         if not (cur > prev):
             return f"sampleIndex 非递增：prev={prev!r} cur={cur!r}"

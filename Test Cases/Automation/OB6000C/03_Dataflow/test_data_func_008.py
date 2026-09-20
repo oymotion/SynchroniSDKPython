@@ -51,15 +51,22 @@ class LostCollector:
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
         for d in items:
-            cs = getattr(d, 'channelSamples', None)
+            try:
+                n_ch = d.getChannelCount()
+                n_smp = d.getSampleCount()
+            except Exception:
+                n_ch = 0
+                n_smp = 0
             lost_samples = 0
             batch_samples = 0
-            if cs:
-                for ch in cs:
-                    for s in ch:
-                        batch_samples += 1
-                        if getattr(s, 'isLost', False):
+            for ci in range(n_ch):
+                for si in range(n_smp):
+                    batch_samples += 1
+                    try:
+                        if d.isLost(ci, si):
                             lost_samples += 1
+                    except Exception:
+                        pass
             try:
                 lost_count = d.getLostPackageCount()
             except Exception as e:

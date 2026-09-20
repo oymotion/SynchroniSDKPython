@@ -12,20 +12,19 @@
        断言收到该 DataType 数据且样本数>0
      - ChannelCount==0：记录"不支持，跳过"（SKIP）
 
-目标模态（gForceUltra 腕带，据 probe_device_info 实测能力）与映射：
+目标模态（gForceUltra 腕带，据 device_specs/gforce_ultra.py 实测能力）与映射：
   DataType               setParam key        ChannelCount 字段    采集时长
   NTF_EMG                "NTF_EMG"           EmgChannelCount=8     5s
   NTF_GEST               "NTF_GEST"          EmgChannelCount=8     5s（DeviceInfo 无独立 GEST 标称值）
   NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount=8    25s（1Hz，需较长采集）
-  NTF_ACC                "NTF_GFORCE_ACC"    AccChannelCount=3     5s
-  NTF_GYRO               "NTF_GFORCE_GYRO"   GyroChannelCount=3    5s
-  NTF_EULER_DATA         "NTF_GFORCE_EULER"  EulerChannelCount=3   5s
-  NTF_QUATERNION         "NTF_GFORCE_QUAT"   QuatChannelCount=4    5s
+  NTF_IMU                "NTF_IMU"           ImuChannelCount=6     5s（acc3+gyro3 聚合）
 
 说明：
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
   - IMPEDANCE 采样率 1Hz，packageSampleCount=20 约需 20s 凑满一批，故采集 25s。
-  - NTF_IMU 聚合流（ImuChannelCount=13）不在本条覆盖（见 DATA-FUNC-010）。
+  - gForceUltra 为「新 EMG 设备」，ACC/GYRO 不以独立 NTF_ACC/NTF_GYRO 流投递，
+    而是以 NTF_IMU 聚合流投递（ImuChannelCount=6：acc 0-2 / gyro 3-5）；无欧拉/四元数。
+    因此本条只测 NTF_IMU，通道布局细节见 DATA-FUNC-010。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -62,14 +61,8 @@ MODALITIES = [
      "请做手势动作（握拳/张手/翻转手腕等），触发手势识别", 5),
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
      "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25),
-    ("ACC", DataType.NTF_ACC, "NTF_GFORCE_ACC", "AccChannelCount",
-     "请晃动/移动腕带，让加速度计产生变化", 5),
-    ("GYRO", DataType.NTF_GYRO, "NTF_GFORCE_GYRO", "GyroChannelCount",
-     "请旋转/晃动腕带，让陀螺仪产生变化", 5),
-    ("EULER", DataType.NTF_EULER_DATA, "NTF_GFORCE_EULER", "EulerChannelCount",
-     "请旋转/晃动腕带，让欧拉角产生变化", 5),
-    ("QUAT", DataType.NTF_QUATERNION, "NTF_GFORCE_QUAT", "QuatChannelCount",
-     "请旋转/晃动腕带，让四元数产生变化", 5),
+    ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
+     "请晃动/旋转腕带，让 6 轴 IMU（acc+gyro）产生变化", 5),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名

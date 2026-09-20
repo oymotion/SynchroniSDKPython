@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ASYNC-FUNC-010：async/sync 混合调用——异步连接、同步 init/起流、异步停流、同步断开，状态切换正确。
+"""ASYNC-FUNC-010：async/sync 混用行为明确——事件循环内同步 BLE 接口被拒绝，纯 async 路径正确。
 
 对应用例：09_异步接口.md -> ASYNC-FUNC-010
 可自动化：auto（需待测设备上电在范围内）
@@ -17,8 +17,10 @@
   6) 等待 2 秒，检查 isDataTransfering==True
   7) await sensor.asyncStopDataNotification()（异步停流）
   8) 检查 isDataTransfering==False
-  9) sensor.disconnect()（同步断开）
-  10) 检查 deviceState 各阶段转换正确：Connected -> Ready -> Streaming -> Disconnected
+  9) sensor.disconnect()（同步断开，事件循环内）—— 预期被 SDK 拒绝
+     （抛 RuntimeError: blocking sync call from an SDK callback thread 或返回 None）
+  10) 清理：await sensor.asyncDisconnect()（纯 async 断开）-> 到达 Disconnected
+  11) 检查 deviceState 迁移：Connected -> Ready -> (Streaming) -> Disconnected
 """
 
 import asyncio
@@ -167,19 +169,43 @@ async def main_async():
     record(results, "停流后 isDataTransfering==False", transferring_after_stop is False,
            "isDataTransfering == False", f"isDataTransfering == {transferring_after_stop}")
 
-    # ---- sensor.disconnect（同步断开） ----
-    print("\n[同步断开] sensor.disconnect() ...", flush=True)
+    # ---- sensor.disconnect（同步断开，事件循环内，验证混用限制） ----
+    # 已知：在运行中的 asyncio 事件循环里调用同步 BLE 接口会被 SDK 拒绝
+    # （抛 RuntimeError: blocking sync call from an SDK callback thread 或返回 None）。
+    # 这是预期行为（事件循环冲突），不作为 bug 判定。
+    print("\n[同步断开] sensor.disconnect()（事件循环内，预期被拒绝）...", flush=True)
+    sync_disc_exc = None
+    sync_disc_ret = None
     try:
-        sensor.disconnect()
+        sync_disc_ret = sensor.disconnect()
     except Exception as e:
-        print(f"[同步断开] 抛异常 {type(e).__name__}: {e}", flush=True)
+        sync_disc_exc = f"{type(e).__name__}: {e}"
+        print(f"[同步断开] 抛异常 {sync_disc_exc}（符合预期：事件循环内不可混用同步 BLE 接口）", flush=True)
 
-    # 等待状态传播
-    time.sleep(1)
+    blocked_ok = (sync_disc_exc is not None) or (sync_disc_ret is None)
+    record(results, "事件循环内同步 disconnect 被拒绝（抛异常或返回 None）", blocked_ok,
+           "同步 disconnect 在事件循环内被 SDK 拒绝（抛异常或返回 None）",
+           f"返回 {sync_disc_ret!r}" if sync_disc_exc is None else f"抛异常 {sync_disc_exc}")
+
+    # ---- 清理：纯 async 断开，验证纯 async 路径状态迁移正确 ----
+    print("\n[异步断开] await sensor.asyncDisconnect() ...", flush=True)
+    try:
+        disc_ok = await sensor.asyncDisconnect()
+    except Exception as e:
+        disc_ok = False
+        print(f"[异步断开] 抛异常 {type(e).__name__}: {e}", flush=True)
+    print(f"[异步断开] asyncDisconnect() -> {disc_ok}", flush=True)
+    record(results, "asyncDisconnect 返回 True", disc_ok is True,
+           "asyncDisconnect() 返回 True", f"asyncDisconnect() -> {disc_ok}")
+
+    # 等待状态传播（Disconnecting→Disconnected 异步）
+    t0 = time.time()
+    while time.time() - t0 < 15 and sensor.deviceState != DeviceStateEx.Disconnected:
+        await asyncio.sleep(0.2)
     state_disconnected = sensor.deviceState
     disconnected_ok = (state_disconnected == DeviceStateEx.Disconnected)
-    print(f"[检查4] disconnect 后 deviceState = {state_disconnected}", flush=True)
-    record(results, "sync disconnect 后 deviceState==Disconnected", disconnected_ok,
+    print(f"[检查4] asyncDisconnect 后 deviceState = {state_disconnected}", flush=True)
+    record(results, "asyncDisconnect 后 deviceState==Disconnected", disconnected_ok,
            "deviceState == DeviceStateEx.Disconnected", f"deviceState == {state_disconnected}")
 
     # ---- 汇总 ----

@@ -58,14 +58,11 @@ def make_on_data(result):
         items = data if isinstance(data, list) else [data]
         for d in items:
             result.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
-            result.total_samples += n
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                result.total_samples += d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                pass
             dt = d.getDataType()
             if dt is not None:
                 result.data_types.add(_dt_name(dt))

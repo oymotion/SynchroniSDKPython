@@ -69,13 +69,10 @@ class BatchCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             if self.first_batch is None and n > 0:
                 self.first_batch = d
@@ -101,29 +98,26 @@ def _clone_metadata_equal(a, b):
 
 
 def _samples_equal(a, b):
-    """遍历两份 SensorData 的 channelSamples 各 Sample 字段是否全一致。"""
-    ca = getattr(a, 'channelSamples', None)
-    cb = getattr(b, 'channelSamples', None)
-    if not ca or not cb:
-        return None  # 空结构由外层判定
+    """遍历两份 SensorData 各 Sample 字段是否全一致。"""
     try:
-        n_ch = len(ca)
-    except TypeError:
+        n_ch = a.getChannelCount()
+        n_smp = a.getSampleCount()
+        n_ch_b = b.getChannelCount()
+        n_smp_b = b.getSampleCount()
+    except Exception:
+        return None  # 空结构由外层判定
+    if n_ch == 0 or n_smp == 0 or n_ch_b == 0 or n_smp_b == 0:
         return None
+    if n_ch != n_ch_b:
+        return f"通道数不一致：原={n_ch} 副本={n_ch_b}"
+    if n_smp != n_smp_b:
+        return f"样本数不一致：原={n_smp} 副本={n_smp_b}"
     for ci in range(n_ch):
-        try:
-            ch_a = ca[ci]
-            ch_b = cb[ci]
-        except Exception as e:
-            return f"取通道 {ci} 失败：{type(e).__name__}: {e}"
-        n_s = len(ch_a)
-        if len(ch_b) != n_s:
-            return f"通道 {ci} 样本数不一致：原={n_s} 副本={len(ch_b)}"
-        for si in range(n_s):
+        for si in range(n_smp):
             for f in SAMPLE_FIELDS:
                 try:
-                    va = getattr(ch_a[si], f, None)
-                    vb = getattr(ch_b[si], f, None)
+                    va = getattr(a.getChannelSample(ci, si), f, None)
+                    vb = getattr(b.getChannelSample(ci, si), f, None)
                 except Exception as e:
                     return f"ci={ci} si={si} 读 {f} 抛异常 {type(e).__name__}: {e}"
                 if va != vb:
@@ -134,13 +128,9 @@ def _samples_equal(a, b):
 def _try_mutate_clone(orig, clone):
     """尽力修改副本 Sample.data 元素，判断是否影响原对象。
     返回 (结果, 说明)：True=深拷贝独立 / False=浅拷贝共享 / None=无法验证。"""
-    ca = getattr(orig, 'channelSamples', None)
-    cb = getattr(clone, 'channelSamples', None)
-    if not ca or not cb:
-        return None, "channelSamples 为空"
     try:
-        s_orig = ca[0][0]
-        s_clone = cb[0][0]
+        s_orig = orig.getChannelSample(0, 0)
+        s_clone = clone.getChannelSample(0, 0)
     except Exception as e:
         return None, f"取首样本失败 {type(e).__name__}: {e}"
 
@@ -356,7 +346,7 @@ def main():
                f"批次数={collector.batches} 非空样本数={collector.first_batch_samples}")
         # 打印首样本 data 类型，辅助定位字段可写性
         try:
-            s0 = collector.first_batch.channelSamples[0][0]
+            s0 = collector.first_batch.getChannelSample(0, 0)
             d0 = s0.data
             print(f"[info] 首样本 data 类型={type(d0).__name__} 长度={len(d0) if hasattr(d0, '__len__') else '?'}", flush=True)
         except Exception as e:

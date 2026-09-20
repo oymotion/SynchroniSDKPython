@@ -44,27 +44,30 @@ class RateCollector:
         for d in items:
             dt = d.getDataType()
             if dt == DataType.NTF_EEG:
-                cs = getattr(d, 'channelSamples', None)
-                if cs:
+                # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount/getSampleIndex
+                try:
+                    n_ch = d.getChannelCount()
+                    n_smp = d.getSampleCount()
+                except Exception:
+                    n_ch = n_smp = 0
+                if n_ch > 0 and n_smp > 0:
                     if self.first_ts is None:
                         self.first_ts = time.time()
-                    try:
-                        n_ch = len(cs)
-                        self.eeg_samples += sum(len(ch) for ch in cs)
-                        if self.channel_count == 0:
-                            self.channel_count = n_ch
-                        # 用通道0 sampleIndex 记录全局首末（sampleIndex 跨批单调递增）
-                        if n_ch:
-                            for s in cs[0]:
-                                idx = getattr(s, 'sampleIndex', None)
-                                if idx is None:
-                                    continue
-                                if self.min_sample_index is None or idx < self.min_sample_index:
-                                    self.min_sample_index = idx
-                                if self.max_sample_index is None or idx > self.max_sample_index:
-                                    self.max_sample_index = idx
-                    except TypeError:
-                        self.eeg_samples += len(cs)
+                    self.eeg_samples += n_ch * n_smp
+                    if self.channel_count == 0:
+                        self.channel_count = n_ch
+                    # 用通道0 sampleIndex 记录全局首末（sampleIndex 跨批单调递增）
+                    for si in range(n_smp):
+                        try:
+                            idx = d.getSampleIndex(0, si)
+                        except Exception:
+                            continue
+                        if idx is None:
+                            continue
+                        if self.min_sample_index is None or idx < self.min_sample_index:
+                            self.min_sample_index = idx
+                        if self.max_sample_index is None or idx > self.max_sample_index:
+                            self.max_sample_index = idx
 
     @property
     def unique_samples(self):

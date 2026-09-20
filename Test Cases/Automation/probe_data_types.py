@@ -58,30 +58,33 @@ class ProbeCollector:
             dt = d.getDataType()
             entry = self.by_type.setdefault(dt, {'batches': 0, 'samples': 0})
             entry['batches'] += 1
-            cs = getattr(d, 'channelSamples', None)
-            if cs:
-                try:
-                    entry['samples'] += sum(len(ch) for ch in cs)
-                except TypeError:
-                    entry['samples'] += len(cs)
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount/getChannelSample
+            try:
+                n_ch = d.getChannelCount()
+                n_smp = d.getSampleCount()
+            except Exception:
+                n_ch = n_smp = 0
+            entry['samples'] += n_ch * n_smp
 
             # dump 样本字段名（仅一次）
-            if not self.sample_fields and cs:
-                first_ch = cs[0] if cs else None
-                if first_ch and len(first_ch) > 0:
-                    s0 = first_ch[0]
+            if not self.sample_fields and n_ch > 0 and n_smp > 0:
+                try:
+                    s0 = d.getChannelSample(0, 0)
                     for f in ['data', 'rawData', 'impedance', 'saturation',
                               'sampleIndex', 'channelIndex', 'absTimeStampInSec', 'isLost']:
                         try:
                             self.sample_fields[f] = getattr(s0, f, '<无>')
                         except Exception as e:
                             self.sample_fields[f] = f"<{type(e).__name__}>"
+                except Exception:
+                    pass
 
             # 采集 impedance 字段值（前 10 个非零，用于判断是否内嵌阻抗）
-            if cs and len(self.impedance_values) < 10:
-                for ch in cs:
-                    for s in ch:
+            if n_ch > 0 and n_smp > 0 and len(self.impedance_values) < 10:
+                for ci in range(n_ch):
+                    for si in range(n_smp):
                         try:
+                            s = d.getChannelSample(ci, si)
                             imp = s.impedance
                         except Exception:
                             continue
@@ -89,6 +92,8 @@ class ProbeCollector:
                             self.impedance_values.append(imp)
                             if len(self.impedance_values) >= 10:
                                 break
+                    if len(self.impedance_values) >= 10:
+                        break
 
     def clear(self):
         self.by_type.clear()

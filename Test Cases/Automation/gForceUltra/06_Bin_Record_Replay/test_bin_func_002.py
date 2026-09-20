@@ -17,8 +17,9 @@
   device_name、chip_type、is_universal_stream、feature_map、device_info、sensor_datas、
   replay_duration（录制秒数，在 close 时写入 header）；文件不存在或无 config record 时
   返回 None。
-  本用例只校验"返回 dict 且含全部关键字段（非空/结构正确）"，不校验字段值语义（值一致性见
-  FUNC-009、元数据完整性见后续）。
+  本用例校验"返回 dict 且含全部关键字段（非空/结构正确）"，并把 device_info 的
+  ModelName/各流通道数/采样率与 device_specs/gforce_ultra.py 做基础比对；值精确性仍见
+  FUNC-009、元数据完整性见后续。
   注意 DEBUG_BLE_DATA_PATH 的值是字符串 "True"/"False"，不是 Python bool。
 
 前置条件：
@@ -335,6 +336,75 @@ def main():
         record(results, "sensor_datas 为 list", isinstance(sd, list),
                "sensor_datas 为 list",
                f"sensor_datas 长度={len(sd) if isinstance(sd, list) else type(sd).__name__}")
+
+        # ===== 与 device spec 做基础比对（身份/通道数/采样率）=====
+        try:
+            spec = common.load_spec(base_name)
+            spec_txt = f"load_spec({base_name!r}) 成功"
+        except Exception as e:
+            spec = None
+            spec_txt = f"load_spec({base_name!r}) 抛异常 {type(e).__name__}: {e}"
+        record(results, "加载 device spec", spec is not None,
+               f"common.load_spec({base_name!r}) 成功", spec_txt)
+
+        if spec is not None:
+            di = info.get("device_info") or {}
+
+            # 1) ModelName 一致
+            model_ok = di.get("ModelName") == spec.get("model")
+            record(results, "bin ModelName 与 spec model 一致", model_ok,
+                   f"ModelName == {spec.get('model')!r}",
+                   f"ModelName={di.get('ModelName')!r} spec={spec.get('model')!r}")
+
+            # 2) 各流通道数与 spec streams 一致
+            channel_map = {
+                "NTF_EMG": "EmgChannelCount",
+                "NTF_GFORCE_ACC": "AccChannelCount",
+                "NTF_GFORCE_GYRO": "GyroChannelCount",
+                "NTF_IMU": "ImuChannelCount",
+                "NTF_IMPEDANCE": "ImpeChannelCount",
+                "NTF_GFORCE_EULER": "EulerChannelCount",
+                "NTF_GFORCE_QUAT": "QuatChannelCount",
+                "NTF_MAG_ANGLE": "MagAngleChannelCount",
+                "NTF_EEG": "EegChannelCount",
+                "NTF_ECG": "EcgChannelCount",
+                "NTF_BRTH": "BrthChannelCount",
+                "NTF_PPG": "PpgChannelCount",
+                "NTF_SPO2": "Spo2ChannelCount",
+            }
+            ch_mismatch = []
+            for sk, bk in channel_map.items():
+                st = (spec.get("streams") or {}).get(sk)
+                if not st:
+                    continue
+                expect = st.get("channels")
+                actual = di.get(bk)
+                if actual != expect:
+                    ch_mismatch.append(f"{sk}:bin={actual} spec={expect}")
+            record(results, "bin 通道数与 spec streams 一致", not ch_mismatch,
+                   "各流 ChannelCount == spec.channels",
+                   "全部一致" if not ch_mismatch else "不一致: " + "; ".join(ch_mismatch))
+
+            # 3) 采样率在 spec 允许集合内（EMG 有已知 init 改 500 的 bug，故用 rates 集合而非 default）
+            rate_map = {
+                "EMG_SAMPLE_RATE": "EmgSampleRate",
+                "IMU_SAMPLE_RATE": "ImuSampleRate",
+            }
+            rate_bad = []
+            rate_seen = []
+            for sk, bk in rate_map.items():
+                sr = (spec.get("sample_rates") or {}).get(sk)
+                if not sr:
+                    continue
+                allowed = [str(r) for r in sr.get("rates", [])]
+                actual = di.get(bk)
+                rate_seen.append(f"{bk}={actual}")
+                if allowed and str(actual) not in allowed:
+                    rate_bad.append(f"{bk}:bin={actual} spec允许={allowed}")
+            record(results, "bin 采样率在 spec 允许集合内", not rate_bad,
+                   "各采样率 ∈ spec.rates",
+                   ("在允许集合内: " + ", ".join(rate_seen)) if not rate_bad
+                   else "不一致: " + "; ".join(rate_bad))
     else:
         record(results, "返回含全部关键字段（8 项）", None,
                f"dict 含 {REQUIRED_KEYS}", "getBinFileInfo 未返回 dict，跳过字段校验")

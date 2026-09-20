@@ -72,13 +72,11 @@ class ImuCollector:
             if _dt_name(d.getDataType()) != "NTF_IMU":
                 continue
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             if self.first_batch is None and n > 0:
                 self.first_batch = d
@@ -101,22 +99,17 @@ def check_imu_layout(data, imu_channels, results):
     add("getChannelCount()==ImuChannelCount", meta_ch == imu_channels,
         f"getChannelCount()=={imu_channels}", f"getChannelCount()={meta_ch}")
 
-    # 3. 结构通道数 == ImuChannelCount
-    cs = getattr(data, 'channelSamples', None)
-    n_ch = len(cs) if cs else 0
-    add("channelSamples 通道数==ImuChannelCount", n_ch == imu_channels,
-        f"channelSamples 通道数=={imu_channels}", f"channelSamples 通道数={n_ch}")
+    # 3. 结构通道数 == ImuChannelCount（1.3.0 无 channelSamples，结构通道数即 getChannelCount）
+    n_ch = data.getChannelCount()
+    n_smp = data.getSampleCount()
+    add("结构通道数==ImuChannelCount", n_ch == imu_channels,
+        f"结构通道数=={imu_channels}", f"结构通道数={n_ch}")
 
     # 4. 各布局分段存在且有数据（按 ImuChannelCount 覆盖到的分段）
     for seg_name, start, end in IMU_LAYOUT:
         if imu_channels >= end:
             seg_has = n_ch >= end
-            seg_samples = 0
-            if seg_has and cs:
-                try:
-                    seg_samples = sum(len(cs[i]) for i in range(start, end))
-                except Exception:
-                    seg_samples = 0
+            seg_samples = (end - start) * n_smp if seg_has else 0
             add(f"{seg_name} 分段存在（通道 {start}-{end - 1}）且有数据",
                 seg_has and seg_samples > 0,
                 f"通道 {start}-{end - 1} 存在且样本数>0",

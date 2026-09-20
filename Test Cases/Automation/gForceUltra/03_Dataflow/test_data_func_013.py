@@ -12,14 +12,15 @@
        rawData         -> getRawData(ci,si)
        impedance       -> getImpedance(ci,si)
        saturation      -> getSaturation(ci,si)
-       timeStampInMs   -> getTimeStampInMs(ci,si)
        absTimeStampInSec -> getAbsTimeStampInSec(ci,si)
+     （getTimeStampInMs 为单独访问器，Sample 无 timeStampInMs 字段，不在此比对）
      channelIndex 无直接单点访问器，通过 getChannelSample(ci,si).channelIndex 校验。
 
 说明：
-  0.9.0 新增了 Sample.rawData/impedance/saturation/channelIndex/timeStampInMs/
-  absTimeStampInSec 等字段及对应单点访问器。本用例聚焦这些"新增字段"，逐字段
+  0.9.0 新增了 Sample.rawData/impedance/saturation/channelIndex/absTimeStampInSec
+  等字段及对应单点访问器。本用例聚焦这些"新增字段"，逐字段
   给出独立结论，区别于 DATA-FUNC-007（全字段 + sampleIndex 单调）。
+  timeStampInMs 仅有 getTimeStampInMs(ci,si) 访问器，Sample 无对应字段，故不比对。
   channelIndex 语义为"样本所属通道"，getChannelSample(ci,si).channelIndex 应 == ci。
 
 前置条件：
@@ -55,13 +56,11 @@ class BatchCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             if self.first_batch is None and n > 0:
                 self.first_batch = d
@@ -73,7 +72,6 @@ NEW_FIELD_ACCESSORS = [
     ("rawData", "getRawData"),
     ("impedance", "getImpedance"),
     ("saturation", "getSaturation"),
-    ("timeStampInMs", "getTimeStampInMs"),
     ("absTimeStampInSec", "getAbsTimeStampInSec"),
 ]
 
@@ -84,14 +82,10 @@ def check_new_fields(data, results):
     def add(name, ok, expect, actual):
         record(results, name, ok, expect, actual)
 
-    cs = getattr(data, 'channelSamples', None)
-    if not cs:
-        add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0", "channelSamples 为空/无数据")
-        return
     try:
-        n_ch = len(cs)
-        n_s = len(cs[0]) if n_ch else 0
-    except TypeError:
+        n_ch = data.getChannelCount()
+        n_s = data.getSampleCount()
+    except Exception:
         n_ch = n_s = 0
     if n_ch == 0 or n_s == 0:
         add("channelSamples 结构合法", False, "通道数>0 且每通道样本数>0",
@@ -105,7 +99,7 @@ def check_new_fields(data, results):
         for ci in range(n_ch):
             for si in range(n_s):
                 try:
-                    s = cs[ci][si]
+                    s = data.getChannelSample(ci, si)
                     bad = check_fn(ci, si, s)
                 except Exception as e:
                     bad = f"抛异常 {type(e).__name__}: {e}"

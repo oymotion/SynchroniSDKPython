@@ -128,12 +128,17 @@ async def main_async():
 
     def on_data(s, data_list):
         for d in data_list:
-            cs = getattr(d, 'channelSamples', None)
-            if cs and len(cs) > 0 and len(cs[0]) > 0:
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount/getChannelSample
+            try:
+                n_ch = d.getChannelCount()
+                n_s = d.getSampleCount()
+            except Exception:
+                n_ch = n_s = 0
+            if n_ch > 0 and n_s > 0:
                 ssi = getattr(d, 'startSampleIndex', None)
                 first_si = None
                 try:
-                    first_si = cs[0][0].sampleIndex
+                    first_si = d.getChannelSample(0, 0).sampleIndex
                 except Exception:
                     pass
                 with batch_lock:

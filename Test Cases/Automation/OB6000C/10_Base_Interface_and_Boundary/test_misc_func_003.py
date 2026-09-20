@@ -129,8 +129,13 @@ async def main_async():
     def on_data(s, data_list):
         nonlocal captured_data
         for d in data_list:
-            cs = getattr(d, 'channelSamples', None)
-            if cs and len(cs) > 0 and len(cs[0]) > 0:
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                n_ch = d.getChannelCount()
+                n_s = d.getSampleCount()
+            except Exception:
+                n_ch = n_s = 0
+            if n_ch > 0 and n_s > 0:
                 with sample_lock:
                     if captured_data is None:
                         captured_data = d
@@ -174,12 +179,11 @@ async def main_async():
            f"type={type(captured_data).__name__}")
 
     # 记录 clear 前的状态
-    cs_before = getattr(captured_data, 'channelSamples', None)
     try:
-        n_ch_before = len(cs_before) if cs_before else 0
-    except TypeError:
+        n_ch_before = captured_data.getChannelCount()
+    except Exception:
         n_ch_before = 0
-    print(f"[clear前] channelSamples 通道数={n_ch_before}", flush=True)
+    print(f"[clear前] getChannelCount()={n_ch_before}", flush=True)
 
     # 尝试调用 clear() 或 reset()
     clear_method = None
@@ -215,20 +219,15 @@ async def main_async():
     record(results, f"SensorData.{clear_method}() 不抛异常", True, f"{clear_method}() 正常执行", "无异常")
 
     # 检查 clear 后的状态
-    cs_after = getattr(captured_data, 'channelSamples', None)
-    if cs_after is None:
+    try:
+        n_ch_after = captured_data.getChannelCount()
+    except Exception:
         n_ch_after = 0
-        print(f"[clear后] channelSamples = None", flush=True)
-    else:
-        try:
-            n_ch_after = len(cs_after)
-        except TypeError:
-            n_ch_after = 0
-        print(f"[clear后] channelSamples 通道数={n_ch_after}", flush=True)
+    print(f"[clear后] getChannelCount()={n_ch_after}", flush=True)
 
-    cleared = (n_ch_after == 0 or cs_after is None)
-    record(results, f"{clear_method}() 后 channelSamples 归零/空", cleared,
-           "channelSamples 为空或通道数为 0", f"通道数={n_ch_after}")
+    cleared = (n_ch_after == 0)
+    record(results, f"{clear_method}() 后通道数归零", cleared,
+           "getChannelCount() == 0", f"通道数={n_ch_after}")
 
     # 清理
     try:

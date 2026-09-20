@@ -74,13 +74,10 @@ class MetaCollector:
             except Exception:
                 dt_key = "?"
             self.type_counts[dt_key] = self.type_counts.get(dt_key, 0) + 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             self.total_samples += n
             # 只保存第一个“非空”的 NTF_EEG 批次，避免把 IMU 聚合批当成 EEG
             if self.first_batch is None and n > 0 and dt == DataType.NTF_EEG:

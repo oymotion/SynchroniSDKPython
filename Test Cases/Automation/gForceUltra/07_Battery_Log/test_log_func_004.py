@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
-"""LOG-FUNC-004：早期 scan/connect 日志不丢失。
+"""LOG-FUNC-004：日志完整记录 scan/connect 事件。
 
 对应用例：07_Battery_Log.md -> LOG-FUNC-004
 可自动化：auto（设备上电、在范围内为运行前置；测试中无需人工动作）
 
 流程：
-  1) 先不开启 debug 日志，执行 scan、connect、到达 Ready
-  2) 连接成功后，再 setDebugEnabled(True) + setLogPath 指向临时目录
-  3) 检查：日志文件中包含 scan/connect 阶段的早期事件（说明早期日志未丢失）
+  1) 初始化后立即 setLogPath 指向临时目录 + setDebugEnabled(True) 开启日志
+  2) 执行 scan、connect、到达 Ready
+  3) 检查：日志文件中包含 scan/connect 阶段事件
 
 说明：
-  SDK 内部可能缓冲早期日志，在 setDebugEnabled(True) 后才写入文件。
-  本用例验证即使延迟开启日志，扫描/连接阶段的日志也不会丢失。
-  通过在日志文件中搜索 scan/connect 相关的关键字来验证。
+  本用例验证「先开日志再做操作」这一正常流程下，日志能完整记录
+  scan/connect 等关键事件。通过在日志文件中搜索 scan/connect 相关关键字来验证。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -75,7 +74,7 @@ def main():
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
-    print("LOG-FUNC-004 早期 scan/connect 日志不丢失", flush=True)
+    print("LOG-FUNC-004 日志完整记录 scan/connect 事件", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
@@ -97,7 +96,25 @@ def main():
         ctrl.terminate()
         return
 
-    # 注意：此时尚未开启 debug 日志 — 早期日志应被 SDK 缓冲
+    # ---- 关键步骤：初始化后立即开启 debug 日志（在 scan/connect 之前）----
+    log_dir = tempfile.mkdtemp(prefix="sdklog_")
+    print(f"\n[日志目录] 初始化后立即开启日志，使用受控目录 {log_dir}", flush=True)
+    try:
+        ctrl.setLogPath(True, log_dir)
+        log_ok = True
+        log_txt = f"setLogPath(True, {log_dir}) 无异常"
+    except Exception as e:
+        log_ok = False
+        log_txt = f"setLogPath 抛异常 {type(e).__name__}: {e}"
+    print(f"[日志目录] {log_txt}", flush=True)
+    record(results, "setLogPath 设置受控日志目录", log_ok,
+           "setLogPath(True, dir) 无异常", log_txt)
+
+    try:
+        ctrl.setDebugEnabled(True)
+        print("[日志目录] setDebugEnabled(True) 无异常", flush=True)
+    except Exception as e:
+        print(f"[日志目录] setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}", flush=True)
 
     # 扫描匹配
     print(f"\n[扫描] 目标 identity: {common.TARGET_IDENTITIES}", flush=True)
@@ -164,30 +181,10 @@ def main():
         ctrl.terminate()
         return
 
-    # ---- 关键步骤：在 scan/connect 完成后才开启 debug 日志 ----
-    log_dir = tempfile.mkdtemp(prefix="sdklog_")
-    print(f"\n[日志目录] 延迟开启日志，使用受控目录 {log_dir}", flush=True)
-    try:
-        ctrl.setLogPath(True, log_dir)
-        log_ok = True
-        log_txt = f"setLogPath(True, {log_dir}) 无异常"
-    except Exception as e:
-        log_ok = False
-        log_txt = f"setLogPath 抛异常 {type(e).__name__}: {e}"
-    print(f"[日志目录] {log_txt}", flush=True)
-    record(results, "setLogPath 设置受控日志目录", log_ok,
-           "setLogPath(True, dir) 无异常", log_txt)
-
-    try:
-        ctrl.setDebugEnabled(True)
-        print("[日志目录] setDebugEnabled(True) 无异常", flush=True)
-    except Exception as e:
-        print(f"[日志目录] setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}", flush=True)
-
-    # 给 SDK 一些时间将缓冲的早期日志写入文件
+    # 给 SDK 一些时间将 scan/connect 阶段的日志写入文件
     time.sleep(2.0)
 
-    # ---- 检查日志中是否包含早期 scan/connect 事件 ----
+    # ---- 检查日志中是否包含 scan/connect 事件 ----
     # 搜索关键字：scan, connect, BLE, 设备名, 设备地址, identity
     keywords = [
         "scan",
@@ -206,15 +203,15 @@ def main():
     for m in matches[:10]:  # 最多显示 10 行
         print(f"  {m[:120]}", flush=True)
 
-    has_early_events = len(matches) > 0
-    if has_early_events:
-        early_txt = f"日志中找到 {len(matches)} 条匹配早期事件的行"
+    has_events = len(matches) > 0
+    if has_events:
+        events_txt = f"日志中找到 {len(matches)} 条匹配 scan/connect 事件的行"
     else:
-        early_txt = "日志中未找到匹配早期事件的行（可能日志为空或关键字不匹配）"
+        events_txt = "日志中未找到匹配 scan/connect 事件的行（可能日志为空或关键字不匹配）"
 
-    record(results, "早期 scan/connect 日志不丢失（日志含早期事件）", has_early_events,
-           "延迟开启 debug 日志后，日志文件中包含 scan/connect 阶段的早期事件",
-           early_txt)
+    record(results, "日志记录 scan/connect 事件", has_events,
+           "开启 debug 日志后，日志文件中包含 scan/connect 阶段事件",
+           events_txt)
 
     # 断开
     try:

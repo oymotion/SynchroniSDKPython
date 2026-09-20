@@ -110,8 +110,15 @@ async def main_async():
     record(results, "asyncDisconnect 返回 True", ok_disconnect is True,
            "asyncDisconnect() 返回 True", f"asyncDisconnect() -> {ok_disconnect}")
 
+    # 状态 Disconnecting→Disconnected 是异步的，轮询等待终态（最多 5 秒）
     final_state = sensor.deviceState
-    print(f"[检查2] 断开后 deviceState = {final_state}", flush=True)
+    waited = 0.0
+    interval = 0.5
+    while final_state != DeviceStateEx.Disconnected and waited < 5:
+        await asyncio.sleep(interval)
+        waited += interval
+        final_state = sensor.deviceState
+    print(f"[检查2] 断开后 deviceState = {final_state}（等待 {waited:.1f}s）", flush=True)
     record(results, "asyncDisconnect 后 deviceState==Disconnected", final_state == DeviceStateEx.Disconnected,
            "deviceState == DeviceStateEx.Disconnected", f"deviceState == {final_state}")
 

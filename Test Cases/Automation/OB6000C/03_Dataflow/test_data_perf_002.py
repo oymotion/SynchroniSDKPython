@@ -98,13 +98,11 @@ class LongRunCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            if cs:
-                try:
-                    n_ch = len(cs)
-                    self.total_samples += len(cs[0]) if n_ch else 0
-                except TypeError:
-                    self.total_samples += len(cs)
+            # 1.3.0 已移除 channelSamples；getSampleCount() 即每通道样本数
+            try:
+                self.total_samples += d.getSampleCount()
+            except Exception:
+                pass
 
 
 def main():

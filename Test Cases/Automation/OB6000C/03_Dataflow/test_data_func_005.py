@@ -164,14 +164,11 @@ class DataCollector:
             dt = d.getDataType()
             entry = self.by_type.setdefault(dt, {'batches': 0, 'samples': 0})
             entry['batches'] += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
-            entry['samples'] += n
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                entry['samples'] += d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                pass
 
     def clear(self):
         self.by_type.clear()

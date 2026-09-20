@@ -81,16 +81,20 @@ def main():
            dir_created_txt)
 
     # ---- 测试 2：setLogPath 指向已存在的文件，应被拒绝 ----
-    # 创建一个临时文件
+    # 创建一个临时文件，写入 sentinel 内容，用于区分后续是 append / 覆盖 / 删除
     fd, temp_file = tempfile.mkstemp(suffix=".txt", prefix="existing_file_")
+    sentinel = b"SENTINEL_ORIGINAL_CONTENT_7f3a9c\n"
+    os.write(fd, sentinel)
     os.close(fd)
+    size_before = os.path.getsize(temp_file)
     print(f"\n[测试2] setLogPath(True, '{temp_file}')", flush=True)
     print(f"[测试2] 参数: enable=True, path='{temp_file}'", flush=True)
     print(f"[测试2] 路径类型: {'文件' if os.path.isfile(temp_file) else '目录' if os.path.isdir(temp_file) else '不存在'}", flush=True)
-    print(f"[测试2] 文件大小: {os.path.getsize(temp_file)} bytes", flush=True)
+    print(f"[测试2] 文件原始大小: {size_before} bytes（sentinel 长度 {len(sentinel)}）", flush=True)
 
     file_rejected = False
     file_rejected_txt = ""
+    ret = None
     try:
         ret = ctrl.setLogPath(True, temp_file)
         print(f"[测试2] setLogPath 返回值: {ret}", flush=True)
@@ -104,6 +108,69 @@ def main():
     record(results, "setLogPath 指向已存在文件被拒绝", file_rejected,
            "setLogPath(True, 已存在文件) 抛异常或返回错误",
            file_rejected_txt)
+
+    # ---- 测试 2b：若未拒绝，进一步验证对已存在文件的实际影响 ----
+    # 三种可能后果：
+    #   1) 追加写入（可接受）  —— 原内容保留，新日志追加在后
+    #   2) 写时报错/未写入（无问题）—— 文件不变，原内容保留
+    #   3) 覆盖/截断/删除（严重）—— 原内容丢失、文件被删或变小
+    if not file_rejected:
+        print(f"\n[测试2b] 未拒绝，继续验证实际影响 ...", flush=True)
+        try:
+            ctrl.setDebugEnabled(True)
+        except Exception as e:
+            print(f"[测试2b] setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}", flush=True)
+
+        # 刷一些日志（controller 级，无需设备）
+        for _ in range(3):
+            for key in ("BACK_END", "DEBUG_ENABLED", "LOG_PATH"):
+                try:
+                    ctrl.getParam(key)
+                except Exception:
+                    pass
+        if ctrl.isEnable:
+            try:
+                ctrl.scan(config.SCAN_TIMEOUT_MS)
+            except Exception as e:
+                print(f"[测试2b] scan 抛异常 {type(e).__name__}: {e}", flush=True)
+        time.sleep(2.0)
+
+        exists_after = os.path.isfile(temp_file)
+        size_after = os.path.getsize(temp_file) if exists_after else None
+        prefix = b""
+        if exists_after:
+            try:
+                with open(temp_file, "rb") as f:
+                    prefix = f.read(len(sentinel))
+            except Exception:
+                pass
+        sentinel_preserved = exists_after and prefix == sentinel
+
+        if not exists_after:
+            outcome = "文件被删除（严重）"
+            ok = False
+        elif size_after < size_before:
+            outcome = f"文件被截断（严重）：{size_before} -> {size_after} bytes"
+            ok = False
+        elif sentinel_preserved and size_after > size_before:
+            outcome = f"追加写入（可接受）：{size_before} -> {size_after} bytes，原内容保留"
+            ok = True
+        elif sentinel_preserved and size_after == size_before:
+            outcome = f"未写入（无问题）：大小不变 {size_after} bytes，原内容保留"
+            ok = True
+        else:
+            outcome = f"文件被覆盖（严重）：大小 {size_before} -> {size_after}，原内容丢失"
+            ok = False
+
+        print(f"[测试2b] 文件存在: {exists_after}", flush=True)
+        print(f"[测试2b] 文件大小: {size_before} -> {size_after}", flush=True)
+        print(f"[测试2b] sentinel 保留: {sentinel_preserved}", flush=True)
+        print(f"[测试2b] 结论: {outcome}", flush=True)
+        record(results, "setLogPath 指向已存在文件的实际影响", ok,
+               "追加写入或未写入（原内容不丢失，不覆盖/删除）",
+               outcome)
+    else:
+        print("[测试2b] setLogPath 已拒绝，跳过实际影响验证", flush=True)
 
     # 清理临时文件
     try:

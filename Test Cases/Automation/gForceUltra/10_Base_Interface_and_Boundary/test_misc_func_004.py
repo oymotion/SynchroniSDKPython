@@ -50,13 +50,15 @@ def _sensor_data_snapshot(d):
         except Exception as e:
             snap[m] = f"异常: {e}"
 
-    # channelSamples 中各样本的关键字段
-    cs = getattr(d, 'channelSamples', None)
+    # 各样本的关键字段（1.3.0 无 channelSamples，用 getChannelSample 遍历）
     samples = []
-    if cs:
-        for ci, ch in enumerate(cs):
-            for si, s in enumerate(ch):
+    try:
+        n_ch = d.getChannelCount()
+        n_s = d.getSampleCount()
+        for ci in range(n_ch):
+            for si in range(n_s):
                 try:
+                    s = d.getChannelSample(ci, si)
                     samples.append({
                         "ci": ci, "si": si,
                         "data": getattr(s, 'data', None),
@@ -65,6 +67,8 @@ def _sensor_data_snapshot(d):
                     })
                 except Exception as e:
                     samples.append({"ci": ci, "si": si, "error": str(e)})
+    except Exception:
+        pass
     snap["samples"] = samples
     return snap
 
@@ -165,8 +169,13 @@ async def main_async():
     def on_data(s, data_list):
         nonlocal captured_data
         for d in data_list:
-            cs = getattr(d, 'channelSamples', None)
-            if cs and len(cs) > 0 and len(cs[0]) > 0:
+            # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount
+            try:
+                n_ch = d.getChannelCount()
+                n_s = d.getSampleCount()
+            except Exception:
+                n_ch = n_s = 0
+            if n_ch > 0 and n_s > 0:
                 with sample_lock:
                     if captured_data is None:
                         captured_data = d
