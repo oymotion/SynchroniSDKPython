@@ -45,7 +45,7 @@ def main():
         input("\n>>> [人工操作] 请确认 USB BLE dongle 已插入【电脑】（如需装 WinUSB 驱动请先完成），"
               "完成后按回车继续 ...")
     else:
-        print("\n当前为 bleak 后端，checkSetupDongle 将退化为 'OK'（无数量的 OK）。", flush=True)
+        print("\n当前为 winrt 后端，checkSetupDongle 将退化为 'OK'（无数量的 OK）。", flush=True)
         input(">>> [人工操作] 若想验证 bumble 后端，请设置环境变量 SENSOR_SDK_BLE_BACKEND=bumble、"
               "插入 dongle 后重跑；现在按回车直接在当前后端下测试 ...")
 

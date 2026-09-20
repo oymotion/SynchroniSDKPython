@@ -11,7 +11,7 @@
 | 类型归属 | 头环 / EEG 设备 |
 | 核心能力 | NTF_EEG（2 通道脑电）、NTF_PPG、NTF_IMU、NTF_IMPEDANCE（电极接触检测） |
 | 采样率 | EEG `250`（唯一）；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
-| SDK 版本 | 0.9.1 |
+| SDK 版本 | 1.3.0 |
 
 ## 能力假设（连接后用 getDeviceInfo() 确认）
 
@@ -35,11 +35,11 @@
 | 磁角度 MAG_ANGLE | `MagAngleChannelCount > 0` | 待确认 | 待确认 |
 
 > 与 OB6000C 的关键差异：Cerelax 为 **2 通道 EEG 头环**（OB6000C 为 32 通道），并**新增 PPG / IMU / Impedance 电极接触检测**；不支持 ECG / EMG / GEST / BRTH。
-> 采样率有三套（EEG / IMU / PPG）。当前 SDK 版本的 `setParam` 仅提供 `EEG_SAMPLE_RATE` 设置接口；IMU / PPG 采样率设置（`IMU_SAMPLE_RATE` / `PPG_SAMPLE_RATE`）**为规划中的功能，当前版本尚未提供**，仅可读 `getDeviceInfo()` 的只读字段（`ImuSampleRate` / `PpgSampleRate`）。相关设置用例已先行登记（PARAM-FUNC-012/013、DATA-FUNC-014），待 SDK 实现后执行。
+> 采样率有三套（EEG / IMU / PPG）。SDK 1.3.0 已文档化 `setParam`/`getParam` 的 `EEG_SAMPLE_RATE` / `IMU_SAMPLE_RATE` / `PPG_SAMPLE_RATE`（含 `_LIST` 可选值查询）。IMU/PPG 采样率按设备能力门控（IMU 需扩展 IMU 能力、PPG 需 PPG 能力），能力缺失或列表为空时返回 `Error`，仅可读 `getDeviceInfo()` 的只读字段（`ImuSampleRate` / `PpgSampleRate`）作为标称参考。相关用例见 PARAM-FUNC-011/012/013、DATA-FUNC-014。
 
 ## 环境与前置条件
 
-- Python 3.10~3.14，`sensor-sdk==0.9.6`（`pip install --upgrade sensor-sdk`）。
+- Python 3.10~3.14，`sensor-sdk==1.3.0`（`pip install --upgrade sensor-sdk`）。
 - 蓝牙开启（bleak 后端）或 dongle 已绑定（bumble 后端，`checkSetupDongle()` 返回 `OK`）。
 - 设备上电、在扫描范围内。
 - 每个脚本结束调用 `SensorControllerInstance.terminate()`；Ctrl+C 异常路径也需调用。
@@ -127,7 +127,7 @@
 | SensorProfile | getBatteryLevel/onPowerChanged | BATT-FUNC-001/002 | BATT-FUNC-004（失效模式） |
 | SensorProfile | async 变体 | ASYNC-FUNC-001~012 | ASYNC-FUNC-010（混用限制） |
 | SensorData | getSampleRate/getChannelCount 等 | DATA-FUNC-006 | DATA-PERF-003（标称值校验） |
-| SensorData | clone/clear/reset/to_flatbuffers | DATA-FUNC-012、MISC-003~005 | — |
+| SensorData | clone | DATA-FUNC-012 | clear/reset/to_flatbuffers 已移除（SDK 1.3.0），MISC-003~005 标记为跳过 |
 
 > 未映射到用例的接口（如底层序列化签名待确认项）显式标"未覆盖"，待 README 定案后补齐。
 

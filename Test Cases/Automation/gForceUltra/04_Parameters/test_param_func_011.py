@@ -1,20 +1,25 @@
 # -*- coding: utf-8 -*-
-"""DATA-FUNC-003：startDataNotification 后 isDataTransfering==True，回调按批触发。
+"""PARAM-FUNC-011：getParam IMU/PPG_SAMPLE_RATE 与 EMG_RESOLUTION（能力门控）。
 
-对应用例：03_数据流.md -> DATA-FUNC-003
-可自动化：auto（设备上电在范围内为运行前置，测试中无需人工动作）
+对应用例：04_参数.md -> PARAM-FUNC-011
+可自动化：auto（设备上电、在范围内为运行前置）
 
 流程：
-  1) scan -> requireSensor -> connect -> 到达 Ready
-  2) init(packageSampleCount, powerRefreshInterval)
-  3) startDataNotification 起流
-  4) 断言 isDataTransfering==True
-  5) 采集窗口内统计 onDataCallback 批次/样本数，断言回调持续触发（≥2 批）
+  1) scan -> requireSensor -> connect -> 到达 Ready -> init
+  2) getDeviceInfo() 读取 ImuChannelCount / PpgChannelCount（能力门控参考）
+  3) 逐一 getParam：
+     - IMU_SAMPLE_RATE / IMU_SAMPLE_RATE_LIST
+     - PPG_SAMPLE_RATE / PPG_SAMPLE_RATE_LIST
+     - EMG_RESOLUTION / EMG_RESOLUTION_LIST
+  4) 硬断言：每次查询返回 str（不崩溃）；支持时返回当前值/管道分隔列表，
+     不支持时返回以 Error 开头或空列表，均视为"查询接口正确"
 
 说明：
-  本用例只验证"起流链路正常"（isDataTransfering + 回调持续）。
-  每批样本数 ≈ packageSampleCount 的批大小验证见 DATA-FUNC-009。
-  onDataCallback 兼容单个 SensorData 与 list 两种形式。
+  SDK 1.3.0 已文档化 IMU_SAMPLE_RATE / PPG_SAMPLE_RATE / EMG_RESOLUTION 及各自 _LIST
+  查询键。这些键按设备能力门控：gForceUltra 有 IMU（NTF_IMU/NTF_GFORCE_*），PPG 按
+  PpgChannelCount 判定，EMG_RESOLUTION 仅 legacy RAW-signal EMG（新 EMG 预期 Error/空）。
+  因此本用例不做"必须返回有效值"的硬断言，只验证查询接口正确返回（不崩溃）且返回值
+  属于"有效值 或 Error 开头/空"两种合法形态之一；能力形态另作 informational 输出。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -31,49 +36,29 @@ sys.path.insert(0, AUTOMATION_DIR)
 
 from sensor import *
 import config
-
-COLLECT_SECONDS = 5  # 起流后采集时长（秒）
-
+import common
 from common import record, scan_and_match
 
+# 查询键分组：单点查询 + 可选值列表查询
+QUERY_KEYS = [
+    ("IMU_SAMPLE_RATE", "IMU_SAMPLE_RATE_LIST"),
+    ("PPG_SAMPLE_RATE", "PPG_SAMPLE_RATE_LIST"),
+    ("EMG_RESOLUTION", "EMG_RESOLUTION_LIST"),
+]
 
-def _dt_name(dt):
+
+def _get(sensor, key):
     try:
-        if isinstance(dt, DataType):
-            return dt.name
-        return DataType(dt).name
-    except Exception:
-        return str(dt)
-
-
-class DataResult:
-    def __init__(self):
-        self.batches = 0
-        self.total_samples = 0
-        self.data_types = set()
-
-
-def make_on_data(result):
-    def on_data(sensor, data):
-        items = data if isinstance(data, list) else [data]
-        for d in items:
-            result.batches += 1
-            try:
-                n = d.getChannelCount() * d.getSampleCount()
-            except Exception:
-                n = 0
-            result.total_samples += n
-            dt = d.getDataType()
-            if dt is not None:
-                result.data_types.add(_dt_name(dt))
-    return on_data
+        return sensor.getParam(key)
+    except Exception as e:
+        return f"抛异常 {type(e).__name__}: {e}"
 
 
 def main():
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
-    print("DATA-FUNC-003 startDataNotification 后 isDataTransfering==True，回调按批触发", flush=True)
+    print("PARAM-FUNC-011 getParam IMU/PPG_SAMPLE_RATE 与 EMG_RESOLUTION（能力门控）", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
@@ -82,7 +67,8 @@ def main():
     print("  - 主机(电脑)：蓝牙已开启", flush=True)
     print("  - 待测设备：gForceUltra 上电、在范围内", flush=True)
 
-    input("\n>>> [人工操作] 请确认待测设备 gForceUltra 已【开机】且在范围内，完成后按回车继续 ...")
+    input("\n>>> [人工操作] 请确认待测设备 gForceUltra 已【开机】且在范围内，"
+          "测试过程无需额外动作，完成后按回车继续 ...")
 
     results = []
 
@@ -95,11 +81,18 @@ def main():
         return
 
     # 扫描匹配
-    print(f"\n[扫描] SensorController.scan({config.SCAN_TIMEOUT_MS}) ...", flush=True)
+    print(f"\n[扫描] 目标 identity: {common.TARGET_IDENTITIES}", flush=True)
     target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS)
+    print(f"[扫描] 扫描到 {len(devices) if devices else 0} 台设备:", flush=True)
+    if devices:
+        for d in devices:
+            n = getattr(d, 'Name', '?')
+            a = getattr(d, 'Address', '?')
+            print(f"  {n} {a} identity={common._identity_of(n)}", flush=True)
+
     if target is None:
-        print("[FAIL] 未匹配到 config 中启用的设备", flush=True)
-        record(results, "scan 匹配到目标设备", False, "scan 返回含启用的目标设备", "未匹配到目标")
+        print("[FAIL] 未匹配到目标设备", flush=True)
+        record(results, "scan 匹配到目标设备", False, "scan 返回含目标设备", "未匹配到目标")
         print("\n结论: FAIL", flush=True)
         ctrl.terminate()
         return
@@ -107,7 +100,7 @@ def main():
     name = getattr(target, 'Name', '?')
     addr = getattr(target, 'Address', '?')
     print(f"[扫描] 目标设备: {name} {addr}", flush=True)
-    record(results, "scan 匹配到目标设备", True, "scan 返回含启用的目标设备", f"匹配到 {name} {addr}")
+    record(results, "scan 匹配到目标设备", True, "scan 返回含目标设备", f"匹配到 {name} {addr}")
 
     # requireSensor
     sensor = ctrl.requireSensor(target)
@@ -160,43 +153,41 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # 起流
-    result = DataResult()
-    sensor.onDataCallback = make_on_data(result)
-
-    print("\n[起流] SensorProfile.startDataNotification() ...", flush=True)
+    # 能力参考：DeviceInfo 通道数
+    di = None
     try:
-        sret = sensor.startDataNotification()
-        start_txt = f"返回 {sret}"
+        di = sensor.getDeviceInfo()
     except Exception as e:
-        sret = None
-        start_txt = f"抛异常 {type(e).__name__}: {e}"
-    print(f"[起流] SensorProfile.startDataNotification() -> {start_txt}", flush=True)
-    record(results, "SensorProfile.startDataNotification 返回 True", sret is True,
-           "startDataNotification() 返回 True", f"startDataNotification() -> {start_txt}")
+        print(f"[设备信息] getDeviceInfo 抛异常 {type(e).__name__}: {e}", flush=True)
+    imu_ch = getattr(di, "ImuChannelCount", 0) if di else 0
+    ppg_ch = getattr(di, "PpgChannelCount", 0) if di else 0
+    print(f"\n[能力] getDeviceInfo: ImuChannelCount={imu_ch}, PpgChannelCount={ppg_ch}", flush=True)
+    record(results, "getDeviceInfo 返回 DeviceInfo", di is not None,
+           "getDeviceInfo 返回 DeviceInfo", f"返回 {type(di).__name__}")
 
-    # isDataTransfering
-    transferring = sensor.isDataTransfering
-    print(f"[检查] SensorProfile.isDataTransfering = {transferring}", flush=True)
-    record(results, "起流后 isDataTransfering==True", transferring is True,
-           "isDataTransfering == True", f"isDataTransfering == {transferring}")
+    # 逐一查询（能力门控）
+    for single_key, list_key in QUERY_KEYS:
+        v_single = _get(sensor, single_key)
+        v_list = _get(sensor, list_key)
+        print(f"\n[getParam] {single_key} = {v_single!r}", flush=True)
+        print(f"[getParam] {list_key} = {v_list!r}", flush=True)
 
-    # 采集窗口，观察回调持续触发
-    print(f"\n[采集] 等待 {COLLECT_SECONDS}s 观察 onDataCallback ...", flush=True)
-    time.sleep(COLLECT_SECONDS)
+        single_ok = isinstance(v_single, str) and not v_single.startswith("抛异常")
+        list_ok = isinstance(v_list, str) and not v_list.startswith("抛异常")
 
-    print(f"[采集] 收到批数={result.batches} 样本数={result.total_samples} 数据类型={sorted(result.data_types)}", flush=True)
-    # 持续触发：采集窗口内至少收到 2 批，且样本数 > 0
-    sustained = (result.batches >= 2 and result.total_samples > 0)
-    record(results, "onDataCallback 持续触发（≥2 批）", sustained,
-           "采集窗口内收到 ≥2 批且样本数>0",
-           f"批数={result.batches} 样本数={result.total_samples} 类型={sorted(result.data_types)}")
+        record(results, f"getParam('{single_key}') 不崩溃", single_ok,
+               f"getParam('{single_key}') 返回 str（Error 或有效值）",
+               f"{single_key}={v_single!r}")
+        record(results, f"getParam('{list_key}') 不崩溃", list_ok,
+               f"getParam('{list_key}') 返回 str（Error 或有效值）",
+               f"{list_key}={v_list!r}")
+
+        # informational：能力形态（有效值 / Error 开头 / 空），供人工与后续校准
+        record(results, f"{single_key} 能力形态（informational）", None,
+               "有效值或 Error/空 均为合法形态",
+               f"{single_key}={v_single!r} {list_key}={v_list!r}")
 
     # 清理
-    try:
-        sensor.stopDataNotification()
-    except Exception:
-        pass
     try:
         sensor.disconnect()
     except Exception as e:
@@ -210,11 +201,13 @@ def main():
     for rname, status, expect, actual in results:
         if status == "PASS":
             print(f"  [PASS] {rname}（实际: {actual}）", flush=True)
+        elif status == "SKIP":
+            print(f"  [SKIP] {rname}（{actual}）", flush=True)
         else:
             print(f"  [FAIL] {rname}", flush=True)
             print(f"         期待: {expect}", flush=True)
             print(f"         实际: {actual}", flush=True)
-        if status != "PASS":
+        if status == "FAIL":
             all_pass = False
 
     print("\n结论: " + ("PASS" if all_pass else "FAIL"), flush=True)

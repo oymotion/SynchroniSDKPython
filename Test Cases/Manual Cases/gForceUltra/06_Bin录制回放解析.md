@@ -1,5 +1,10 @@
 # gForceUltra Bin 录制/回放/解析用例（BIN-*）
 
+> 实现说明：凡涉及离线回放 `replayBinFile` 的用例（BIN-FUNC-004/005/006/009、BIN-ROB-003），
+> 自动化脚本必须在独立子进程里用 fresh controller + fresh profile 回放；进程内复用已连接/已起流
+> 的 profile 会得到 0 批/0 样本，且随后 disconnect 触发 native access violation。BIN-FUNC-007
+> 是「实时起流中拒绝回放」的互斥验证，仍保留进程内（其核心是验证拒绝，而非真正回放数据）。
+
 ### BIN-FUNC-001 连接后自动生成 .bin
 - **测试目的**：验证 bin 自动录制。
 - **流程与逻辑**：连接起流，检查是否生成 `{DeviceName}_{MAC}_{时间戳}.bin`。
@@ -12,7 +17,7 @@
 ### BIN-FUNC-002 getBinFileInfo 返回字段
 - **测试目的**：验证 bin 信息。
 - **流程与逻辑**：对有效 bin 调 `getBinFileInfo`。
-- **预期结果**：返回含 `device_mac/device_name/chip_type/replay_duration` 的 dict。
+- **预期结果**：返回含 `device_mac/device_name/chip_type/is_universal_stream/feature_map/device_info/sensor_datas/replay_duration` 的 dict。
 - **有效性说明**：bin 元数据完整。
 - **可自动化**：auto
 - **人工介入**：无

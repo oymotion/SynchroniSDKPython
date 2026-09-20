@@ -22,12 +22,13 @@
   - 待测设备：gForceUltra 上电、在范围内
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
 import time
 import tempfile
-import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTOMATION_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
@@ -40,10 +41,7 @@ from common import record, _identity_of, scan_and_match
 
 COLLECT_SECONDS = 30  # 起流采集时长（秒）：录制足够长，确保回放有充足窗口执行 pause/resume/stop
 SETTLE_SECONDS = 2  # 停流后的刹车时间（秒）
-PAUSE_SLEEP = 3  # pause 后观察窗口（秒）
 PAUSE_GROWTH_TOLERANCE = 20  # pause 后"刹车滑行"允许的最大批数增长（在途/缓冲数据仍会短暂流入）
-RESUME_SLEEP = 3  # resume 后观察窗口（秒）
-THREAD_JOIN_TIMEOUT = 60  # 等待回放子线程结束的超时（秒）
 
 
 def _list_bins(log_dir):
@@ -66,34 +64,29 @@ def _get_ble_path(sensor):
         return f"抛异常 {type(e).__name__}: {e}"
 
 
-class BatchCounter:
-    """onDataCallback 计数，线程安全。"""
-
-    def __init__(self):
-        self.count = 0
-        self.lock = threading.Lock()
-
-    def __call__(self, sensor, data):
-        items = data if isinstance(data, list) else [data]
-        with self.lock:
-            self.count += len(items)
-
-    def snapshot(self):
-        with self.lock:
-            return self.count
-
-
-def _call_ctrl(method, *args):
-    """调用 controller 方法并返回 (返回值, 异常信息)。"""
-    try:
-        r = method(*args)
-        return r, None
-    except Exception as e:
-        return None, f"抛异常 {type(e).__name__}: {e}"
-
-
 def _on_error(sensor, reason):
     print(f"[onErrorCallback] {getattr(sensor, 'BLEDevice', None)}: {reason}", flush=True)
+
+
+def _run_worker(bin_path, mode, realtime=False, timeout=180):
+    """在独立子进程里回放，返回解析后的 JSON dict。"""
+    worker = os.path.join(AUTOMATION_DIR, "replay_worker.py")
+    cmd = [sys.executable, worker, "--bin", bin_path, "--mode", mode]
+    if mode == "summary":
+        cmd += ["--realtime", "true" if realtime else "false"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return {"ok": False, "error": "子进程无 stdout",
+                    "returncode": proc.returncode, "stderr": (proc.stderr or "")[:500]}
+        try:
+            return json.loads(lines[-1])
+        except Exception as e:
+            return {"ok": False, "error": f"解析子进程 JSON 失败 {type(e).__name__}: {e}",
+                    "stdout": (proc.stdout or "")[:500], "stderr": (proc.stderr or "")[:500]}
+    except Exception as e:
+        return {"ok": False, "error": f"子进程回放异常 {type(e).__name__}: {e}"}
 
 
 def main():
@@ -285,79 +278,7 @@ def main():
         print("\n结论: FAIL", flush=True)
         return
 
-    # ---- 回放控制测试 ----
-    counter = BatchCounter()
-    sensor.onDataCallback = counter
-
-    replay_error = [None]
-
-    def replay_thread():
-        try:
-            ctrl.replayBinFile(bin_path, sensor, realtime=True)
-        except Exception as e:
-            replay_error[0] = f"{type(e).__name__}: {e}"
-
-    print(f"\n[回放] 在子线程中启动 replayBinFile(realtime=True, 录制 {COLLECT_SECONDS}s) ...", flush=True)
-    t = threading.Thread(target=replay_thread, daemon=True)
-    t.start()
-
-    # 等待数据开始流动（轮询，最多等 5s）
-    t_wait = time.time()
-    before_pause = 0
-    while time.time() - t_wait < 5:
-        before_pause = counter.snapshot()
-        if before_pause > 0:
-            break
-        time.sleep(0.2)
-    print(f"[回放] 当前批数 = {before_pause}（等待数据流动耗时 {time.time() - t_wait:.1f}s）", flush=True)
-    record(results, "回放开始产生数据", before_pause > 0,
-           "进入回放后 count > 0", f"before_pause={before_pause}")
-
-    # ---- pause ----
-    r, err = _call_ctrl(ctrl.pauseBinReplay, sensor)
-    print(f"[pause] pauseBinReplay -> {r!r}  err={err}", flush=True)
-    pause_ok = (r == "OK")
-    record(results, "pauseBinReplay 返回 OK", pause_ok,
-           "返回 'OK'", f"返回 {r!r}  err={err}")
-
-    time.sleep(PAUSE_SLEEP)
-    during_pause = counter.snapshot()
-    paused_growth = during_pause - before_pause
-    print(f"[pause] 暂停 {PAUSE_SLEEP}s 后批数 = {during_pause}（增长 {paused_growth}）", flush=True)
-    stopped = paused_growth <= PAUSE_GROWTH_TOLERANCE
-    record(results, "pause 后批数停止增长", stopped,
-           f"pause 后批数增长 <= {PAUSE_GROWTH_TOLERANCE}", f"增长 {paused_growth}")
-
-    # ---- resume ----
-    r, err = _call_ctrl(ctrl.resumeBinReplay, sensor)
-    print(f"[resume] resumeBinReplay -> {r!r}  err={err}", flush=True)
-    resume_ok = (r == "OK")
-    record(results, "resumeBinReplay 返回 OK", resume_ok,
-           "返回 'OK'", f"返回 {r!r}  err={err}")
-
-    time.sleep(RESUME_SLEEP)
-    after_resume = counter.snapshot()
-    resumed_growth = after_resume - during_pause
-    print(f"[resume] resume {RESUME_SLEEP}s 后批数 = {after_resume}（增长 {resumed_growth}）", flush=True)
-    resumed = resumed_growth > 0
-    record(results, "resume 后批数恢复增长", resumed,
-           "resume 后批数增长 > 0", f"增长 {resumed_growth}")
-
-    # ---- stop ----
-    r, err = _call_ctrl(ctrl.stopBinReplay, sensor)
-    print(f"[stop] stopBinReplay -> {r!r}  err={err}", flush=True)
-    stop_ok = (r == "OK")
-    record(results, "stopBinReplay 返回 OK", stop_ok,
-           "返回 'OK'", f"返回 {r!r}  err={err}")
-
-    # 等待子线程结束
-    t.join(timeout=THREAD_JOIN_TIMEOUT)
-    thread_done = not t.is_alive()
-    record(results, "stop 后回放子线程结束", thread_done,
-           f"子线程在 {THREAD_JOIN_TIMEOUT}s 内结束",
-           f"子线程{'已结束' if thread_done else '仍在运行'}" + (f" err={replay_error[0]}" if replay_error[0] else ""))
-
-    # 清理
+    # ---- 清理并终止本进程 SDK（释放 dongle，避免与回放子进程冲突）----
     try:
         sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
     except Exception:
@@ -368,6 +289,49 @@ def main():
         pass
 
     ctrl.terminate()
+
+    # ---- 回放控制：独立子进程（fresh controller + fresh profile）----
+    # 进程内回放会复用已连接/已起流的 profile（0 批/0 样本），故必须子进程回放。
+    result = _run_worker(bin_path, "control")
+    r_ok = result.get("ok") is True
+    r_err = result.get("error")
+
+    if r_ok:
+        detail = {k: result.get(k) for k in
+                  ('before_pause', 'pause_return', 'paused_growth',
+                   'resume_return', 'resumed_growth', 'stop_return', 'thread_done')}
+        print(f"[回放] 子进程控制回放完成：{detail}", flush=True)
+    else:
+        print(f"[回放] 子进程控制回放失败：{r_err}", flush=True)
+
+    before_pause = result.get("before_pause", 0)
+    paused_growth = result.get("paused_growth", 0)
+    resumed_growth = result.get("resumed_growth", 0)
+
+    record(results, "回放开始产生数据", r_ok and before_pause > 0,
+           "进入回放后 count > 0", f"before_pause={before_pause}")
+
+    record(results, "pauseBinReplay 返回 OK", r_ok and result.get("pause_return") == "OK",
+           "返回 'OK'", f"返回 {result.get('pause_return')!r}  err={result.get('pause_error')}")
+
+    stopped = paused_growth <= PAUSE_GROWTH_TOLERANCE
+    record(results, "pause 后批数停止增长", r_ok and stopped,
+           f"pause 后批数增长 <= {PAUSE_GROWTH_TOLERANCE}", f"增长 {paused_growth}")
+
+    record(results, "resumeBinReplay 返回 OK", r_ok and result.get("resume_return") == "OK",
+           "返回 'OK'", f"返回 {result.get('resume_return')!r}  err={result.get('resume_error')}")
+
+    resumed = resumed_growth > 0
+    record(results, "resume 后批数恢复增长", r_ok and resumed,
+           "resume 后批数增长 > 0", f"增长 {resumed_growth}")
+
+    record(results, "stopBinReplay 返回 OK", r_ok and result.get("stop_return") == "OK",
+           "返回 'OK'", f"返回 {result.get('stop_return')!r}  err={result.get('stop_error')}")
+
+    thread_done = result.get("thread_done")
+    record(results, "stop 后回放子线程结束", r_ok and thread_done is True,
+           "子进程回放线程在超时内结束",
+           f"thread_done={thread_done}" + (f" err={result.get('replay_error')}" if result.get('replay_error') else ""))
 
     # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)

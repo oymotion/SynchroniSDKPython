@@ -27,7 +27,9 @@
   - 信号发生器：能输出 50Hz/60Hz、100μV 正弦波，接入 gForceUltra 通道 3
 """
 
+import json
 import os
+import subprocess
 import sys
 import time
 import math
@@ -188,21 +190,6 @@ def _run_one_segment(sensor, log_dir, out_name, filter_settings):
     return dest
 
 
-def _sample_value(s):
-    """取 Sample 的物理值（data），回退 rawData；兼容 list / 标量。"""
-    v = getattr(s, 'data', None)
-    if v is None:
-        v = getattr(s, 'rawData', None)
-    if isinstance(v, (list, tuple)):
-        if len(v) == 0:
-            return None
-        v = v[0]
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
 def _goertzel_amplitude(samples, fs, target_freq):
     """Goertzel 算法计算目标频率的正弦峰幅值（纯 Python，无需 numpy）。"""
     n = len(samples)
@@ -223,54 +210,38 @@ def _goertzel_amplitude(samples, fs, target_freq):
     return math.sqrt(max(power, 0.0)) * 2.0 / n
 
 
-def _analyze_bin(ctrl, sensor, bin_path, target_freqs):
-    """回放 bin，收集 EMG 各通道样本，输出每通道时域峰值与各目标频率幅值。
+def _analyze_bin(bin_path, target_freqs):
+    """在独立子进程回放 bin，收集 EMG 各通道样本，输出每通道时域峰值与各目标频率幅值。
 
     返回 (channels_amps, channels_peaks, fs)：
       channels_amps  = {通道索引: {频率: Goertzel 峰值}}
       channels_peaks = {通道索引: 时域峰值 (max-min)/2}
     """
-    ch_samples = {}
-    fs_holder = [None]
-
-    def on_data(profile, data):
-        items = data if isinstance(data, list) else [data]
-        for d in items:
-            try:
-                dt = d.getDataType()
-            except Exception:
-                continue
-            name = dt.name if isinstance(dt, DataType) else DataType(dt).name
-            if 'EMG' not in name.upper():
-                continue
-            if fs_holder[0] is None:
-                fs_holder[0] = getattr(d, 'sampleRate', None)
-            cs = getattr(d, 'channelSamples', None)
-            if not cs:
-                continue
-            for ci, ch in enumerate(cs):
-                if ci not in ch_samples:
-                    ch_samples[ci] = []
-                for s in ch:
-                    v = _sample_value(s)
-                    if v is not None:
-                        ch_samples[ci].append(v)
-
-    old_cb = sensor.onDataCallback
-    sensor.onDataCallback = on_data
+    worker = os.path.join(AUTOMATION_DIR, "replay_worker.py")
+    cmd = [sys.executable, worker, "--bin", bin_path, "--mode", "samples"]
     try:
-        ctrl.replayBinFile(bin_path, sensor, realtime=False, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            print(f"[分析] 子进程无 stdout，returncode={proc.returncode} stderr={(proc.stderr or '')[:500]}", flush=True)
+            return {}, {}, None
+        result = json.loads(lines[-1])
     except Exception as e:
-        print(f"[分析] replayBinFile 异常 {type(e).__name__}: {e}", flush=True)
-    finally:
-        sensor.onDataCallback = old_cb
+        print(f"[分析] 子进程回放异常 {type(e).__name__}: {e}", flush=True)
+        return {}, {}, None
 
-    fs = fs_holder[0] or 500
+    if result.get("ok") is not True:
+        print(f"[分析] 子进程回放失败：{result.get('error')}", flush=True)
+        return {}, {}, None
+
+    fs = result.get("fs") or 500
+    raw_channels = result.get("channels", {})
     channels_amps = {}
     channels_peaks = {}
-    for ci, vals in ch_samples.items():
+    for ci_str, vals in raw_channels.items():
         if not vals:
             continue
+        ci = int(ci_str)
         channels_amps[ci] = {f: _goertzel_amplitude(vals, fs, f) for f in target_freqs}
         channels_peaks[ci] = (max(vals) - min(vals)) / 2.0
     return channels_amps, channels_peaks, fs
@@ -420,7 +391,7 @@ def main():
         if not os.path.isfile(path):
             print(f"[分析] 缺少 {label}.bin，跳过", flush=True)
             continue
-        ch_amps, ch_peaks, fs = _analyze_bin(ctrl, sensor, path, [50.0, 60.0])
+        ch_amps, ch_peaks, fs = _analyze_bin(path, [50.0, 60.0])
         all_amps[label] = ch_amps
         all_peaks[label] = ch_peaks
         print(f"[分析] {label}: 采样率={fs}Hz", flush=True)

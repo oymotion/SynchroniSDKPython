@@ -10,14 +10,14 @@
   3) setParam("DEBUG_BLE_DATA_PATH", "True") 开启 bin 导出（注意：值为字符串 "True"）
   4) startDataNotification 起流，采集数秒后 stopDataNotification、disconnect（close 写 header）
   5) 通过 getParam("DEBUG_BLE_DATA_PATH") 读导出的 bin 路径（回退到目录扫描）
-  6) getBinFileInfo(bin_path) 并校验返回 dict 含 device_mac/device_name/chip_type/replay_duration
+  6) getBinFileInfo(bin_path) 并校验返回 dict 含 device_mac/device_name/chip_type/is_universal_stream/feature_map/device_info/sensor_datas/replay_duration
 
 说明：
   README：getBinFileInfo(file_path) -> Optional[dict]，返回 dict 字段包括 device_mac、
   device_name、chip_type、is_universal_stream、feature_map、device_info、sensor_datas、
   replay_duration（录制秒数，在 close 时写入 header）；文件不存在或无 config record 时
   返回 None。
-  本用例只校验"返回 dict 且含四个关键字段（非空）"，不校验字段值语义（值一致性见
+  本用例只校验"返回 dict 且含全部关键字段（非空/结构正确）"，不校验字段值语义（值一致性见
   FUNC-009、元数据完整性见后续）。
   注意 DEBUG_BLE_DATA_PATH 的值是字符串 "True"/"False"，不是 Python bool。
 
@@ -42,7 +42,11 @@ import common
 from common import record, _identity_of, scan_and_match
 
 COLLECT_SECONDS = 3  # 起流后采集时长（秒），确保 bin 有数据且 replay_duration > 0
-REQUIRED_KEYS = ["device_mac", "device_name", "chip_type", "replay_duration"]
+REQUIRED_KEYS = [
+    "device_mac", "device_name", "chip_type",
+    "is_universal_stream", "feature_map", "device_info", "sensor_datas",
+    "replay_duration",
+]
 
 
 def _nonempty(v):
@@ -264,7 +268,7 @@ def main():
 
     if not have_bin:
         record(results, "getBinFileInfo 返回含关键字段的 dict", None,
-               "返回 dict 且含 device_mac/device_name/chip_type/replay_duration",
+               "返回 dict 且含全部关键字段",
                "无有效 bin，无法执行 getBinFileInfo")
         # 清理
         try:
@@ -300,7 +304,7 @@ def main():
     if is_dict:
         missing = [k for k in REQUIRED_KEYS if k not in info]
         keys_ok = len(missing) == 0
-        record(results, "返回含 device_mac/device_name/chip_type/replay_duration 字段", keys_ok,
+        record(results, "返回含全部关键字段（8 项）", keys_ok,
                f"dict 含 {REQUIRED_KEYS}", f"缺失 {missing}" if missing else f"含全部 {REQUIRED_KEYS}")
 
         # 关键字段非空/数值合理
@@ -315,14 +319,38 @@ def main():
                f"device_mac={dm!r} device_name={dn!r} chip_type={ct!r}")
         record(results, "replay_duration 为数值且 >=0", rd_ok,
                "replay_duration 为数值且 >=0", f"replay_duration={rd!r}")
+
+        # 新增扩展字段结构校验（SDK 1.3.0 getBinFileInfo 扩展字段）
+        ius = info.get("is_universal_stream")
+        fm = info.get("feature_map")
+        di = info.get("device_info")
+        sd = info.get("sensor_datas")
+        record(results, "is_universal_stream 为 bool", isinstance(ius, bool),
+               "is_universal_stream 为 bool", f"is_universal_stream={ius!r}")
+        record(results, "feature_map 为 int", isinstance(fm, int),
+               "feature_map 为 int", f"feature_map={fm!r}")
+        record(results, "device_info 为非空 dict", isinstance(di, dict) and bool(di),
+               "device_info 为非空 dict",
+               f"device_info keys={sorted(di.keys()) if isinstance(di, dict) else di!r}")
+        record(results, "sensor_datas 为 list", isinstance(sd, list),
+               "sensor_datas 为 list",
+               f"sensor_datas 长度={len(sd) if isinstance(sd, list) else type(sd).__name__}")
     else:
-        record(results, "返回含 device_mac/device_name/chip_type/replay_duration 字段", None,
+        record(results, "返回含全部关键字段（8 项）", None,
                f"dict 含 {REQUIRED_KEYS}", "getBinFileInfo 未返回 dict，跳过字段校验")
         record(results, "device_mac/device_name/chip_type 非空", None,
                "device_mac/device_name 非空字符串，chip_type 非 None",
                "getBinFileInfo 未返回 dict，跳过字段校验")
         record(results, "replay_duration 为数值且 >=0", None,
                "replay_duration 为数值且 >=0", "getBinFileInfo 未返回 dict，跳过字段校验")
+        record(results, "is_universal_stream 为 bool", None,
+               "is_universal_stream 为 bool", "getBinFileInfo 未返回 dict，跳过字段校验")
+        record(results, "feature_map 为 int", None,
+               "feature_map 为 int", "getBinFileInfo 未返回 dict，跳过字段校验")
+        record(results, "device_info 为非空 dict", None,
+               "device_info 为非空 dict", "getBinFileInfo 未返回 dict，跳过字段校验")
+        record(results, "sensor_datas 为 list", None,
+               "sensor_datas 为 list", "getBinFileInfo 未返回 dict，跳过字段校验")
 
     # 清理
     try:

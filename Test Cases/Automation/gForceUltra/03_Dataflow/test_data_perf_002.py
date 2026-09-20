@@ -45,6 +45,7 @@ WINDOW_SECONDS = 60           # 分窗口统计间隔（秒）
 DROP_TOLERANCE = 0.05         # 掉速容差：末段相对首段下降 >5% 判掉速
 MEMORY_LEAK_THRESHOLD_MB = 50  # 内存泄漏阈值：末窗口相对首窗口增长超过该值判泄漏
 EDGE_WINDOWS = 3              # 取首/末各 N 个窗口做平均对比
+RECONNECT_TIMEOUT_SECONDS = 60  # 断连重连兜底：连续无数据超过该时长则提前汇总退出
 
 
 class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
@@ -93,18 +94,19 @@ class LongRunCollector:
     def __init__(self):
         self.total_samples = 0
         self.batches = 0
+        self.last_data_ts = None  # 最后一次收到数据的时间戳（用于断连兜底检测）
 
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            if cs:
-                try:
-                    n_ch = len(cs)
-                    self.total_samples += len(cs[0]) if n_ch else 0
-                except TypeError:
-                    self.total_samples += len(cs)
+            try:
+                n = d.getSampleCount()
+                self.total_samples += n
+                if n > 0:
+                    self.last_data_ts = time.time()
+            except Exception:
+                pass
 
 
 def main():
@@ -247,15 +249,24 @@ def main():
     window_rates = []
     window_rss_mb = []
     prev_total = 0
+    disconnected = False  # 是否因持续断连超过兜底时长而提前终止
 
     print(f"\n[采集] 开始长稳采集，共 {num_windows} 个窗口，每个 {WINDOW_SECONDS}s ...", flush=True)
+    print(f"[采集] 提示：连续无数据超过 {RECONNECT_TIMEOUT_SECONDS}s 将提前汇总退出", flush=True)
     print("[采集] 提示：异常时按 Ctrl+C 可提前终止并输出已采集统计", flush=True)
 
     try:
         for i in range(num_windows):
             win_start = time.time()
             while time.time() - win_start < WINDOW_SECONDS:
+                # 断连重连兜底：最后一次数据距今超过 RECONNECT_TIMEOUT_SECONDS 则提前退出
+                if collector.last_data_ts is not None \
+                        and time.time() - collector.last_data_ts > RECONNECT_TIMEOUT_SECONDS:
+                    disconnected = True
+                    break
                 time.sleep(0.5)
+            if disconnected:
+                break
 
             cur_total = collector.total_samples
             window_samples = cur_total - prev_total
@@ -271,6 +282,11 @@ def main():
             print(f"[窗口 {i + 1}/{num_windows}] 样本={window_samples} 采样率={rate:.1f}Hz 内存={rss_txt}", flush=True)
     except KeyboardInterrupt:
         print("\n[采集] 被用户中断，输出已采集的中间统计 ...", flush=True)
+
+    if disconnected:
+        idle_sec = time.time() - collector.last_data_ts
+        print(f"\n[断连] 连续无数据超过 {RECONNECT_TIMEOUT_SECONDS}s（实际 {idle_sec:.0f}s），"
+              f"判定重连失败，提前汇总退出", flush=True)
 
     # 停流
     try:
@@ -290,6 +306,12 @@ def main():
     n_done = len(window_rates)
     print(f"[统计] 完成窗口数 = {n_done} / {num_windows}，总累计样本（每通道） = {collector.total_samples}，"
           f"总批次数 = {collector.batches}", flush=True)
+
+    # 判定 0：连接稳定（无持续断连超过兜底时长）
+    record(results, "连接稳定（无持续断连 > 60s）", not disconnected,
+           f"连续无数据不超过 {RECONNECT_TIMEOUT_SECONDS}s",
+           (f"断连重连失败，连续无数据超 {RECONNECT_TIMEOUT_SECONDS}s，提前终止" if disconnected
+            else "全程未出现持续断连"))
 
     # 判定 1：全程持续收到数据（每个窗口样本数 > 0）
     all_windows_nonempty = n_done > 0 and all(s > 0 for s in [window_rates[i] * WINDOW_SECONDS for i in range(n_done)])

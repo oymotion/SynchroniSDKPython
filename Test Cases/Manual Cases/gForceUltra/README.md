@@ -9,7 +9,7 @@
 | 设备型号 | gForceUltra（腕带） |
 | 广播名前缀 | `gForceUltra` |
 | 类型归属 | OYM 命名设备 / 传统 OYMotion 设备（非“新 EMG 设备”） |
-| SDK 版本 | 0.8.0 |
+| SDK 版本 | 1.3.0 |
 
 ## 能力假设（连接后用 getDeviceInfo() 确认）
 
@@ -30,7 +30,7 @@
 
 ## 环境与前置条件
 
-- Python 3.10~3.14，`sensor-sdk==0.9.1`（`pip install --upgrade sensor-sdk`）。
+- Python 3.10~3.14，`sensor-sdk==1.3.0`（`pip install --upgrade sensor-sdk`）。
 - 蓝牙开启（bleak 后端）或 dongle 已绑定（bumble 后端，`checkSetupDongle()` 返回 `OK`）。
 - 设备上电、在扫描范围内、广播名以 `gForceUltra` 开头。
 - 每个脚本结束调用 `SensorControllerInstance.terminate()`；Ctrl+C 异常路径也需调用。

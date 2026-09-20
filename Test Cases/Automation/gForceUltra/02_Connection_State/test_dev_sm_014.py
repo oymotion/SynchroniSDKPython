@@ -6,17 +6,17 @@
 
 触发条件（README）：
   onDeviceInfoUpdate 在 init 后 DeviceInfo 变化时触发，主要触发源有二：
-    1) bumble 后端：连接后链路参数（ConnectionIntervalMs / PeripheralLatency /
+    1) dongle 后端：连接后链路参数（ConnectionIntervalMs / PeripheralLatency /
        SupervisionTimeoutMs）由外设更新
     2) EEG_SAMPLE_RATE 变更改变上报采样率
   gForceUltra 腕带【无 EEG】（EegSampleRate==0），因此无法用 EEG_SAMPLE_RATE 触发；
-  必须走【bumble 后端】的链路参数更新路径。
+  必须走【dongle 后端】的链路参数更新路径。
 
 后端切换说明：
   后端在 SDK import 时确定，单进程内无法切换。因此：
-    - 主进程若已是 bumble，直接跑测试；
+    - 主进程若已是 dongle，直接跑测试；
     - 主进程若是 bleak，提示用户关闭主机蓝牙 + 接入 dongle，确认后以
-      SENSOR_SDK_BLE_BACKEND=bumble 子进程重跑本脚本。
+      SENSOR_SDK_BLE_BACKEND=dongle 子进程重跑本脚本。
 
 前置条件（运行前人工准备）：
   - 主机(电脑)：关闭主机蓝牙，接入 USB BLE dongle（Windows 上可能需先用管理员
@@ -24,7 +24,7 @@
   - 待测设备：gForceUltra 上电、在范围内
 
 流程：
-  1) 确认后端（bumble）/ 引导接入 dongle
+  1) 确认后端（dongle）/ 引导接入 dongle
   2) 确认设备开机 -> 按回车
   3) scan -> requireSensor -> connect 到 Ready -> init
   4) init 前注册 onDeviceInfoUpdate，init 后记录 getDeviceInfo() 字段快照
@@ -74,7 +74,7 @@ def _snapshot(info):
 
 
 def run_test():
-    """完整测试逻辑（在指定后端环境下运行，通常是 bumble）。"""
+    """完整测试逻辑（在指定后端环境下运行，通常是 dongle）。"""
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
@@ -84,17 +84,17 @@ def run_test():
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
 
     print("\n[前置条件]", flush=True)
-    print("  - 主机(电脑)：蓝牙已关闭，已接入 USB BLE dongle（bumble 后端）", flush=True)
+    print("  - 主机(电脑)：蓝牙已关闭，已接入 USB BLE dongle（dongle 后端）", flush=True)
     print("  - 待测设备：gForceUltra 上电、在范围内", flush=True)
 
     input("\n>>> [人工操作] 请确认待测设备 gForceUltra 已【开机】且在范围内，完成后按回车继续 ...")
 
     results = []
 
-    # bumble 后端下先确保 dongle 就绪
+    # dongle 后端下先确保 dongle 就绪
     backend = ctrl.getBLEBackendName()
-    if (backend or '').lower() == 'bumble':
-        print("\n[环境] bumble 后端，调用 SensorController.checkSetupDongle() 确保 dongle 就绪 ...", flush=True)
+    if (backend or '').lower() == 'dongle':
+        print("\n[环境] dongle 后端，调用 SensorController.checkSetupDongle() 确保 dongle 就绪 ...", flush=True)
         try:
             dongle_ret = ctrl.checkSetupDongle()
             print(f"[环境] checkSetupDongle() -> {dongle_ret!r}", flush=True)
@@ -199,14 +199,14 @@ def run_test():
         sret = f"抛异常 {type(e).__name__}: {e}"
     print(f"[触发尝试] setParam(EEG_SAMPLE_RATE, 500) -> {sret!r}", flush=True)
 
-    # 观察窗口：等待 onDeviceInfoUpdate 触发（bumble 链路参数更新 / 采样率变更）
+    # 观察窗口：等待 onDeviceInfoUpdate 触发（dongle 链路参数更新 / 采样率变更）
     print(f"\n[等待] onDeviceInfoUpdate 触发，最多 {DEVICE_INFO_TIMEOUT}s ...", flush=True)
     triggered = _wait_until(lambda: len(updates) > 0, DEVICE_INFO_TIMEOUT, 0.5, "onDeviceInfoUpdate 触发")
 
     print(f"[结果] onDeviceInfoUpdate 触发 {len(updates)} 次", flush=True)
     if not triggered:
         # 无法触发：说明当前后端 + 设备无触发场景
-        print("[说明] 未触发。可能原因：bumble 链路参数未更新，或设备无 EEG 采样率变更。", flush=True)
+        print("[说明] 未触发。可能原因：dongle 链路参数未更新，或设备无 EEG 采样率变更。", flush=True)
         record(results, "onDeviceInfoUpdate 触发（≥1 次）", None,
                "onDeviceInfoUpdate 至少触发 1 次",
                f"触发 {len(updates)} 次（{backend} 后端 + 腕带无 EEG，可能无触发场景）")
@@ -278,7 +278,7 @@ def main():
     ctrl = SensorControllerInstance
     backend = ctrl.getBLEBackendName()
 
-    # 子进程模式：直接跑测试（由主进程以 bumble 后端启动）
+    # 子进程模式：直接跑测试（由主进程以 dongle 后端启动）
     if os.environ.get('DEV_SM_014_RUN') == '1':
         run_test()
         return
@@ -289,24 +289,24 @@ def main():
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"当前进程后端 = {backend}", flush=True)
 
-    if (backend or '').lower() == 'bumble':
+    if (backend or '').lower() == 'dongle':
         run_test()
         return
 
-    # bleak 后端：链路参数更新不可用，腕带无 EEG，需切 bumble
+    # bleak 后端：链路参数更新不可用，腕带无 EEG，需切 dongle
     print("\n[后端引导]", flush=True)
     print("  当前为 bleak 后端。onDeviceInfoUpdate 的主要触发源是「链路参数更新」，", flush=True)
-    print("  仅在 bumble（USB dongle）后端可用；而腕带无 EEG，无法用 EEG_SAMPLE_RATE 触发。", flush=True)
-    print("  因此本用例需切换到 bumble 后端。", flush=True)
+    print("  仅在 dongle（USB dongle）后端可用；而腕带无 EEG，无法用 EEG_SAMPLE_RATE 触发。", flush=True)
+    print("  因此本用例需切换到 dongle 后端。", flush=True)
     print("\n  请完成以下两步：", flush=True)
     print("    1) 关闭【电脑】蓝牙", flush=True)
     print("    2) 接入 USB BLE dongle（如未绑定 WinUSB 驱动，请先跑 CTRL-FUNC-011 引导）", flush=True)
-    input("\n>>> [人工操作] 完成上述两步后按回车继续（将以 bumble 后端子进程重跑）...")
+    input("\n>>> [人工操作] 完成上述两步后按回车继续（将以 dongle 后端子进程重跑）...")
 
     env = os.environ.copy()
-    env['SENSOR_SDK_BLE_BACKEND'] = 'bumble'
+    env['SENSOR_SDK_BLE_BACKEND'] = 'dongle'
     env['DEV_SM_014_RUN'] = '1'
-    print("\n[重跑] 以 SENSOR_SDK_BLE_BACKEND=bumble 启动子进程 ...", flush=True)
+    print("\n[重跑] 以 SENSOR_SDK_BLE_BACKEND=dongle 启动子进程 ...", flush=True)
     subprocess.run([sys.executable, os.path.abspath(__file__)], env=env)
 
     # 子进程已输出结果，主进程不再重复汇总

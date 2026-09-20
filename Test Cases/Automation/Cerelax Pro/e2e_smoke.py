@@ -22,6 +22,8 @@
 """
 
 import os
+import re
+import subprocess
 import sys
 import time
 import threading
@@ -66,13 +68,14 @@ class DataCounter:
         with self.lock:
             self.batches += len(items)
             for it in items:
-                cs = getattr(it, 'channelSamples', None)
-                if not cs:
-                    continue
+                # SDK 1.3.0 移除了 channelSamples，改用 getSampleCount/getChannelCount
                 try:
-                    self.samples += sum(len(ch) for ch in cs)
-                except TypeError:
-                    self.samples += len(cs)
+                    n_ch = it.getChannelCount()
+                    n_smp = it.getSampleCount()
+                    if n_ch > 0 and n_smp > 0:
+                        self.samples += n_ch * n_smp
+                except Exception:
+                    continue
 
     def snapshot(self):
         with self.lock:
@@ -217,6 +220,13 @@ def main():
     record(results, "SensorProfile.getDeviceInfo 返回 DeviceInfo", info_ok,
            "init 后 getDeviceInfo() 返回非 None", f"返回 {type(info).__name__}" if info_ok else "返回 None")
 
+    # 实际当前采样率以 getParam 为准（DeviceInfo.EegSampleRate 是设备信息里的声明值，可能≠实际起流采样率）
+    try:
+        eeg_rate_actual = sensor.getParam("EEG_SAMPLE_RATE")
+    except Exception as e:
+        eeg_rate_actual = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[采样率] getParam('EEG_SAMPLE_RATE') -> {eeg_rate_actual!r}", flush=True)
+
     # 参数（FILTER 聚合查询）
     try:
         flt = sensor.getParam("FILTER")
@@ -279,7 +289,9 @@ def main():
     ble_path = _get_ble_path(sensor)
     print(f"[bin] stop 后 getParam('DEBUG_BLE_DATA_PATH') = {ble_path!r}", flush=True)
 
-    # 断开
+    # 断开：释放 BLE、让 bin 落盘。离线回放必须在「全新、从未连接」的 profile 上跑
+    # （本进程的 sensor 已连接/起流过，直接回放会拿到 0 批，且随后 disconnect 会访问越界），
+    # 所以回放放到后面的独立子进程里（fresh controller + fresh profile）。
     try:
         sensor.disconnect()
     except Exception as e:
@@ -309,7 +321,7 @@ def main():
         except Exception as e:
             info = None
             print(f"[bin] getBinFileInfo 抛异常 {type(e).__name__}: {e}", flush=True)
-        info_ok = isinstance(info, dict) and info
+        info_ok = bool(isinstance(info, dict) and info)
         if info_ok:
             print(f"[bin] getBinFileInfo -> device_name={info.get('device_name')}, "
                   f"replay_duration={info.get('replay_duration')}", flush=True)
@@ -326,26 +338,11 @@ def main():
         record(results, "SensorController.parseBinToCsv 生成 CSV", csv_ok,
                "返回 CSV 路径且文件存在", f"{csv_path!r}（存在={csv_ok}）")
 
-        # 回放：快速回放并确认有数据回调
-        replay_counter = DataCounter()
-        sensor.onDataCallback = replay_counter
-        print(f"[回放] SensorController.replayBinFile(realtime=False) ...", flush=True)
-        try:
-            ctrl.replayBinFile(bin_path, sensor, realtime=False, timeout=60)
-            rerr = None
-        except Exception as e:
-            rerr = f"{type(e).__name__}: {e}"
-            print(f"[回放] 抛异常 {rerr}", flush=True)
-        rb, rs = replay_counter.snapshot()
-        print(f"[回放] 收到 {rb} 批 / {rs} 样本", flush=True)
-        record(results, "replayBinFile 回放产生数据", rerr is None and rs > 0,
-               "回放后样本数 > 0", f"批数={rb} 样本数={rs}" + (f" err={rerr}" if rerr else ""))
     else:
         record(results, "SensorController.getBinFileInfo 返回元数据", None, "返回非空 dict", "无有效 bin")
         record(results, "SensorController.parseBinToCsv 生成 CSV", None, "返回 CSV 路径且文件存在", "无有效 bin")
-        record(results, "replayBinFile 回放产生数据", None, "回放后样本数 > 0", "无有效 bin")
 
-    # 清理
+    # 清理并终止本进程的 SDK（释放 dongle，避免与下面的回放子进程冲突）
     try:
         sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
     except Exception:
@@ -356,6 +353,36 @@ def main():
         pass
 
     ctrl.terminate()
+
+    # 回放：独立子进程里跑（fresh controller + fresh profile，复用官方 console.py --replay 的离线回放逻辑）
+    if have_bin:
+        print(f"[回放] 子进程离线回放 console.py --replay ...", flush=True)
+        rb = 0
+        rerr = None
+        try:
+            console_path = os.path.normpath(
+                os.path.join(AUTOMATION_DIR, "..", "..", "examples", "console.py"))
+            proc = subprocess.run(
+                [sys.executable, console_path, "--replay", bin_path],
+                capture_output=True, text=True, timeout=180)
+            stdout = proc.stdout or ""
+            m = re.search(r"received\s+(\d+)\s+data batches", stdout)
+            rb = int(m.group(1)) if m else 0
+            if proc.returncode != 0:
+                rerr = f"console.py --replay 退出码 {proc.returncode}"
+            elif rb <= 0:
+                rerr = "回放解析到 0 批数据"
+            print(f"[回放] 子进程 stdout: {stdout.strip()}", flush=True)
+            if (proc.stderr or "").strip():
+                print(f"[回放] 子进程 stderr: {proc.stderr.strip()}", flush=True)
+        except Exception as e:
+            rerr = f"{type(e).__name__}: {e}"
+            print(f"[回放] 抛异常 {rerr}", flush=True)
+        print(f"[回放] 收到 {rb} 批", flush=True)
+        record(results, "replayBinFile 回放产生数据", rerr is None and rb > 0,
+               "回放后批数 > 0", f"批数={rb}" + (f" err={rerr}" if rerr else ""))
+    else:
+        record(results, "replayBinFile 回放产生数据", None, "回放后批数 > 0", "无有效 bin")
 
     # 汇总
     print("\n" + "=" * 60, flush=True)

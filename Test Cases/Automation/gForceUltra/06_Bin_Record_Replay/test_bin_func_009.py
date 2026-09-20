@@ -28,8 +28,10 @@
   - 待测设备：gForceUltra 上电、在范围内
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
 import time
 import tempfile
@@ -101,37 +103,29 @@ class LiveCollector:
         return None
 
 
-class ReplayCollector:
-    """REPLAY 端回调：记录首批有效数据的 (startTimeStamp, delay)。
-
-    参考 multi_start_test.py 的 REPLAY 端逻辑：取首个有效批。
-    """
-
-    def __init__(self):
-        self.count = 0
-        self.first_ts = None
-        self.first_delay = None
-
-    def __call__(self, sensor, data):
-        items = data if isinstance(data, list) else [data]
-        for d in items:
-            self.count += 1
-            ts = d.getStartTimeStamp()
-            delay = d.getDelay()
-            if ts and self.first_ts is None:
-                self.first_ts = ts
-                self.first_delay = delay
-
-    @property
-    def replay_pair(self):
-        """返回首批有效数据的 (startTimeStamp, delay)，无有效数据时返回 None。"""
-        if self.first_ts is not None:
-            return (self.first_ts, self.first_delay)
-        return None
-
-
 def _on_error(sensor, reason):
     print(f"[onErrorCallback] {getattr(sensor, 'BLEDevice', None)}: {reason}", flush=True)
+
+
+def _run_worker(bin_path, mode, realtime=False, timeout=180):
+    """在独立子进程里回放，返回解析后的 JSON dict。"""
+    worker = os.path.join(AUTOMATION_DIR, "replay_worker.py")
+    cmd = [sys.executable, worker, "--bin", bin_path, "--mode", mode]
+    if mode == "summary":
+        cmd += ["--realtime", "true" if realtime else "false"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return {"ok": False, "error": "子进程无 stdout",
+                    "returncode": proc.returncode, "stderr": (proc.stderr or "")[:500]}
+        try:
+            return json.loads(lines[-1])
+        except Exception as e:
+            return {"ok": False, "error": f"解析子进程 JSON 失败 {type(e).__name__}: {e}",
+                    "stdout": (proc.stdout or "")[:500], "stderr": (proc.stderr or "")[:500]}
+    except Exception as e:
+        return {"ok": False, "error": f"子进程回放异常 {type(e).__name__}: {e}"}
 
 
 def main():
@@ -340,21 +334,33 @@ def main():
         print("\n结论: FAIL", flush=True)
         return
 
-    # ---- REPLAY：记录首批 (startTimeStamp, delay) ----
-    replay = ReplayCollector()
-    sensor.onDataCallback = replay
-
-    print(f"\n[回放] replayBinFile({bin_path!r}, sensor, realtime=False) ...", flush=True)
-    replay_start = time.time()
+    # ---- 清理并终止本进程 SDK（释放 dongle，避免与回放子进程冲突）----
     try:
-        profile = ctrl.replayBinFile(bin_path, sensor, realtime=False)
-        replay_txt = f"返回 {type(profile).__name__}"
-    except Exception as e:
-        profile = None
-        replay_txt = f"抛异常 {type(e).__name__}: {e}"
-    replay_duration = time.time() - replay_start
-    replay_pair = replay.replay_pair
-    print(f"[回放] {replay_txt}，回放批数 = {replay.count}，耗时 ≈ {replay_duration:.3f}s", flush=True)
+        sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
+    except Exception:
+        pass
+    try:
+        ctrl.setDebugEnabled(False)
+    except Exception:
+        pass
+
+    ctrl.terminate()
+
+    # ---- REPLAY：独立子进程（fresh controller + fresh profile），记录首批 (startTimeStamp, delay) ----
+    # 进程内回放会复用已连接/已起流的 profile（0 批/0 样本），故必须子进程回放。
+    result = _run_worker(bin_path, "summary", realtime=False)
+    r_ok = result.get("ok") is True
+    r_err = result.get("error")
+    replay_count = result.get("batches", 0)
+    replay_first_ts = result.get("first_ts")
+    replay_first_delay = result.get("first_delay")
+
+    if r_ok:
+        print(f"[回放] 子进程回放完成，批数 = {replay_count}", flush=True)
+    else:
+        print(f"[回放] 子进程回放失败：{r_err}", flush=True)
+
+    replay_pair = (replay_first_ts, replay_first_delay) if replay_first_ts is not None else None
     print(f"[回放] REPLAY (startTimeStamp, delay) = {replay_pair}", flush=True)
 
     # ---- 比对 (startTimeStamp, delay) ----
@@ -374,18 +380,6 @@ def main():
     else:
         record(results, "回放还原 (startTimeStamp, delay) 与实收一致", False,
                "replay 端有有效数据", "replay 端无有效 (startTimeStamp, delay) 数据")
-
-    # 清理
-    try:
-        sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
-    except Exception:
-        pass
-    try:
-        ctrl.setDebugEnabled(False)
-    except Exception:
-        pass
-
-    ctrl.terminate()
 
     # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)

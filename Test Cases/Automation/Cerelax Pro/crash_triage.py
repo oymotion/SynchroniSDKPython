@@ -73,13 +73,14 @@ class DataCounter:
             self.calls += 1
             self.batches += len(items)
             for it in items:
-                cs = getattr(it, 'channelSamples', None)
-                if not cs:
-                    continue
+                # SDK 1.3.0 移除了 channelSamples，改用 getSampleCount/getChannelCount
                 try:
-                    self.samples += sum(len(ch) for ch in cs)
-                except TypeError:
-                    self.samples += len(cs)
+                    n_ch = it.getChannelCount()
+                    n_smp = it.getSampleCount()
+                except Exception:
+                    continue
+                if n_ch > 0 and n_smp > 0:
+                    self.samples += n_ch * n_smp
 
     def snapshot(self):
         with self.lock:

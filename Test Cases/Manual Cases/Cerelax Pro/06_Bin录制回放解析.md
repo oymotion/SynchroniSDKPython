@@ -14,7 +14,7 @@
 - **优先级**：P0
 - **测试目的**：验证 bin 信息。
 - **流程与逻辑**：对有效 bin 调 `getBinFileInfo`。
-- **预期结果**：返回含 `device_mac/device_name/chip_type/replay_duration` 的 dict。
+- **预期结果**：返回含 `device_mac/device_name/chip_type/is_universal_stream/feature_map/device_info/sensor_datas/replay_duration` 的 dict。
 - **有效性说明**：bin 元数据完整。
 - **可自动化**：auto
 - **人工介入**：无

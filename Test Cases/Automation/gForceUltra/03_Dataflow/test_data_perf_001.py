@@ -13,8 +13,9 @@
 说明：
   实测采样率用"固定窗口计时"计算：从首批数据到达起，精确采集 PERF_COLLECT_SECONDS
   秒，用固定墙钟时长做分母（而非首末批到达时间），彻底排除起流前延迟和停流空转：
-      实测采样率 = 每通道累计样本数 / PERF_COLLECT_SECONDS
-  EMG 采样率 500Hz（getSampleRate() 标称），延长采集时长可进一步确认收敛趋势。
+      实测采样率 = 去重后唯一样本数（sampleIndex 首末 span）/ PERF_COLLECT_SECONDS
+  EMG 默认采样率 1000Hz（getSampleRate() 标称）。注意：SDK 存在已知 bug，init 时会把
+  采样率静默改为 500（已报 Redmine），因此 getSampleRate() 目前可能返回 500 而非 1000。
   采样率统计与是否佩戴无关（佩戴只影响信号内容，不影响采样速率）。
 
 前置条件：
@@ -61,25 +62,32 @@ class RateCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             self.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            if cs:
-                try:
-                    n_ch = len(cs)
-                    self.total_samples += len(cs[0]) if n_ch else 0
-                    # 记录通道0样本的 sampleIndex 首末（交叉验证样本唯一性）
-                    if n_ch:
-                        for s in cs[0]:
-                            idx = getattr(s, 'sampleIndex', None)
-                            if idx is None:
-                                continue
-                            if self.min_sample_index is None or idx < self.min_sample_index:
-                                self.min_sample_index = idx
-                            if self.max_sample_index is None or idx > self.max_sample_index:
-                                self.max_sample_index = idx
-                except TypeError:
-                    self.total_samples += len(cs)
+            try:
+                n_ch = d.getChannelCount()
+                n_smp = d.getSampleCount()
+            except Exception:
+                n_ch = 0
+                n_smp = 0
+            if n_ch and n_smp:
+                # 仅保存第一个非空 EMG 批次作为标称采样率来源（避免误抓 IMU 50Hz）
                 if self.first_batch is None:
-                    self.first_batch = d
+                    try:
+                        if d.getDataType() == DataType.NTF_EMG:
+                            self.first_batch = d
+                    except Exception:
+                        pass
+                # 1.3.0 已移除 channelSamples；getSampleCount() 即每通道样本数
+                self.total_samples += n_smp
+                # 记录通道0样本的 sampleIndex 首末（交叉验证样本唯一性）
+                for si in range(n_smp):
+                    try:
+                        idx = d.getSampleIndex(0, si)
+                    except Exception:
+                        continue
+                    if self.min_sample_index is None or idx < self.min_sample_index:
+                        self.min_sample_index = idx
+                    if self.max_sample_index is None or idx > self.max_sample_index:
+                        self.max_sample_index = idx
 
 
 def main():
@@ -249,27 +257,35 @@ def main():
     record(results, "收到数据（首批已到达）", collector.first_ts is not None,
            "首批数据已到达", "未收到数据" if collector.first_ts is None else "已收到数据")
 
-    # 判定 3：实测采样率偏差 <= 容差
+    # 去重后的唯一样本数：按 sampleIndex 首末 span（max-min+1）近似
+    unique_samples = None
+    if collector.min_sample_index is not None and collector.max_sample_index is not None:
+        unique_samples = collector.max_sample_index - collector.min_sample_index + 1
+
+    # 判定 3：实测采样率偏差 <= 容差（以去重后唯一样本数计算实测采样率）
     if window_duration is None or collector.total_samples <= 0:
-        record(results, "实测采样率偏差 <= 容差", False,
+        record(results, "实测采样率偏差 <= 容差（去重后）", False,
                f"|实测-标称|/标称 <= {SAMPLE_RATE_TOLERANCE:.0%}",
                "未收到任何数据，无法计算实测采样率")
     else:
-        measured_rate = collector.total_samples / window_duration
+        # 实测采样率分子优先用去重后唯一样本数；读不到 sampleIndex 时回退投递样本数
+        rate_numerator = unique_samples if unique_samples else collector.total_samples
+        measured_rate = rate_numerator / window_duration
+        delivered_rate = collector.total_samples / window_duration
 
         if nominal_rate is None:
-            record(results, "实测采样率偏差 <= 容差", False,
+            record(results, "实测采样率偏差 <= 容差（去重后）", False,
                    f"|实测-标称|/标称 <= {SAMPLE_RATE_TOLERANCE:.0%}",
-                   f"实测采样率={measured_rate:.1f}Hz 但 getSampleRate() 抛异常，无法比较")
+                   f"实测(去重)={measured_rate:.1f}Hz 但 getSampleRate() 抛异常，无法比较")
         elif nominal_rate <= 0:
-            record(results, "实测采样率偏差 <= 容差", False,
+            record(results, "实测采样率偏差 <= 容差（去重后）", False,
                    f"|实测-标称|/标称 <= {SAMPLE_RATE_TOLERANCE:.0%}",
                    f"标称采样率非法（{nominal_rate}），无法比较")
         else:
             deviation = abs(measured_rate - nominal_rate) / nominal_rate
-            record(results, "实测采样率偏差 <= 容差", deviation <= SAMPLE_RATE_TOLERANCE,
-                   f"|实测-标称|/标称 <= {SAMPLE_RATE_TOLERANCE:.0%}",
-                   f"实测={measured_rate:.1f}Hz 标称={nominal_rate:.1f}Hz 偏差={deviation:.2%}")
+            record(results, "实测采样率偏差 <= 容差（去重后）", deviation <= SAMPLE_RATE_TOLERANCE,
+                   f"|实测(去重)-标称|/标称 <= {SAMPLE_RATE_TOLERANCE:.0%}",
+                   f"实测(去重)={measured_rate:.1f}Hz 实测(投递)={delivered_rate:.1f}Hz 标称={nominal_rate:.1f}Hz 偏差={deviation:.2%}")
 
     # 交叉验证：sampleIndex 增量 vs channelSamples 长度累加
     if window_duration and collector.min_sample_index is not None and collector.max_sample_index is not None:
@@ -283,7 +299,11 @@ def main():
         print(f"[交叉验证] 按 channelSamples 换算采样率 = {len_rate:.1f}Hz", flush=True)
         if index_span > 0:
             diff_ratio = abs(collector.total_samples - index_span) / index_span
-            if diff_ratio < 0.01:
+            unique = diff_ratio < 0.01
+            record(results, "样本唯一性（无重复投递）", unique,
+                   "sampleIndex 唯一样本数与投递样本数一致（差异 < 1%）",
+                   f"差异={diff_ratio:.2%} 唯一样本={index_span} 投递样本={collector.total_samples}")
+            if unique:
                 print(f"[交叉验证] 结论：两者差异 {diff_ratio:.2%}，样本唯一 → 实测偏高为真实数据速率（疑似重复投递）", flush=True)
             else:
                 print(f"[交叉验证] 结论：两者差异 {diff_ratio:.2%}，channelSamples 存在重复，实际唯一样本 ≈ {index_span}", flush=True)

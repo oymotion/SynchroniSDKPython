@@ -1,0 +1,36 @@
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [BumbleDongle] Dongle hotplug monitor started (polling, initial=['usb:1-1'])
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] setParam called: LOG_PATH=D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] setParam called: DEBUG_ENABLED=True
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read number of supported advertising sets
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read maximum advertising data length
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] startScan, period=5000ms
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] register device: 78:1C:9D:E4:6C:6B OB6000C(6C6B) advertised services: 0000ffd0-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] register device: 90:7B:C6:63:4C:C3 gForcePro+(4CC3) advertised services: 0000ffd0-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] register device: A4:34:F1:89:65:15 gForceDual(6515) advertised services: 0000ffd0-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:03 [INFO] [sensor_sdk_controller] [SensorController] register device: D8:71:4D:8D:94:4A OB5200(944A) advertised services: 0000ffd0-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:06 [INFO] [sensor_sdk_controller] [SensorController] register device: BC:93:2A:3F:80:C7 OYFM-7020(80C7) advertised services: 0000ffd0-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read number of supported advertising sets
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read maximum advertising data length
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorController] scan round finished, 5 matched device(s) out of 15
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorController] stopScan
+2026-09-18 18:21:08 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] connect called
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_NUMBER_OF_SUPPORTED_ADVERTISING_SETS_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read number of supported advertising sets
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] HCI_LE_READ_MAXIMUM_ADVERTISING_DATA_LENGTH_COMMAND failed (UNKNOWN_HCI_COMMAND_ERROR)
+2026-09-18 18:21:08 [INFO] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [bumble.host] Failed to read maximum advertising data length
+2026-09-18 18:21:08 [WARNING] [sensor_sdk_controller] [SensorBLE] BumbleBridge.cpp:533 _onEvent(): bumble bridge: [bumble.host] [31m--- Ignoring event [35mHCI_READ_REMOTE_VERSION_INFORMATION_COMPLETE_EVENT[0m:
+  [36mstatus:           [0m SUCCESS
+  [36mconnection_handle:[0m 1536
+  [36mversion:          [0m 13
+  [36mmanufacturer_name:[0m 767
+  [36msubversion:       [0m 1488[0m
+2026-09-18 18:22:14 [WARNING] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:533 _onEvent(): bumble bridge: [BumbleDongle:78:1C:9D:E4:6C:6B] HCI link down: 78:1C:9D:E4:6C:6B/P via usb:1-1, handle=0x0600, reason=0x16 (CONNECTION_TERMINATED_BY_LOCAL_HOST_ERROR), link lived 66.4s
+2026-09-18 18:22:15 [INFO] [sensor_sdk_controller] [SensorController] parseBinToCsv called: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.bin
+2026-09-18 18:22:16 [INFO] [sensor_sdk_controller] [BinReplay] bin_to_csv: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.bin -> D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.csv (11293 rows)
+2026-09-18 18:22:16 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] setParam called: DEBUG_BLE_DATA_PATH=False
+2026-09-18 18:22:16 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] setParam result: DEBUG_BLE_DATA_PATH=False -> Error (Error: Please connect first)
+2026-09-18 18:22:16 [INFO] [sensor_sdk_controller] [SensorController] setParam called: DEBUG_ENABLED=False

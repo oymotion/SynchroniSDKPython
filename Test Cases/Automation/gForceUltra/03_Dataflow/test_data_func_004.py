@@ -48,13 +48,10 @@ def make_on_data(result):
         items = data if isinstance(data, list) else [data]
         for d in items:
             result.batches += 1
-            cs = getattr(d, 'channelSamples', None)
-            n = 0
-            if cs:
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except TypeError:
-                    n = len(cs)
+            try:
+                n = d.getChannelCount() * d.getSampleCount()
+            except Exception:
+                n = 0
             result.total_samples += n
     return on_data
 

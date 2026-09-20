@@ -152,21 +152,15 @@ class DataCounter:
             self.calls += 1
             self.batches += len(items)
             for it in items:
+                # SDK 1.3.0 移除了 channelSamples，改用 getSampleCount/getChannelCount
                 try:
-                    cs = it.channelSamples
+                    n_ch = it.getChannelCount()
+                    n_smp = it.getSampleCount()
                 except Exception:
                     continue
-                if not cs:
+                if n_ch <= 0 or n_smp <= 0:
                     continue
-                n = 0
-                try:
-                    n = sum(len(ch) for ch in cs)
-                except Exception:
-                    try:
-                        n = len(cs)
-                    except Exception:
-                        n = 0
-                self.samples += n
+                self.samples += n_ch * n_smp
                 # 累加 SDK 报告的丢包数（序号 gap），仅统计 >0 的整数值
                 try:
                     lp = it.getLostPackageCount()

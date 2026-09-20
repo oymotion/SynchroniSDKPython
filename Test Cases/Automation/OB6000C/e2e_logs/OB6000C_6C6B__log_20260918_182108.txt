@@ -1,0 +1,26 @@
+2026-09-18 18:21:08 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] connect called
+2026-09-18 18:21:08 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [ble_core] bleak connect attempt 1/3: 78:1C:9D:E4:6C:6B
+2026-09-18 18:21:08 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [BumbleDongle:78:1C:9D:E4:6C:6B] bumble connect start: 78:1C:9D:E4:6C:6B/P via usb:1-1
+2026-09-18 18:21:08 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [BumbleDongle:78:1C:9D:E4:6C:6B] HCI link up: 78:1C:9D:E4:6C:6B/P via usb:1-1, handle=0x0600
+2026-09-18 18:21:10 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [BumbleDongle:78:1C:9D:E4:6C:6B] GATT service discovery done: 78:1C:9D:E4:6C:6B/P via usb:1-1, services=5, 1044ms
+2026-09-18 18:21:10 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [BumbleDongle:78:1C:9D:E4:6C:6B] bumble connect done: 78:1C:9D:E4:6C:6B/P via usb:1-1, handle=0x0600, att_mtu=250, peer_name='OB6000C(6C6B)', conn_params=7.5ms/latency 0/timeout 4000.0ms, 1670ms
+2026-09-18 18:21:10 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorBLE] BumbleBridge.cpp:530 _onEvent(): bumble bridge: [ble_core] connect 78:1C:9D:E4:6C:6B: LL data length 251 octets requested
+2026-09-18 18:21:10 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] bin recorder opened: C:\Users\James\AppData\Local\Temp\OB6000C_6C6B__78_1C_9D_E4_6C_6B_20260918_182110.bin
+2026-09-18 18:21:10 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] GATT service: 00001800-0000-1000-8000-00805f9b34fb characteristics: 00002a00-0000-1000-8000-00805f9b34fb,00002a01-0000-1000-8000-00805f9b34fb,00002a04-0000-1000-8000-00805f9b34fb,00002aa6-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:10 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] GATT service: 00001801-0000-1000-8000-00805f9b34fb characteristics: 00002a05-0000-1000-8000-00805f9b34fb,00002b29-0000-1000-8000-00805f9b34fb,00002b2a-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:10 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] GATT service: 0000180a-0000-1000-8000-00805f9b34fb characteristics: 00002a23-0000-1000-8000-00805f9b34fb,00002a26-0000-1000-8000-00805f9b34fb,00002a27-0000-1000-8000-00805f9b34fb,00002a29-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:10 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] GATT service: 0000ffd0-0000-1000-8000-00805f9b34fb characteristics: 00000002-0000-1000-8000-00805f9b34fb,00000003-0000-1000-8000-00805f9b34fb,00000004-0000-1000-8000-00805f9b34fb
+2026-09-18 18:21:10 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] GATT service: 1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0 characteristics: 984227f3-34fc-4045-a5d0-2c581f81a153,f7bf3564-fb6d-4e53-88a4-5e37e0326063
+2026-09-18 18:21:11 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] init called, packageSampleCount=20, timeoutInMS=10000, powerRefreshInterval=1000
+2026-09-18 18:21:13 [WARNING] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] get_imu_cap_ex failed
+2026-09-18 18:21:13 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] getParam called: EMG_SAMPLE_RATE
+2026-09-18 18:21:13 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] getParam called: FILTER
+2026-09-18 18:21:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] setParam called: DEBUG_BLE_DATA_PATH=True
+2026-09-18 18:21:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] bin exported to: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.bin
+2026-09-18 18:21:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] bin recorder opened: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.bin
+2026-09-18 18:21:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] setParam result: DEBUG_BLE_DATA_PATH=True -> OK
+2026-09-18 18:21:13 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] startDataNotification called
+2026-09-18 18:22:13 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] stopDataNotification called
+2026-09-18 18:22:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] bin saved to: D:\James\Projects\Sensor SDK\Python\SynchroniSDKPython\Test Cases\Automation\OB6000C\e2e_logs\OB6000C_6C6B__data_20260918_182113.bin
+2026-09-18 18:22:13 [DEBUG] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] getParam called: DEBUG_BLE_DATA_PATH
+2026-09-18 18:22:13 [INFO] [sensor_sdk.profile.78:1C:9D:E4:6C:6B] [SensorProfile] disconnect called

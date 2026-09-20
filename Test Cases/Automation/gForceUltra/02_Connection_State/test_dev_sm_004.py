@@ -18,6 +18,7 @@
 
 import os
 import sys
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTOMATION_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
@@ -26,6 +27,18 @@ sys.path.insert(0, AUTOMATION_DIR)
 from sensor import *
 import config
 from common import record, scan_and_match
+
+DISCONNECT_TIMEOUT = 15  # disconnect 后等待迁移到 Disconnected 的超时（秒）
+
+
+def _wait_until(cond, timeout, interval=0.5, what=""):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if cond():
+            return True
+        time.sleep(interval)
+    print(f"  [等待超时] {what}（{timeout}s）", flush=True)
+    return False
 
 
 def _idx(states, state_name):
@@ -129,6 +142,11 @@ def main():
     print(f"[断开] SensorProfile.disconnect() -> {disc_txt}", flush=True)
     record(results, "SensorProfile.disconnect 返回 True", dret is True,
            "disconnect() 返回 True", f"disconnect() -> {disc_txt}")
+
+    # 等待异步迁移到 Disconnected（disconnect() 返回 True 仅表示断开命令已发出，
+    # 状态 Disconnecting→Disconnected 是异步的，需轮询等终态）
+    _wait_until(lambda: sensor.deviceState == DeviceStateEx.Disconnected,
+                DISCONNECT_TIMEOUT, 0.5, "deviceState==Disconnected")
 
     # 最终状态
     final_state = sensor.deviceState
