@@ -19,6 +19,7 @@
 import asyncio
 import os
 import sys
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTOMATION_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
@@ -110,7 +111,12 @@ async def main_async():
     record(results, "asyncDisconnect 返回 True", ok_disconnect is True,
            "asyncDisconnect() 返回 True", f"asyncDisconnect() -> {ok_disconnect}")
 
+    # asyncDisconnect 异步：断开后状态可能短暂停留在 Disconnecting，等待其收敛到 Disconnected
+    t0 = time.time()
     final_state = sensor.deviceState
+    while time.time() - t0 < 10 and final_state == DeviceStateEx.Disconnecting:
+        await asyncio.sleep(0.2)
+        final_state = sensor.deviceState
     print(f"[检查2] 断开后 deviceState = {final_state}", flush=True)
     record(results, "asyncDisconnect 后 deviceState==Disconnected", final_state == DeviceStateEx.Disconnected,
            "deviceState == DeviceStateEx.Disconnected", f"deviceState == {final_state}")

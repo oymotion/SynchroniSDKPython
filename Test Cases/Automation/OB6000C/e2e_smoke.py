@@ -57,6 +57,8 @@ class DataCounter:
     def __init__(self):
         self.batches = 0
         self.samples = 0
+        self.dt_samples = {}      # DataType 名字 -> 累计样本数（n_ch * n_smp）
+        self.first_eeg_ts = None  # 首次收到 EEG 数据的时刻（time.monotonic 秒）
         self.lock = threading.Lock()
 
     def __call__(self, sensor, data):
@@ -69,13 +71,31 @@ class DataCounter:
                     n_ch = it.getChannelCount()
                     n_smp = it.getSampleCount()
                     if n_ch > 0 and n_smp > 0:
-                        self.samples += n_ch * n_smp
+                        n = n_ch * n_smp
+                        self.samples += n
+                        dt = it.getDataType()
+                        name = dt.name if isinstance(dt, DataType) else "?"
+                        self.dt_samples[name] = self.dt_samples.get(name, 0) + n
+                        if name == "NTF_EEG" and self.first_eeg_ts is None:
+                            self.first_eeg_ts = time.monotonic()
                 except Exception:
                     continue
 
     def snapshot(self):
         with self.lock:
             return self.batches, self.samples
+
+    def eeg_samples(self):
+        with self.lock:
+            return self.dt_samples.get("NTF_EEG", 0)
+
+    def eeg_first_ts(self):
+        with self.lock:
+            return self.first_eeg_ts
+
+    def stats(self):
+        with self.lock:
+            return dict(self.dt_samples)
 
 def main():
     ctrl = SensorControllerInstance
@@ -259,10 +279,27 @@ def main():
     record(results, "SensorProfile.isDataTransfering 为 True", sensor.isDataTransfering is True,
            "isDataTransfering == True", f"isDataTransfering == {sensor.isDataTransfering}")
 
-    print(f"\n[采集] 等待 {COLLECT_SECONDS}s ...", flush=True)
-    time.sleep(COLLECT_SECONDS)
+    # 起流后短窗口内观察主信号（EEG）是否已有数据，量化判定「connect 后是否有数据流」。
+    eeg_window = 5
+    print(f"\n[EEG 早期检查] 起流后等待 {eeg_window}s，观察 EEG 流是否已有数据 ...", flush=True)
+    eeg_start_ts = time.monotonic()
+    time.sleep(eeg_window)
+    eeg_early = counter.eeg_samples()
+    eeg_first = counter.eeg_first_ts()
+    eeg_latency = (eeg_first - eeg_start_ts) if eeg_first is not None else None
+    print(f"[EEG 早期检查] {eeg_window}s 内 EEG 样本数 = {eeg_early}"
+          + (f"，首包延迟 = {eeg_latency:.2f}s" if eeg_latency is not None else "，未收到 EEG")
+          + f"；各族统计 = {counter.stats()}", flush=True)
+    record(results, "startDataNotification 后 EEG 流立即有数据", eeg_early > 0,
+           f"起流后 {eeg_window}s 内 EEG 样本数 > 0",
+           f"EEG样本={eeg_early}" + (f" 首包延迟={eeg_latency:.2f}s" if eeg_latency is not None else "") + f" 各族={counter.stats()}")
+
+    remaining = COLLECT_SECONDS - eeg_window
+    if remaining > 0:
+        print(f"\n[采集] 继续等待剩余 {remaining}s ...", flush=True)
+        time.sleep(remaining)
     batches, samples = counter.snapshot()
-    print(f"[采集] 收到 {batches} 批 / {samples} 样本", flush=True)
+    print(f"[采集] 累计收到 {batches} 批 / {samples} 样本", flush=True)
     record(results, "onDataCallback 收到数据", samples > 0,
            "起流后样本数 > 0", f"批数={batches} 样本数={samples}")
 

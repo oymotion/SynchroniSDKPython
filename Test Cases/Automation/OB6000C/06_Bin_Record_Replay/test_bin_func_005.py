@@ -6,7 +6,7 @@
 
 流程：
   1) 复用 FUNC-004 前半段流程生成有效 bin（connect → 起流 → 采集 → stop → disconnect）
-  2) 复用同一 profile，换回调计数，replayBinFile(path, sensor, realtime=False)
+  2) 在独立子进程（fresh controller + fresh profile）里 replay_worker.py --mode summary --realtime false 回放
   3) 校验：回放产生数据（count>0）、回放 DataType 包含 live DataType、replay 有 startTimeStamp
   4) informational：回放批数与实收批数对比、回放耗时应该远小于录制时长（全速）
 
@@ -21,8 +21,10 @@
   - 待测设备：OB6000C 上电、在范围内
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
 import time
 import tempfile
@@ -58,6 +60,30 @@ def _get_ble_path(sensor):
         return sensor.getParam("DEBUG_BLE_DATA_PATH")
     except Exception as e:
         return f"抛异常 {type(e).__name__}: {e}"
+
+
+def _run_worker(bin_path, mode, realtime=False, timeout=180):
+    """在独立子进程里回放，返回解析后的 JSON dict。
+
+    进程内回放会复用已连接/已起流的 profile（结果 0 批/0 样本），故必须子进程回放。
+    """
+    worker = os.path.join(AUTOMATION_DIR, "replay_worker.py")
+    cmd = [sys.executable, worker, "--bin", bin_path, "--mode", mode]
+    if mode == "summary":
+        cmd += ["--realtime", "true" if realtime else "false"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return {"ok": False, "error": "子进程无 stdout",
+                    "returncode": proc.returncode, "stderr": (proc.stderr or "")[:500]}
+        try:
+            return json.loads(lines[-1])
+        except Exception as e:
+            return {"ok": False, "error": f"解析子进程 JSON 失败 {type(e).__name__}: {e}",
+                    "stdout": (proc.stdout or "")[:500], "stderr": (proc.stderr or "")[:500]}
+    except Exception as e:
+        return {"ok": False, "error": f"子进程回放异常 {type(e).__name__}: {e}"}
 
 
 class BatchCounter:
@@ -300,68 +326,7 @@ def main():
         print("\n结论: FAIL", flush=True)
         return
 
-    # ---- 回放 realtime=False 全速 ----
-    # 硬断言策略与 FUNC-004 一致：不比精确批数，只验证回放产生有效数据
-    replay = BatchCounter()
-    sensor.onDataCallback = replay
-
-    print(f"\n[回放] replayBinFile({bin_path!r}, sensor, realtime=False) ...", flush=True)
-    replay_start = time.time()
-    try:
-        profile = ctrl.replayBinFile(bin_path, sensor, realtime=False)
-        replay_txt = f"返回 {type(profile).__name__}"
-    except Exception as e:
-        profile = None
-        replay_txt = f"抛异常 {type(e).__name__}: {e}"
-    replay_duration = time.time() - replay_start
-    replay_count = replay.count
-    print(f"[回放] {replay_txt}，回放批数 = {replay_count}，耗时 ≈ {replay_duration:.3f}s", flush=True)
-
-    # ---- 诊断 ----
-    print("\n[诊断] 数据分布对比", flush=True)
-    print(f"  LIVE   总批数={live.count}  分布={live.dt_counts}  首 ts={live.first_ts} dt={live.first_dt}", flush=True)
-    print(f"  REPLAY 总批数={replay.count}  分布={replay.dt_counts}  首 ts={replay.first_ts} dt={replay.first_dt}", flush=True)
-
-    live_dts = set(live.dt_counts.keys())
-    replay_dts = set(replay.dt_counts.keys())
-
-    # 1) 回放产生了数据
-    has_data = replay.count > 0
-    record(results, "回放产生数据（count > 0）", has_data,
-           "replay.count > 0", f"replay.count={replay.count}")
-
-    # 2) 回放 DataType 集合包含 live 的 DataType
-    contains_live = live_dts.issubset(replay_dts)
-    record(results, "回放 DataType 包含 live 的 DataType", contains_live,
-           f"replay dts 包含 {live_dts}",
-           f"live={live_dts} replay={replay_dts} 交集={live_dts & replay_dts} 缺失={live_dts - replay_dts}")
-
-    # 3) 回放产生了有效数据（startTimeStamp 非 None）
-    has_anchor = replay.first_ts is not None
-    record(results, "回放数据有 startTimeStamp（流锚点）", has_anchor,
-           "replay.first_ts is not None",
-           f"replay.first_ts={replay.first_ts} live.first_ts={live.first_ts}")
-
-    # 4) informational：per-DataType 批数差异
-    all_dts = sorted(live_dts | replay_dts)
-    diffs = []
-    for dt in all_dts:
-        lc = live.dt_counts.get(dt, 0)
-        rc = replay.dt_counts.get(dt, 0)
-        diffs.append(f"{dt}: live={lc} replay={rc} diff={rc - lc}")
-    print(f"  [informational] 各 DataType 批数差异: {' | '.join(diffs)}", flush=True)
-    record(results, "per-DataType 批数差异（informational）", None,
-           "仅作参考，不做 PASS/FAIL 判定", diffs)
-
-    # 5) informational：全速回放（耗时远小于录制时长）
-    if live_duration > 0:
-        speedup = live_duration / replay_duration if replay_duration > 0 else float('inf')
-        print(f"  [informational] 全速回放: 录制={live_duration:.3f}s 回放={replay_duration:.3f}s 加速比={speedup:.1f}x", flush=True)
-        record(results, "realtime=False 全速回放（informational）", None,
-               "回放耗时远小于录制时长",
-               f"replay={replay_duration:.3f}s live={live_duration:.3f}s 加速比={speedup:.1f}x")
-
-    # 清理
+    # ---- 清理并终止本进程 SDK（释放 dongle，避免与回放子进程冲突）----
     try:
         sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
     except Exception:
@@ -372,6 +337,66 @@ def main():
         pass
 
     ctrl.terminate()
+
+    # ---- 回放 realtime=False 全速：独立子进程（fresh controller + fresh profile）----
+    # 进程内回放会复用已连接/已起流的 profile（结果 0 批/0 样本），故必须子进程回放。
+    # 硬断言策略与 FUNC-004 一致：不比精确批数，只验证回放产生有效数据。
+    print(f"\n[回放] 子进程离线回放 replay_worker.py --mode summary --realtime false ...", flush=True)
+    result = _run_worker(bin_path, "summary", realtime=False)
+    r_ok = result.get("ok") is True
+    r_err = result.get("error")
+
+    replay_count = result.get("batches", 0) if r_ok else 0
+    replay_dt_counts = result.get("dt_counts", {}) if r_ok else {}
+    replay_first_ts = result.get("first_ts") if r_ok else None
+    replay_duration = result.get("elapsed_sec", 0.0) if r_ok else 0.0
+
+    print(f"[回放] {'完成' if r_ok else '失败'}：批数={replay_count}，耗时≈{replay_duration:.3f}s"
+          + (f" err={r_err}" if r_err else ""), flush=True)
+
+    # ---- 诊断 ----
+    print("\n[诊断] 数据分布对比", flush=True)
+    print(f"  LIVE   总批数={live.count}  分布={live.dt_counts}  首 ts={live.first_ts} dt={live.first_dt}", flush=True)
+    print(f"  REPLAY 总批数={replay_count}  分布={replay_dt_counts}  首 ts={replay_first_ts}", flush=True)
+
+    live_dts = set(live.dt_counts.keys())
+    replay_dts = set(replay_dt_counts.keys())
+
+    # 1) 回放产生了数据
+    has_data = r_ok and replay_count > 0
+    record(results, "回放产生数据（count > 0）", has_data,
+           "replay.count > 0", f"replay.count={replay_count}" + (f" err={r_err}" if r_err else ""))
+
+    # 2) 回放 DataType 集合包含 live 的 DataType
+    contains_live = has_data and live_dts.issubset(replay_dts)
+    record(results, "回放 DataType 包含 live 的 DataType", contains_live,
+           f"replay dts 包含 {live_dts}",
+           f"live={live_dts} replay={replay_dts} 交集={live_dts & replay_dts} 缺失={live_dts - replay_dts}")
+
+    # 3) 回放产生了有效数据（startTimeStamp 非 None）
+    has_anchor = has_data and replay_first_ts is not None
+    record(results, "回放数据有 startTimeStamp（流锚点）", has_anchor,
+           "replay.first_ts is not None",
+           f"replay.first_ts={replay_first_ts} live.first_ts={live.first_ts}")
+
+    # 4) informational：per-DataType 批数差异
+    all_dts = sorted(live_dts | replay_dts)
+    diffs = []
+    for dt in all_dts:
+        lc = live.dt_counts.get(dt, 0)
+        rc = replay_dt_counts.get(dt, 0)
+        diffs.append(f"{dt}: live={lc} replay={rc} diff={rc - lc}")
+    print(f"  [informational] 各 DataType 批数差异: {' | '.join(diffs)}", flush=True)
+    record(results, "per-DataType 批数差异（informational）", None,
+           "仅作参考，不做 PASS/FAIL 判定", diffs)
+
+    # 5) informational：全速回放（耗时远小于录制时长）
+    if r_ok and live_duration > 0:
+        speedup = live_duration / replay_duration if replay_duration > 0 else float('inf')
+        print(f"  [informational] 全速回放: 录制={live_duration:.3f}s 回放={replay_duration:.3f}s 加速比={speedup:.1f}x", flush=True)
+        record(results, "realtime=False 全速回放（informational）", None,
+               "回放耗时远小于录制时长",
+               f"replay={replay_duration:.3f}s live={live_duration:.3f}s 加速比={speedup:.1f}x")
 
     # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)

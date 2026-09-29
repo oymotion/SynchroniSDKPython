@@ -29,7 +29,7 @@ import common
 from common import record
 from multi_common import (
     scan_and_match_all, connect_and_init_all, disconnect_all,
-    check_device_count, print_summary,
+    check_device_count, print_summary, MultiDataCollector,
 )
 
 
@@ -87,6 +87,11 @@ def main():
     s1, s2 = sensors[0], sensors[1]
     tid1, tid2 = matched[0][1], matched[1][1]
 
+    # 数据回调收集器：观察 multiStart 前后各设备是否真的有数据到达
+    collector = MultiDataCollector()
+    s1.onDataCallback = collector.on_data
+    s2.onDataCallback = collector.on_data
+
     # 第一台单独起流
     print(f"\n[单独起流] {tid1} startDataNotification() ...", flush=True)
     try:
@@ -110,6 +115,12 @@ def main():
     # 等待一下确保起流稳定
     time.sleep(2)
 
+    baseline = dict(collector.batch_counts)
+    baseline_ts = dict(collector.first_batch)
+    print(f"[基线] multiStart 前 batch_counts={baseline}", flush=True)
+    print(f"[基线] multiStart 前 first_batch(ts,delay)={baseline_ts}", flush=True)
+    print(f"[基线] multiStart 前 isDataTransfering: s1({tid1})={s1.isDataTransfering}, s2({tid2})={s2.isDataTransfering}", flush=True)
+
     print(f"\n[multiStart] 对已起流的 {tid1} 和未起流的 {tid2} 执行 multiStart ...", flush=True)
     try:
         mret = ctrl.multiStartDataNotification(sensors)
@@ -128,10 +139,27 @@ def main():
         print(f"[multiStart] {tid1}({mac1}): result={mret.get(mac1)}, isDataTransfering={s1.isDataTransfering}", flush=True)
         print(f"[multiStart] {tid2}({mac2}): result={mret.get(mac2)}, isDataTransfering={s2.isDataTransfering}", flush=True)
 
+    # 观察 multiStart 期间/之后数据是否真的在传（区分「返回 False 但数据在传」vs「真没起流」）
+    after = dict(collector.batch_counts)
+    after_ts = dict(collector.first_batch)
+    inc = {mac: after.get(mac, 0) - baseline.get(mac, 0) for mac in set(after) | set(baseline)}
+    print(f"[数据观察] multiStart 后 batch_counts={after}", flush=True)
+    print(f"[数据观察] multiStart 期间批次增量={inc}", flush=True)
+    print(f"[数据观察] multiStart 前 first_batch(ts,delay)={baseline_ts}", flush=True)
+    print(f"[数据观察] multiStart 后 first_batch(ts,delay)={after_ts}", flush=True)
+
+    # 再等 3 秒观察是否持续传输
+    time.sleep(3)
+    after2 = dict(collector.batch_counts)
+    inc2 = {mac: after2.get(mac, 0) - after.get(mac, 0) for mac in set(after2) | set(after)}
+    print(f"[数据观察] multiStart+3s 批次增量={inc2}, "
+          f"isDataTransfering: s1={s1.isDataTransfering}, s2={s2.isDataTransfering}", flush=True)
+
     record(results, "已起流设备 multiStart 先停后起（restart 语义）",
            restart_ok,
            "s1（已起流）先停后起，s2（空闲）起流，均成功，无异常",
-           f"multiStart 返回 {mret}")
+           f"multiStart 返回 {mret}；期间批次增量={inc}；+3s 增量={inc2}；"
+           f"isDataTransfering s1={s1.isDataTransfering} s2={s2.isDataTransfering}")
 
     try:
         ctrl.multiStopDataNotification(sensors)

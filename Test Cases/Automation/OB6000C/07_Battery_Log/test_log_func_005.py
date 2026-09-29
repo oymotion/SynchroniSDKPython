@@ -6,8 +6,8 @@
 
 流程：
   1) setLogPath(True, 受控目录) + setDebugEnabled(True) 指向临时日志目录
-  2) 测试 controller 级别：ctrl.log("test_controller_msg", "I") 写入一条 Info 日志
-  3) scan -> requireSensor -> connect -> 到达 Ready -> init
+  2) scan -> requireSensor -> connect -> 到达 Ready -> init
+  3) 测试 controller 级别：ctrl.log("test_controller_msg", "I") 写入一条 Info 日志
   4) 测试 profile 级别：sensor.log("test_profile_msg", "W") 写入一条 Warning 日志
   5) 测试：profile 未启用时，sensor.log 应回退到 controller log
   6) 读取日志文件，检查 [App] 标记和测试消息的内容及级别（D/I/W/E）
@@ -117,31 +117,6 @@ def main():
     except Exception as e:
         print(f"[日志目录] setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    # ---- 测试 1：SensorController.log 写入应用日志（controller 级别） ----
-    ctrl_test_msg = "test_controller_msg_ctrl_log_001"
-    print(f"\n[应用日志] ctrl.log('{ctrl_test_msg}', 'I') ...", flush=True)
-    try:
-        ctrl.log(ctrl_test_msg, "I")
-        ctrl_log_ok = True
-        ctrl_log_txt = f"ctrl.log('{ctrl_test_msg}', 'I') 无异常"
-    except Exception as e:
-        ctrl_log_ok = False
-        ctrl_log_txt = f"ctrl.log 抛异常 {type(e).__name__}: {e}"
-    print(f"[应用日志] {ctrl_log_txt}", flush=True)
-
-    # 给日志写入留时间
-    time.sleep(1.0)
-
-    # 搜索日志中的 controller 消息
-    ctrl_matches = _search_log_lines(log_dir, re.escape(ctrl_test_msg))
-    found_ctrl = len(ctrl_matches) > 0
-    print(f"[应用日志] 搜索 '{ctrl_test_msg}' 匹配到 {len(ctrl_matches)} 行:", flush=True)
-    for m in ctrl_matches[:5]:
-        print(f"  {m[:120]}", flush=True)
-    record(results, "SensorController.log 写入应用日志", found_ctrl,
-           f"ctrl.log('{ctrl_test_msg}', 'I') 后在日志中可找到该消息",
-           f"匹配到 {len(ctrl_matches)} 行" if found_ctrl else "未找到匹配行")
-
     # 环境检查
     is_enable = ctrl.isEnable
     print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
@@ -228,6 +203,31 @@ def main():
         init_txt = f"抛异常 {type(e).__name__}: {e}"
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
+
+    # ---- 测试 1：SensorController.log 写入应用日志（controller 级别） ----
+    ctrl_test_msg = "test_controller_msg_ctrl_log_001"
+    print(f"\n[应用日志] ctrl.log('{ctrl_test_msg}', 'I') ...", flush=True)
+    try:
+        ctrl.log(ctrl_test_msg, "I")
+        ctrl_log_ok = True
+        ctrl_log_txt = f"ctrl.log('{ctrl_test_msg}', 'I') 无异常"
+    except Exception as e:
+        ctrl_log_ok = False
+        ctrl_log_txt = f"ctrl.log 抛异常 {type(e).__name__}: {e}"
+    print(f"[应用日志] {ctrl_log_txt}", flush=True)
+
+    # 给日志写入留时间
+    time.sleep(1.0)
+
+    # 搜索日志中的 controller 消息
+    ctrl_matches = _search_log_lines(log_dir, re.escape(ctrl_test_msg))
+    found_ctrl = len(ctrl_matches) > 0
+    print(f"[应用日志] 搜索 '{ctrl_test_msg}' 匹配到 {len(ctrl_matches)} 行:", flush=True)
+    for m in ctrl_matches[:5]:
+        print(f"  {m[:120]}", flush=True)
+    record(results, "SensorController.log 写入应用日志", found_ctrl,
+           f"ctrl.log('{ctrl_test_msg}', 'I') 后在日志中可找到该消息",
+           f"匹配到 {len(ctrl_matches)} 行" if found_ctrl else "未找到匹配行")
 
     # ---- 测试 2：SensorProfile.log 写入应用日志（profile 级别） ----
     profile_test_msg = "test_profile_msg_sensor_log_002"

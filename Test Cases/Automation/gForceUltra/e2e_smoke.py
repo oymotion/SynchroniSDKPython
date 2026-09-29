@@ -58,6 +58,8 @@ class DataCounter:
     def __init__(self):
         self.batches = 0
         self.samples = 0
+        self.dt_samples = {}      # DataType 名字 -> 累计样本数（n_ch * n_smp）
+        self.first_emg_ts = None  # 首次收到 EMG 数据的时刻（time.monotonic 秒）
         self.lock = threading.Lock()
 
     def __call__(self, sensor, data):
@@ -70,13 +72,31 @@ class DataCounter:
                     n_ch = it.getChannelCount()
                     n_smp = it.getSampleCount()
                     if n_ch > 0 and n_smp > 0:
-                        self.samples += n_ch * n_smp
+                        n = n_ch * n_smp
+                        self.samples += n
+                        dt = it.getDataType()
+                        name = dt.name if isinstance(dt, DataType) else "?"
+                        self.dt_samples[name] = self.dt_samples.get(name, 0) + n
+                        if name == "NTF_EMG" and self.first_emg_ts is None:
+                            self.first_emg_ts = time.monotonic()
                 except Exception:
                     continue
 
     def snapshot(self):
         with self.lock:
             return self.batches, self.samples
+
+    def emg_samples(self):
+        with self.lock:
+            return self.dt_samples.get("NTF_EMG", 0)
+
+    def emg_first_ts(self):
+        with self.lock:
+            return self.first_emg_ts
+
+    def stats(self):
+        with self.lock:
+            return dict(self.dt_samples)
 
 def main():
     ctrl = SensorControllerInstance
@@ -260,10 +280,29 @@ def main():
     record(results, "SensorProfile.isDataTransfering 为 True", sensor.isDataTransfering is True,
            "isDataTransfering == True", f"isDataTransfering == {sensor.isDataTransfering}")
 
-    print(f"\n[采集] 等待 {COLLECT_SECONDS}s ...", flush=True)
-    time.sleep(COLLECT_SECONDS)
+    # 复现「connect 后 EMG 无数据」：起流后短窗口内观察 EMG 是否已有数据。
+    # 现象：pyqt_demo 里 connect 后波形区不立即出数据，需重启设备；其他设备 connect 后立即有数据。
+    # 这里用 SDK 起流后 5s 内是否收到 NTF_EMG 样本来量化判定。
+    emg_window = 5
+    print(f"\n[EMG 早期检查] 起流后等待 {emg_window}s，观察 EMG 流是否已有数据 ...", flush=True)
+    emg_start_ts = time.monotonic()
+    time.sleep(emg_window)
+    emg_early = counter.emg_samples()
+    emg_first = counter.emg_first_ts()
+    emg_latency = (emg_first - emg_start_ts) if emg_first is not None else None
+    print(f"[EMG 早期检查] {emg_window}s 内 EMG 样本数 = {emg_early}"
+          + (f"，首包延迟 = {emg_latency:.2f}s" if emg_latency is not None else "，未收到 EMG")
+          + f"；各族统计 = {counter.stats()}", flush=True)
+    record(results, "startDataNotification 后 EMG 流立即有数据", emg_early > 0,
+           f"起流后 {emg_window}s 内 EMG 样本数 > 0",
+           f"EMG样本={emg_early}" + (f" 首包延迟={emg_latency:.2f}s" if emg_latency is not None else "") + f" 各族={counter.stats()}")
+
+    remaining = COLLECT_SECONDS - emg_window
+    if remaining > 0:
+        print(f"\n[采集] 继续等待剩余 {remaining}s ...", flush=True)
+        time.sleep(remaining)
     batches, samples = counter.snapshot()
-    print(f"[采集] 收到 {batches} 批 / {samples} 样本", flush=True)
+    print(f"[采集] 累计收到 {batches} 批 / {samples} 样本", flush=True)
     record(results, "onDataCallback 收到数据", samples > 0,
            "起流后样本数 > 0", f"批数={batches} 样本数={samples}")
 

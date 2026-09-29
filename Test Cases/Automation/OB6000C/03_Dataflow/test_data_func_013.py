@@ -12,14 +12,15 @@
        rawData         -> getRawData(ci,si)
        impedance       -> getImpedance(ci,si)
        saturation      -> getSaturation(ci,si)
-       timeStampInMs   -> getTimeStampInMs(ci,si)
        absTimeStampInSec -> getAbsTimeStampInSec(ci,si)
+     （getTimeStampInMs 为单独访问器，Sample 无 timeStampInMs 字段，不在此比对）
      channelIndex 无直接单点访问器，通过 getChannelSample(ci,si).channelIndex 校验。
 
 说明：
-  0.9.0 新增了 Sample.rawData/impedance/saturation/channelIndex/timeStampInMs/
-  absTimeStampInSec 等字段及对应单点访问器。本用例聚焦这些"新增字段"，逐字段
+  0.9.0 新增了 Sample.rawData/impedance/saturation/channelIndex/absTimeStampInSec
+  等字段及对应单点访问器。本用例聚焦这些"新增字段"，逐字段
   给出独立结论，区别于 DATA-FUNC-007（全字段 + sampleIndex 单调）。
+  timeStampInMs 仅有 getTimeStampInMs(ci,si) 访问器，Sample 无对应字段，故不比对。
   channelIndex 语义为"样本所属通道"，getChannelSample(ci,si).channelIndex 应 == ci。
 
 前置条件：
@@ -70,7 +71,6 @@ NEW_FIELD_ACCESSORS = [
     ("rawData", "getRawData"),
     ("impedance", "getImpedance"),
     ("saturation", "getSaturation"),
-    ("timeStampInMs", "getTimeStampInMs"),
     ("absTimeStampInSec", "getAbsTimeStampInSec"),
 ]
 

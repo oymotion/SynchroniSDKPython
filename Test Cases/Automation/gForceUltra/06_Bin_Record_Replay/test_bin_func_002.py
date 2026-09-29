@@ -385,7 +385,7 @@ def main():
                    "各流 ChannelCount == spec.channels",
                    "全部一致" if not ch_mismatch else "不一致: " + "; ".join(ch_mismatch))
 
-            # 3) 采样率在 spec 允许集合内（EMG 有已知 init 改 500 的 bug，故用 rates 集合而非 default）
+            # 3) 采样率在 spec 允许集合内（EMG 支持 500/1000 两档，用 rates 集合校验而非硬编码 default）
             rate_map = {
                 "EMG_SAMPLE_RATE": "EmgSampleRate",
                 "IMU_SAMPLE_RATE": "ImuSampleRate",

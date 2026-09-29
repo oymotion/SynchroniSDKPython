@@ -283,7 +283,7 @@ def main():
     print("压力测试：反复连接-长时间起流-断开", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
-    print(f"ble backend = {ctrl.getBLEBackendName()}（Windows 上可能恒为 'bleak'，仅作参考，不参与判定）", flush=True)
+    print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
     if target_identity:
         print(f"目标 identity: {', '.join(target_identity)}（命令行指定）", flush=True)
     else:
@@ -292,15 +292,16 @@ def main():
 
     # dongle 就绪检查：非 dongle（系统蓝牙）则中断，避免系统蓝牙不稳定
     try:
-        dongle_ok = checkSetupDongle()
+        dongle_ok = ctrl.checkSetupDongle()
     except Exception as e:
         dongle_ok = None
         print(f"[dongle] checkSetupDongle() 抛异常 {type(e).__name__}: {e}", flush=True)
     print(f"[dongle] checkSetupDongle() -> {dongle_ok!r}", flush=True)
     if not (isinstance(dongle_ok, str) and dongle_ok.startswith("OK")):
-        print("[FAIL] USB dongle 未就绪（无可用 dongle），将回退系统蓝牙（不稳定），已中断。", flush=True)
+        print("[FAIL] USB dongle 未就绪（backend 非 dongle），稳定性测试不支持非 dongle 后端，已中断。", flush=True)
         ctrl.terminate()
         return
+    print("[dongle] 提醒：已确认 backend 为 USB dongle（稳定性测试仅支持 dongle），继续执行。", flush=True)
 
     print("\n[前置条件]", flush=True)
     print("  - 主机(电脑)：系统蓝牙已【关闭】", flush=True)
@@ -324,6 +325,7 @@ def main():
 
     start_time = time.time()
     fail_round = None
+    fail_detail = None
     total_rounds = 0
 
     for i in range(1, MAX_ROUNDS + 1):
@@ -344,6 +346,7 @@ def main():
             else:
                 print(f"[定位] 日志目录中无 .bin 文件（本轮出错点可能在起流前）", flush=True)
             fail_round = i
+            fail_detail = detail
             break
 
         # 每轮之间短暂休息
@@ -361,7 +364,7 @@ def main():
 
     if fail_round is not None:
         print(f"\n  状态异常发生在第 {fail_round} 轮", flush=True)
-        print(f"  详情: startDataNotification 返回非 True", flush=True)
+        print(f"  详情: {fail_detail}", flush=True)
     else:
         print(f"\n  全部 {MAX_ROUNDS} 轮通过，未复现异常", flush=True)
 

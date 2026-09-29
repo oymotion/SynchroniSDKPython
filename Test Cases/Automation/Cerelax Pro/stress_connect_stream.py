@@ -374,7 +374,7 @@ def main():
 
     # dongle 就绪检查：非 dongle（系统蓝牙）则中断，避免系统蓝牙不稳定
     try:
-        dongle_ok = checkSetupDongle()
+        dongle_ok = ctrl.checkSetupDongle()
     except Exception as e:
         dongle_ok = None
         print(f"[dongle] checkSetupDongle() 抛异常 {type(e).__name__}: {e}", flush=True)

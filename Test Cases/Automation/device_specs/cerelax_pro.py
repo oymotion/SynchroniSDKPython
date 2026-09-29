@@ -42,7 +42,7 @@ SPEC = {
         "NTF_GFORCE_QUAT":  {"supported": False, "channels": 0},   # QuatChannelCount=0（6 轴无四元数）
         "NTF_IMU":          {"supported": True,  "channels": 6},   # ImuChannelCount=6（acc3+gyro3 聚合）
         "NTF_MAG_ANGLE":    {"supported": False, "channels": 0},   # MagAngleChannelCount=0（无磁力计）
-        "NTF_IMPEDANCE":    {"supported": True,  "channels": 2},   # ImpeChannelCount=2（电极接触检测）
+        "NTF_IMPEDANCE":    {"supported": True,  "channels": 2},   # ImpeChannelCount=2（电极接触检测，固定 1Hz，见 sample_rates.IMPEDANCE）
         "NTF_EEG":          {"supported": True,  "channels": 2},   # EegChannelCount=2（核心）
         "NTF_ECG":          {"supported": False, "channels": 0},   # EcgChannelCount=0
         "NTF_BRTH":         {"supported": False, "channels": 0},   # BrthChannelCount=0
@@ -58,10 +58,27 @@ SPEC = {
         "FILTER_LPF":  True,   # 低通
     },
 
-    # ===== 采样率参数（EEG/IMU/PPG 三套，均可 getParam/setParam）=====
+    # ===== 采样率（统一事实来源，供 test_measure_sample_rate.py 遍历）=====
+    # 每条对应一路数据流：
+    #   stream    : setParam("NTF_XXX", "ON") 开关 key，同时是 DataType.NTF_XXX 类型名
+    #   settable  : True 表示 key 即 setParam 采样率参数名；False 为固定采样率、无对应参数
+    #   co_stream : 伴随流（IMU / 阻抗需与 EEG 同起才有数据），None 表示无；PPG 为独立流
     "sample_rates": {
-        "EEG_SAMPLE_RATE": {"rates": ["250", "500", "1000"],       "default": "1000"},
-        "IMU_SAMPLE_RATE": {"rates": ["50", "100", "200"],         "default": "200"},
-        "PPG_SAMPLE_RATE": {"rates": ["50", "100", "200", "400"],  "default": "50"},
+        "EEG_SAMPLE_RATE": {
+            "rates": ["250", "500", "1000"], "default": "1000",
+            "stream": "NTF_EEG", "settable": True, "co_stream": None,
+        },
+        "IMU_SAMPLE_RATE": {
+            "rates": ["50", "100", "200"], "default": "200",
+            "stream": "NTF_IMU", "settable": True, "co_stream": "NTF_EEG",
+        },
+        "PPG_SAMPLE_RATE": {
+            "rates": ["50", "100", "200", "400"], "default": "50",
+            "stream": "NTF_PPG", "settable": True, "co_stream": None,
+        },
+        "IMPEDANCE": {
+            "rates": ["1"], "default": "1",
+            "stream": "NTF_IMPEDANCE", "settable": False, "co_stream": "NTF_EEG",
+        },
     },
 }

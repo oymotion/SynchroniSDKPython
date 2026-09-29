@@ -5,13 +5,13 @@
 可自动化：semi-auto（需人工插入 dongle）
 
 前置条件（运行前请人工准备好）：
-  - 主机(电脑)：若测 bumble 后端，需插入 USB BLE dongle（Windows 上可能需先
+  - 主机(电脑)：若测 dongle 后端，需插入 USB BLE dongle（Windows 上可能需先
     用管理员权限把 dongle 绑定到 WinUSB 驱动）
   - 待测设备：本用例【无需】OB6000C（只检测 dongle，不连接设备）
 
 流程：
   1) 打印当前后端 getBLEBackendName()
-  2) 人工确认 dongle 已插入（bumble 后端时）-> 按回车
+  2) 人工确认 dongle 已插入（dongle 后端时）-> 按回车
   3) checkSetupDongle() -> 断言不抛异常
   4) 断言返回非空字符串
   5) 断言返回格式为 "OK" / "OK: N" / "Error: ..."
@@ -41,12 +41,12 @@ def main():
     print("（本用例无需待测设备 OB6000C，仅检测 USB dongle）", flush=True)
 
     # 人工操作提示
-    if (backend or '').lower() == 'bumble':
+    if (backend or '').lower() == 'dongle':
         input("\n>>> [人工操作] 请确认 USB BLE dongle 已插入【电脑】（如需装 WinUSB 驱动请先完成），"
               "完成后按回车继续 ...")
     else:
-        print("\n当前为 bleak 后端，checkSetupDongle 将退化为 'OK'（无数量的 OK）。", flush=True)
-        input(">>> [人工操作] 若想验证 bumble 后端，请设置环境变量 SENSOR_SDK_BLE_BACKEND=bumble、"
+        print("\n当前为 winrt 后端，checkSetupDongle 将退化为 'OK'（无数量的 OK）。", flush=True)
+        input(">>> [人工操作] 若想验证 dongle 后端，请设置环境变量 SENSOR_SDK_BLE_BACKEND=dongle、"
               "插入 dongle 后重跑；现在按回车直接在当前后端下测试 ...")
 
     results = []

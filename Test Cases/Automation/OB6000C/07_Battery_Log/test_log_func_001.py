@@ -60,6 +60,11 @@ def _get_total_size(log_files):
     return total
 
 
+# ---- 关闭日志判定参数 ----
+DISABLE_BRAKE_SECONDS = 2.0    # setDebugEnabled(False) 后的刹车时间：等已缓冲日志落盘
+DISABLE_OBSERVE_SECONDS = 5.0  # 观察窗口：判断日志是否真的停止增长，以及未停住时的比例
+
+
 def main():
     ctrl = SensorControllerInstance
 
@@ -110,6 +115,24 @@ def main():
         debug_txt = f"setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}"
     print(f"[测试] {debug_txt}", flush=True)
 
+    # 开启 debug 后主动做几件 controller 级操作，产生更多日志，
+    # 避免日志量过小导致「关闭后是否停止」没有区分度。
+    print("\n[日志] 主动产生日志活动（controller 级，无需设备）...", flush=True)
+    for _ in range(3):
+        for key in ("BACK_END", "DEBUG_ENABLED", "LOG_PATH"):
+            try:
+                ctrl.getParam(key)
+            except Exception:
+                pass
+    if ctrl.isEnable:
+        try:
+            devices = ctrl.scan(config.SCAN_TIMEOUT_MS)
+            print(f"[日志] scan 返回 {len(devices)} 台设备", flush=True)
+        except Exception as e:
+            print(f"[日志] scan 抛异常 {type(e).__name__}: {e}", flush=True)
+    else:
+        print("[日志] 蓝牙未开启，跳过 scan（仅参数读写产生日志）", flush=True)
+
     # 等待日志写入
     time.sleep(2.0)
 
@@ -148,23 +171,30 @@ def main():
         disable_txt = f"setDebugEnabled(False) 抛异常 {type(e).__name__}: {e}"
     print(f"[测试] {disable_txt}", flush=True)
 
-    # 等待一段时间，确保不会再写入新日志
-    time.sleep(2.0)
+    # 刹车时间：给已缓冲的日志落盘留出时间，避免把落盘尾流误判为「仍在写」
+    time.sleep(DISABLE_BRAKE_SECONDS)
+    size_after_brake = _get_total_size(_list_log_files(log_dir))
 
-    files_after_disable = _list_log_files(log_dir)
-    size_after_disable = _get_total_size(files_after_disable)
+    # 观察窗口：拉长时间看日志是否真的停住，以及未停住时的增长比例
+    time.sleep(DISABLE_OBSERVE_SECONDS)
+    size_after_observe = _get_total_size(_list_log_files(log_dir))
 
     # 检查：关闭后日志大小应不再增长（或增长很小）
-    size_growth = size_after_disable - size_after_enable
+    size_growth = size_after_observe - size_after_brake
     no_growth = size_growth <= 0
-    print(f"[日志目录] 关闭前日志总大小: {size_after_enable} bytes", flush=True)
-    print(f"[日志目录] 关闭后日志总大小: {size_after_disable} bytes", flush=True)
-    print(f"[日志目录] 增长量: {size_growth} bytes", flush=True)
+    growth_ratio = size_growth / size_after_brake if size_after_brake > 0 else 0.0
+    growth_rate = size_growth / DISABLE_OBSERVE_SECONDS if DISABLE_OBSERVE_SECONDS > 0 else 0.0
+
+    print(f"[日志目录] 开启后日志总大小: {size_after_enable} bytes", flush=True)
+    print(f"[日志目录] 刹车 {DISABLE_BRAKE_SECONDS}s 后日志总大小: {size_after_brake} bytes", flush=True)
+    print(f"[日志目录] 观察 {DISABLE_OBSERVE_SECONDS}s 后日志总大小: {size_after_observe} bytes", flush=True)
+    print(f"[日志目录] 观察期增长量: {size_growth} bytes（速率 {growth_rate:.2f} bytes/s，占刹车后 {growth_ratio * 100:.2f}%）", flush=True)
 
     if no_growth:
-        disable_log_txt = f"日志大小未增长（关闭前={size_after_enable}，关闭后={size_after_disable}）"
+        disable_log_txt = f"日志大小未增长（刹车后={size_after_brake}，观察后={size_after_observe}）"
     else:
-        disable_log_txt = f"日志大小增长了 {size_growth} bytes（关闭前={size_after_enable}，关闭后={size_after_disable}）"
+        disable_log_txt = (f"日志大小增长了 {size_growth} bytes"
+                           f"（速率 {growth_rate:.2f} bytes/s，占刹车后 {growth_ratio * 100:.2f}%）")
 
     record(results, "setDebugEnabled(False) 关闭日志", no_growth,
            "setDebugEnabled(False) 后日志文件不再增长",

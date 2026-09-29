@@ -88,10 +88,9 @@ def _list_log_files(log_dir):
     return out
 
 def _dump_sample_rates(sensor):
-    """打印设备当前采样率（默认），确认跑之前是否为默认采样率。
+    """打印设备当前采样率，确认 EMG=1000Hz 设置是否生效。
 
-    本脚本不设置采样率，故此处读到的即为设备默认采样率。
-    覆盖 DeviceInfo 的采样率字段 + EEG_SAMPLE_RATE 参数（若设备支持）。
+    覆盖 DeviceInfo 的采样率字段 + EMG_SAMPLE_RATE 参数（若设备支持）。
     """
     try:
         dinfo = sensor.getDeviceInfo()
@@ -122,20 +121,20 @@ def _dump_sample_rates(sensor):
                 pass
             rates.append(f"{f}={v}")
         if rates:
-            print(f"[采样率] 设备当前采样率（默认，本脚本未设置）: {', '.join(rates)}", flush=True)
+            print(f"[采样率] 设备当前采样率: {', '.join(rates)}", flush=True)
         else:
             print("[采样率] 未从 getDeviceInfo 读到有效采样率字段", flush=True)
 
     try:
-        eeg_rate = sensor.getParam("EEG_SAMPLE_RATE")
+        emg_rate = sensor.getParam("EMG_SAMPLE_RATE")
     except Exception as e:
-        eeg_rate = f"抛异常 {type(e).__name__}: {e}"
+        emg_rate = f"抛异常 {type(e).__name__}: {e}"
     try:
-        eeg_list = sensor.getParam("EEG_SAMPLE_RATE_LIST")
+        emg_list = sensor.getParam("EMG_SAMPLE_RATE_LIST")
     except Exception as e:
-        eeg_list = f"抛异常 {type(e).__name__}: {e}"
-    print(f"[采样率] getParam('EEG_SAMPLE_RATE')={eeg_rate!r}  "
-          f"getParam('EEG_SAMPLE_RATE_LIST')={eeg_list!r}", flush=True)
+        emg_list = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[采样率] getParam('EMG_SAMPLE_RATE')={emg_rate!r}  "
+          f"getParam('EMG_SAMPLE_RATE_LIST')={emg_list!r}", flush=True)
 
 
 class DataCounter:
@@ -299,19 +298,20 @@ def main():
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     backend = ctrl.getBLEBackendName()
-    print(f"ble backend = {backend}（Windows 上可能恒为 'bleak'，仅作参考，不参与判定）", flush=True)
+    print(f"ble backend = {backend}", flush=True)
 
     # dongle 就绪检查；dongle 已可用时返回 "OK: N"，不会触发提权
     try:
-        dongle_ok = checkSetupDongle()
+        dongle_ok = ctrl.checkSetupDongle()
     except Exception as e:
         dongle_ok = None
         print(f"[dongle] checkSetupDongle() 抛异常 {type(e).__name__}: {e}", flush=True)
     print(f"[dongle] checkSetupDongle() -> {dongle_ok!r}", flush=True)
     if not (isinstance(dongle_ok, str) and dongle_ok.startswith("OK")):
-        print("[FAIL] USB dongle 未就绪（无可用 dongle），无法用 dongle 连接设备。", flush=True)
+        print("[FAIL] USB dongle 未就绪（backend 非 dongle），稳定性测试不支持非 dongle 后端，已退出。", flush=True)
         ctrl.terminate()
         return
+    print("[dongle] 提醒：已确认 backend 为 USB dongle（稳定性测试仅支持 dongle），继续执行。", flush=True)
 
     print(f"最小运行时长: {MIN_DURATION_SECONDS}s（{MIN_DURATION_SECONDS / 3600:.1f} 小时）", flush=True)
     print(f"低电量退出阈值: {LOW_BATTERY_THRESHOLD}%", flush=True)
@@ -435,7 +435,21 @@ def main():
         _teardown(ctrl, sensor, log_dir, bins_before)
         return
 
-    # 采样率信息：确认跑之前设备使用的是默认采样率（本脚本不设置采样率）
+    # 显式设置 EMG 采样率为 1000Hz（明确锁定，避免依赖上电默认值）
+    try:
+        emg_ret = sensor.setParam("EMG_SAMPLE_RATE", "1000")
+        print(f"[采样率] setParam('EMG_SAMPLE_RATE', '1000') -> {emg_ret!r}", flush=True)
+    except Exception as e:
+        print(f"[采样率] setParam('EMG_SAMPLE_RATE', '1000') 抛异常 {type(e).__name__}: {e}", flush=True)
+
+    # 关闭 GEST 手势流
+    try:
+        gest_ret = sensor.setParam("NTF_GEST", "OFF")
+        print(f"[数据流] setParam('NTF_GEST', 'OFF') -> {gest_ret!r}", flush=True)
+    except Exception as e:
+        print(f"[数据流] setParam('NTF_GEST', 'OFF') 抛异常 {type(e).__name__}: {e}", flush=True)
+
+    # 采样率信息：确认设置生效
     _dump_sample_rates(sensor)
 
     # 开启 profile 日志与 bin 导出

@@ -276,11 +276,11 @@ def main():
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     backend = ctrl.getBLEBackendName()
-    print(f"ble backend = {backend}（Windows 上可能恒为 'bleak'，仅作参考，不参与判定）", flush=True)
+    print(f"ble backend = {backend}", flush=True)
 
     # dongle 就绪检查；dongle 已可用时返回 "OK: N"，不会触发提权
     try:
-        dongle_ok = checkSetupDongle()
+        dongle_ok = ctrl.checkSetupDongle()
     except Exception as e:
         dongle_ok = None
         print(f"[dongle] checkSetupDongle() 抛异常 {type(e).__name__}: {e}", flush=True)

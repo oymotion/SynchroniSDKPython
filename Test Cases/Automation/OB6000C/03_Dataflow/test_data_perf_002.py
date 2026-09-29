@@ -88,11 +88,12 @@ def get_rss_bytes():
 
 
 class LongRunCollector:
-    """持续累计每通道样本数（时间维度），供分窗口快照。"""
+    """按 DataType 分桶累计每通道样本数，供分窗口快照（避免 EEG/IMU 合并误报）。"""
 
     def __init__(self):
         self.total_samples = 0
         self.batches = 0
+        self.samples_by_type = {}  # {DataType: int} 各类型累计样本数
 
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
@@ -100,7 +101,13 @@ class LongRunCollector:
             self.batches += 1
             # 1.3.0 已移除 channelSamples；getSampleCount() 即每通道样本数
             try:
-                self.total_samples += d.getSampleCount()
+                n = d.getSampleCount()
+                dt = d.getDataType()
+            except Exception:
+                continue
+            self.total_samples += n
+            try:
+                self.samples_by_type[dt] = self.samples_by_type.get(dt, 0) + n
             except Exception:
                 pass
 
@@ -242,9 +249,11 @@ def main():
 
     # 分窗口长稳采集
     num_windows = int(TOTAL_SECONDS // WINDOW_SECONDS)
-    window_rates = []
+    window_samples_list = []   # 每窗口合计样本数（用于"持续收到数据"判定）
+    window_rates_by_type = []  # 每窗口各 DataType 的采样率 {DataType: float}
     window_rss_mb = []
     prev_total = 0
+    prev_by_type = {}
 
     print(f"\n[采集] 开始长稳采集，共 {num_windows} 个窗口，每个 {WINDOW_SECONDS}s ...", flush=True)
     print("[采集] 提示：异常时按 Ctrl+C 可提前终止并输出已采集统计", flush=True)
@@ -258,15 +267,24 @@ def main():
             cur_total = collector.total_samples
             window_samples = cur_total - prev_total
             prev_total = cur_total
-            rate = window_samples / WINDOW_SECONDS
+
+            cur_by_type = collector.samples_by_type
+            rates_by_type = {}
+            for dt, cnt in cur_by_type.items():
+                rates_by_type[dt] = (cnt - prev_by_type.get(dt, 0)) / WINDOW_SECONDS
+            prev_by_type = dict(cur_by_type)
 
             rss = get_rss_bytes()
             rss_mb = (rss / (1024 * 1024)) if rss is not None else None
-            window_rates.append(rate)
+            window_samples_list.append(window_samples)
+            window_rates_by_type.append(rates_by_type)
             window_rss_mb.append(rss_mb)
 
             rss_txt = f"{rss_mb:.1f}MB" if rss_mb is not None else "N/A"
-            print(f"[窗口 {i + 1}/{num_windows}] 样本={window_samples} 采样率={rate:.1f}Hz 内存={rss_txt}", flush=True)
+            per_type_txt = " ".join(
+                f"{getattr(dt, 'name', str(dt))}={r:.1f}Hz"
+                for dt, r in sorted(rates_by_type.items(), key=lambda kv: getattr(kv[0], 'name', str(kv[0]))))
+            print(f"[窗口 {i + 1}/{num_windows}] 样本={window_samples} {per_type_txt} 内存={rss_txt}", flush=True)
     except KeyboardInterrupt:
         print("\n[采集] 被用户中断，输出已采集的中间统计 ...", flush=True)
 
@@ -285,28 +303,42 @@ def main():
     print("长稳统计", flush=True)
     print("=" * 60, flush=True)
 
-    n_done = len(window_rates)
+    n_done = len(window_samples_list)
     print(f"[统计] 完成窗口数 = {n_done} / {num_windows}，总累计样本（每通道） = {collector.total_samples}，"
           f"总批次数 = {collector.batches}", flush=True)
+    if collector.samples_by_type:
+        by_type_txt = " ".join(
+            f"{getattr(dt, 'name', str(dt))}={cnt}"
+            for dt, cnt in sorted(collector.samples_by_type.items(), key=lambda kv: getattr(kv[0], 'name', str(kv[0]))))
+        print(f"[统计] 累计样本（按类型）: {by_type_txt}", flush=True)
 
     # 判定 1：全程持续收到数据（每个窗口样本数 > 0）
-    all_windows_nonempty = n_done > 0 and all(s > 0 for s in [window_rates[i] * WINDOW_SECONDS for i in range(n_done)])
+    all_windows_nonempty = n_done > 0 and all(s > 0 for s in window_samples_list)
     record(results, "全程持续收到数据（各窗口样本数>0）", all_windows_nonempty,
            "每个窗口均收到数据", f"完成窗口数={n_done}")
 
-    # 判定 2：无掉速（末段 vs 首段平均采样率）
-    if n_done >= 2 * EDGE_WINDOWS:
-        head = sum(window_rates[:EDGE_WINDOWS]) / EDGE_WINDOWS
-        tail = sum(window_rates[-EDGE_WINDOWS:]) / EDGE_WINDOWS
+    # 判定 2：无掉速（针对主信号类型，避免 EEG/IMU 合并导致误报）
+    main_type = None
+    if DataType.NTF_EEG in collector.samples_by_type:
+        main_type = DataType.NTF_EEG
+    elif collector.samples_by_type:
+        main_type = max(collector.samples_by_type, key=collector.samples_by_type.get)
+
+    if main_type is not None and n_done >= 2 * EDGE_WINDOWS:
+        main_rates = [wr.get(main_type, 0.0) for wr in window_rates_by_type]
+        head = sum(main_rates[:EDGE_WINDOWS]) / EDGE_WINDOWS
+        tail = sum(main_rates[-EDGE_WINDOWS:]) / EDGE_WINDOWS
         drop = (head - tail) / head if head > 0 else 0.0
-        print(f"[掉速] 首 {EDGE_WINDOWS} 窗口平均={head:.1f}Hz，末 {EDGE_WINDOWS} 窗口平均={tail:.1f}Hz，"
-              f"下降={drop:.2%}", flush=True)
-        record(results, "无掉速（末段相对首段下降 <= 5%）", drop <= DROP_TOLERANCE,
-               f"末段相对首段下降 <= {DROP_TOLERANCE:.0%}",
-               f"首段={head:.1f}Hz 末段={tail:.1f}Hz 下降={drop:.2%}")
+        main_name = getattr(main_type, 'name', str(main_type))
+        print(f"[掉速:{main_name}] 首 {EDGE_WINDOWS} 窗口平均={head:.1f}Hz，"
+              f"末 {EDGE_WINDOWS} 窗口平均={tail:.1f}Hz，下降={drop:.2%}", flush=True)
+        record(results, f"无掉速（{main_name} 末段相对首段下降 <= 5%）", drop <= DROP_TOLERANCE,
+               f"{main_name} 末段相对首段下降 <= {DROP_TOLERANCE:.0%}",
+               f"{main_name} 首段={head:.1f}Hz 末段={tail:.1f}Hz 下降={drop:.2%}")
     else:
-        record(results, "无掉速（末段相对首段下降 <= 5%）", False,
-               f"需至少 {2 * EDGE_WINDOWS} 个窗口", f"完成窗口数={n_done}")
+        record(results, "无掉速（主信号末段相对首段下降 <= 5%）", False,
+               f"需至少 {2 * EDGE_WINDOWS} 个窗口且有主信号数据",
+               f"完成窗口数={n_done}，主类型={getattr(main_type, 'name', str(main_type)) if main_type else '无'}")
 
     # 判定 3：无内存泄漏（末窗口 vs 首窗口 RSS）
     valid_rss = [m for m in window_rss_mb if m is not None]

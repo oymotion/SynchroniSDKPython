@@ -54,7 +54,7 @@ SPEC = {
         "NTF_GFORCE_QUAT":  {"supported": True,  "channels": 4},   # QuatChannelCount=4（6 轴融合四元数 wxyz）
         "NTF_IMU":          {"supported": True,  "channels": 13},  # ImuChannelCount=13（acc3+gyro3+euler3+quat4）
         "NTF_MAG_ANGLE":    {"supported": False, "channels": 0},   # MagAngleChannelCount=0（无磁力计）
-        "NTF_IMPEDANCE":    {"supported": True,  "channels": 16},  # ImpeChannelCount=16（电极接触检测）
+        "NTF_IMPEDANCE":    {"supported": True,  "channels": 16},  # ImpeChannelCount=16（电极接触检测，固定 1Hz，见 sample_rates.IMPEDANCE）
         "NTF_EEG":          {"supported": True,  "channels": 16},  # EegChannelCount=16（核心）
         "NTF_ECG":          {"supported": False, "channels": 0},   # EcgChannelCount=0
         "NTF_BRTH":         {"supported": False, "channels": 0},   # BrthChannelCount=0
@@ -70,9 +70,23 @@ SPEC = {
         "FILTER_LPF":  True,   # 低通
     },
 
-    # ===== 采样率参数（EEG/IMU 两套，均可 getParam/setParam）=====
+    # ===== 采样率（统一事实来源，供 test_measure_sample_rate.py 遍历）=====
+    # 每条对应一路数据流：
+    #   stream    : setParam("NTF_XXX", "ON") 开关 key，同时是 DataType.NTF_XXX 类型名
+    #   settable  : True 表示 key 即 setParam 采样率参数名；False 为固定采样率、无对应参数
+    #   co_stream : 伴随流（IMU / 阻抗需与 EEG 同起才有数据），None 表示无
     "sample_rates": {
-        "EEG_SAMPLE_RATE": {"rates": ["250", "500"], "default": "250"},
-        "IMU_SAMPLE_RATE": {"rates": ["50"],         "default": "50"},
+        "EEG_SAMPLE_RATE": {
+            "rates": ["250", "500"], "default": "250",
+            "stream": "NTF_EEG", "settable": True, "co_stream": None,
+        },
+        "IMU_SAMPLE_RATE": {
+            "rates": ["50"], "default": "50",
+            "stream": "NTF_IMU", "settable": True, "co_stream": "NTF_EEG",
+        },
+        "IMPEDANCE": {
+            "rates": ["1"], "default": "1",
+            "stream": "NTF_IMPEDANCE", "settable": False, "co_stream": "NTF_EEG",
+        },
     },
 }

@@ -18,17 +18,17 @@
   NTF_ECG                "NTF_ECG"           EcgChannelCount       5s（EEG/ECG 同写）
   NTF_EMG                "NTF_EMG"           EmgChannelCount       5s（能力门控）
   NTF_GEST               "NTF_GEST"          EmgChannelCount       5s（DeviceInfo 无独立 GEST 标称值）
-  NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount      25s（1Hz，需较长采集）
-  NTF_ACC                "NTF_GFORCE_ACC"    AccChannelCount       5s
-  NTF_GYRO               "NTF_GFORCE_GYRO"   GyroChannelCount      5s
-  NTF_EULER_DATA         "NTF_GFORCE_EULER"  EulerChannelCount     5s
-  NTF_QUATERNION         "NTF_GFORCE_QUAT"   QuatChannelCount      5s
+  NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount      5s（与 NTF_EEG 同起才有数据）
+  NTF_IMU                "NTF_IMU"           ImuChannelCount       5s（acc3+gyro3+euler3+quat4 聚合）
 
 说明：
   - 每个模态是否测试由 getDeviceInfo() 的 ChannelCount 运行时判定（>0 才起流）。
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
-  - IMPEDANCE 采样率 1Hz，packageSampleCount=20 约需 20s 凑满一批，故采集 25s。
-  - NTF_IMU 聚合流（ImuChannelCount）不在本条覆盖（见 DATA-FUNC-010）。
+  - IMPEDANCE / IMU 均需与 NTF_EEG 同时起流才有数据（脑电设备以 EEG 为主线，
+    阻抗与 6 轴 IMU 为伴随流），故二者均与 EEG 同起。
+  - ACC/GYRO/EULER/QUAT 不以独立 NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION 流投递，
+    而是以 NTF_IMU 聚合流投递（ImuChannelCount=13：acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12），
+    故本条只测 NTF_IMU，通道布局细节见 DATA-FUNC-010。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -57,26 +57,21 @@ def _dt_name(dt):
         return str(dt)
 
 
-# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数)
+# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 伴随起流 key)
+# 伴随起流 key 非 None 时与该模态同时 setParam ON 一起起流（IMPEDANCE 需与 EEG 同起才有数据）
 MODALITIES = [
     ("EEG", DataType.NTF_EEG, "NTF_EEG", "EegChannelCount",
-     "请保持电极接触良好，EEG 静息即有信号，无需额外动作", 5),
+     "请保持电极接触良好，EEG 静息即有信号，无需额外动作", 5, None),
     ("ECG", DataType.NTF_ECG, "NTF_ECG", "EcgChannelCount",
-     "请保持电极接触良好，让 ECG 产生信号", 5),
+     "请保持电极接触良好，让 ECG 产生信号", 5, None),
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
-     "请保持电极接触良好，让 EMG 产生信号", 5),
+     "请保持电极接触良好，让 EMG 产生信号", 5, None),
     ("GEST", DataType.NTF_GEST, "NTF_GEST", "EmgChannelCount",
-     "若设备支持，请触发相应手势识别", 5),
+     "若设备支持，请触发相应手势识别", 5, None),
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
-     "请保持电极接触良好，让阻抗测量产生信号", 25),
-    ("ACC", DataType.NTF_ACC, "NTF_GFORCE_ACC", "AccChannelCount",
-     "请轻微移动设备，让加速度计产生变化", 5),
-    ("GYRO", DataType.NTF_GYRO, "NTF_GFORCE_GYRO", "GyroChannelCount",
-     "请轻微旋转设备，让陀螺仪产生变化", 5),
-    ("EULER", DataType.NTF_EULER_DATA, "NTF_GFORCE_EULER", "EulerChannelCount",
-     "请轻微旋转设备，让欧拉角产生变化", 5),
-    ("QUAT", DataType.NTF_QUATERNION, "NTF_GFORCE_QUAT", "QuatChannelCount",
-     "请轻微旋转设备，让四元数产生变化", 5),
+     "请保持电极接触良好，让阻抗测量产生信号", 5, "NTF_EEG"),
+    ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
+     "请晃动/旋转设备，让 6 轴 IMU（acc+gyro+euler+quat）产生变化", 5, "NTF_EEG"),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名
@@ -339,13 +334,18 @@ def main():
 
     # 先全部 OFF，清理初始状态（尤其 GEST/EMG 互斥）
     print("\n[准备] 关闭所有目标模态，清理初始状态 ...", flush=True)
-    for disp, dt, param, field, hint, _sec in MODALITIES:
+    for disp, dt, param, field, hint, _sec, co_key in MODALITIES:
         try:
             sensor.setParam(param, "OFF")
         except Exception as e:
             print(f"  [清理] {param} OFF 抛异常 {type(e).__name__}: {e}", flush=True)
+        if co_key:
+            try:
+                sensor.setParam(co_key, "OFF")
+            except Exception as e:
+                print(f"  [清理] {co_key} OFF 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    for disp, dt, param, field, hint, collect_sec in MODALITIES:
+    for disp, dt, param, field, hint, collect_sec, co_key in MODALITIES:
         ch_count = getattr(info, field, 0)
         print(f"\n{'=' * 40}", flush=True)
         print(f"[模态] {disp}  DataType={_dt_name(dt)}  ChannelCount({field})={ch_count}", flush=True)
@@ -358,7 +358,7 @@ def main():
             print(f"[SKIP] {disp} ChannelCount==0，设备不支持，跳过", flush=True)
             continue
 
-        # setParam ON
+        # setParam ON（伴随起流 key 需一起 ON，如 IMPEDANCE 与 NTF_EEG 同起）
         try:
             p_ret = sensor.setParam(param, "ON")
         except Exception as e:
@@ -366,6 +366,13 @@ def main():
         print(f"[setParam] SensorProfile.setParam({param!r}, 'ON') -> {p_ret!r}", flush=True)
         record(results, f"{disp} setParam 返回 OK", p_ret == "OK",
                f"setParam({param!r}, 'ON') 返回 'OK'", f"返回 {p_ret!r}")
+
+        if co_key:
+            try:
+                co_ret = sensor.setParam(co_key, "ON")
+            except Exception as e:
+                co_ret = f"抛异常 {type(e).__name__}: {e}"
+            print(f"[setParam] 伴随 {co_key!r} ON -> {co_ret!r}", flush=True)
 
         # 起流
         try:
@@ -380,7 +387,7 @@ def main():
         collector.clear()
         time.sleep(collect_sec)
 
-        # 停流 + 关模态
+        # 停流 + 关模态（伴随 key 也一并 OFF）
         try:
             sensor.stopDataNotification()
         except Exception:
@@ -389,6 +396,11 @@ def main():
             sensor.setParam(param, "OFF")
         except Exception:
             pass
+        if co_key:
+            try:
+                sensor.setParam(co_key, "OFF")
+            except Exception:
+                pass
 
         # 统计该 DataType 数据
         entry = collector.by_type.get(dt, {'batches': 0, 'samples': 0})

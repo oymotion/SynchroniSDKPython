@@ -1,20 +1,27 @@
 # -*- coding: utf-8 -*-
-"""PARAM-FUNC-001：每个 NTF_* 键 ON/OFF 返回 OK，getParam 一致。
+"""PARAM-FUNC-011：getParam IMU/PPG/EMG_SAMPLE_RATE 与 EMG_RESOLUTION（能力门控）。
 
-对应用例：04_参数.md -> PARAM-FUNC-001
+对应用例：04_参数.md -> PARAM-FUNC-011
 可自动化：auto（设备上电、在范围内为运行前置）
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 对每个 NTF_* 键逐一 setParam("ON")/setParam("OFF")，校验返回 "OK"
-     且 getParam("NTF") 中对应键状态一致（ON 后为 ON，OFF 后为 OFF）
-  3) NTF_ECG / NTF_EMG / NTF_GEST / NTF_MAG_ANGLE / NTF_SPO2 / NTF_PPG /
-     NTF_PPG_RAW 按 DeviceInfo 对应 ChannelCount 判定：>0 测，==0 记录"不适用，跳过"
+  2) getDeviceInfo() 读取能力，按 ChannelCount 判定各参数是否支持
+  3) 逐项 getParam 查询（能力门控，不做硬编码）：
+       IMU_SAMPLE_RATE / IMU_SAMPLE_RATE_LIST          -> 门控 ImuChannelCount
+       PPG_SAMPLE_RATE / PPG_SAMPLE_RATE_LIST          -> 门控 PpgChannelCount
+       EMG_SAMPLE_RATE / EMG_SAMPLE_RATE_LIST          -> 门控 EmgChannelCount
+       EMG_RESOLUTION   / EMG_RESOLUTION_LIST          -> 门控 EmgChannelCount
 
-说明：
-  NTF_PPG_RAW 是 NTF_PPG 的别名（README），getParam("NTF") 核对时统一查
-  NTF_PPG 键。getParam("NTF") 返回 pipe 分隔串 "KEY|VALUE|KEY|VALUE|..."。
-  OB6000C 为脑电设备，EmgChannelCount==0（无 EMG/GEST），MAG_ANGLE/SPO2/PPG 亦为 0，跳过。
+判定口径（运行时能力，非硬编码）：
+  - 对应 ChannelCount > 0（支持）：getParam 应返回非空、非 Error 的真实值。
+  - 对应 ChannelCount == 0（不支持）：getParam 应返回以 Error 开头、空串，或抛异常；
+    三者均为「不崩溃、正确表达不支持」，不判为缺陷。
+
+OB6000C 预期（仅作说明，脚本不硬编码）：
+  - ImuChannelCount=13 -> IMU 支持，IMU_SAMPLE_RATE 应为 "50"
+  - PpgChannelCount=0  -> PPG 不支持，应返回 Error/空
+  - EmgChannelCount=0  -> EMG / EMG_RESOLUTION 不支持，应返回 Error/空
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -22,7 +29,6 @@
 """
 
 import os
-import re
 import sys
 import time
 
@@ -36,41 +42,53 @@ import common
 from common import record, scan_and_match
 
 
-def _parse_pipe(s):
-    """把 "KEY|VALUE|KEY|VALUE|..." 解析成 {KEY: VALUE}。"""
-    out = {}
-    if not s:
-        return out
-    parts = s.split("|")
-    for i in range(0, len(parts) - 1, 2):
-        out[parts[i]] = parts[i + 1]
-    return out
-
-
-# 每个待测 NTF 键：need_field 为 None 表示无条件测；否则按 DeviceInfo 字段判定
-# get_key 为 getParam("NTF") 中用于核对的键（NTF_PPG_RAW 是 NTF_PPG 的别名）。
-KEY_SPECS = [
-    {"key": "NTF_EEG", "need_field": None, "get_key": "NTF_EEG"},
-    {"key": "NTF_ECG", "need_field": "EcgChannelCount", "get_key": "NTF_ECG"},
-    {"key": "NTF_EMG", "need_field": "EmgChannelCount", "get_key": "NTF_EMG"},
-    {"key": "NTF_GEST", "need_field": "EmgChannelCount", "get_key": "NTF_GEST"},
-    {"key": "NTF_IMU", "need_field": None, "get_key": "NTF_IMU"},
-    {"key": "NTF_GFORCE_ACC", "need_field": None, "get_key": "NTF_GFORCE_ACC"},
-    {"key": "NTF_GFORCE_GYRO", "need_field": None, "get_key": "NTF_GFORCE_GYRO"},
-    {"key": "NTF_GFORCE_EULER", "need_field": None, "get_key": "NTF_GFORCE_EULER"},
-    {"key": "NTF_GFORCE_QUAT", "need_field": None, "get_key": "NTF_GFORCE_QUAT"},
-    {"key": "NTF_MAG_ANGLE", "need_field": "MagAngleChannelCount", "get_key": "NTF_MAG_ANGLE"},
-    {"key": "NTF_SPO2", "need_field": "Spo2ChannelCount", "get_key": "NTF_SPO2"},
-    {"key": "NTF_PPG", "need_field": "PpgChannelCount", "get_key": "NTF_PPG"},
-    {"key": "NTF_PPG_RAW", "need_field": "PpgChannelCount", "get_key": "NTF_PPG"},
+# (当前值 key, 列表 key, DeviceInfo 门控字段)
+QUERY_SPECS = [
+    ("IMU_SAMPLE_RATE", "IMU_SAMPLE_RATE_LIST", "ImuChannelCount"),
+    ("PPG_SAMPLE_RATE", "PPG_SAMPLE_RATE_LIST", "PpgChannelCount"),
+    ("EMG_SAMPLE_RATE", "EMG_SAMPLE_RATE_LIST", "EmgChannelCount"),
+    ("EMG_RESOLUTION", "EMG_RESOLUTION_LIST", "EmgChannelCount"),
 ]
+
+
+def _get(sensor, key):
+    try:
+        return sensor.getParam(key)
+    except Exception as e:
+        return f"抛异常 {type(e).__name__}: {e}"
+
+
+def _check(sensor, info, key, field, results):
+    """按 DeviceInfo 门控字段查询并记录一个 key 的结果。"""
+    try:
+        cnt = int(getattr(info, field, 0) or 0)
+    except Exception as e:
+        cnt = 0
+        print(f"[能力] 读取 {field} 抛异常 {type(e).__name__}: {e}，按 0 处理", flush=True)
+    supported = cnt > 0
+
+    r = _get(sensor, key)
+    print(f"[getParam] {key} -> {r!r}（{field}={cnt}，{'支持' if supported else '不支持'}）", flush=True)
+
+    is_str = isinstance(r, str)
+    is_error_or_empty = (not is_str) or (r == "") or r.startswith("Error") or ("异常" in r)
+    is_real = is_str and r.strip() != "" and (not r.startswith("Error")) and ("异常" not in r)
+
+    if supported:
+        ok = is_real
+        expect = f"{field}>0（支持）时 getParam({key}) 返回非空、非 Error 的真实值"
+    else:
+        ok = is_error_or_empty
+        expect = f"{field}==0（不支持）时 getParam({key}) 返回 Error 开头/空串/抛异常（不崩溃）"
+
+    record(results, f"getParam({key}) 能力门控", ok, expect, f"返回 {r!r}")
 
 
 def main():
     ctrl = SensorControllerInstance
 
     print("=" * 60, flush=True)
-    print("PARAM-FUNC-001 每个 NTF_* 键 ON/OFF 返回 OK，getParam 一致", flush=True)
+    print("PARAM-FUNC-011 getParam IMU/PPG/EMG_SAMPLE_RATE 与 EMG_RESOLUTION（能力门控）", flush=True)
     print("=" * 60, flush=True)
     print(f"sdk version = {ctrl.getVersion()}", flush=True)
     print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
@@ -158,10 +176,10 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # getDeviceInfo 用于能力判定
+    # getDeviceInfo 用于能力门控
     info = sensor.getDeviceInfo()
     if info is None:
-        print("[FAIL] getDeviceInfo() 返回 None，无法进行能力判定", flush=True)
+        print("[FAIL] getDeviceInfo() 返回 None，无法进行能力门控", flush=True)
         record(results, "getDeviceInfo() 返回 DeviceInfo", False,
                "getDeviceInfo() 返回 DeviceInfo（非 None）", "返回 None")
         try:
@@ -174,64 +192,13 @@ def main():
     record(results, "getDeviceInfo() 返回 DeviceInfo", True,
            "getDeviceInfo() 返回 DeviceInfo（非 None）", f"返回 {type(info).__name__}")
 
-    # 逐个键测试
-    print("\n[参数] 逐个 NTF_* 键 ON/OFF 并核对 getParam('NTF') ...", flush=True)
-    for spec in KEY_SPECS:
-        key = spec["key"]
-        get_key = spec["get_key"]
-        need_field = spec["need_field"]
+    # 逐项 getParam（能力门控）
+    print("\n[参数] 逐项 getParam 查询（能力门控）...", flush=True)
+    for value_key, list_key, field in QUERY_SPECS:
+        _check(sensor, info, value_key, field, results)
+        _check(sensor, info, list_key, field, results)
 
-        # 能力判定
-        if need_field is not None:
-            try:
-                cnt = int(getattr(info, need_field, 0) or 0)
-            except Exception as e:
-                cnt = 0
-                print(f"[能力] 读取 {need_field} 抛异常 {type(e).__name__}: {e}，按 0 处理", flush=True)
-            if cnt <= 0:
-                print(f"[SKIP] {key}：{need_field}==0，设备不支持，跳过", flush=True)
-                record(results, f"{key} ON/OFF 返回 OK 且 getParam 一致", None,
-                       f"{need_field}>0 时校验", f"{need_field}==0，不适用")
-                continue
-
-        # setParam ON
-        try:
-            r_on = sensor.setParam(key, "ON")
-        except Exception as e:
-            r_on = f"抛异常 {type(e).__name__}: {e}"
-        # getParam 核对 ON
-        ntf_on = _parse_pipe(sensor.getParam("NTF") if callable(sensor.getParam) else "")
-        v_on = ntf_on.get(get_key, "<缺失>")
-
-        # setParam OFF
-        try:
-            r_off = sensor.setParam(key, "OFF")
-        except Exception as e:
-            r_off = f"抛异常 {type(e).__name__}: {e}"
-        # getParam 核对 OFF
-        ntf_off = _parse_pipe(sensor.getParam("NTF") if callable(sensor.getParam) else "")
-        v_off = ntf_off.get(get_key, "<缺失>")
-
-        ok_on = (r_on == "OK")
-        ok_off = (r_off == "OK")
-        match_on = (v_on == "ON")
-        match_off = (v_off == "OFF")
-
-        all_ok = ok_on and ok_off and match_on and match_off
-        actual = (f"ON->{r_on!r}/getParam={v_on}，OFF->{r_off!r}/getParam={v_off}")
-        print(f"[参数] {key}: ON->{r_on!r}(getParam {get_key}={v_on})，"
-              f"OFF->{r_off!r}(getParam {get_key}={v_off})", flush=True)
-        record(results, f"{key} ON/OFF 返回 OK 且 getParam 一致", all_ok,
-               f"setParam ON/OFF 均返回 'OK'，getParam('NTF') 中 {get_key} 为 ON/OFF",
-               actual)
-
-    # 清理：关闭可能被打开的流
-    for spec in KEY_SPECS:
-        try:
-            sensor.setParam(spec["key"], "OFF")
-        except Exception:
-            pass
-
+    # 清理
     try:
         sensor.disconnect()
     except Exception as e:
