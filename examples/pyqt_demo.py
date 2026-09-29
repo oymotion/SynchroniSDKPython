@@ -46,7 +46,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.13"
+DEMO_VERSION               = "0.1.17"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -81,7 +81,6 @@ DATA_TYPE_NAMES = {
     DataType.NTF_GYRO:       "Gyroscope (GYRO)",
     DataType.NTF_EULER_DATA: "Euler Angle (Euler)",
     DataType.NTF_QUATERNION: "Quaternion (Quaternion)",
-    DataType.NTF_MAG_ANGLE_DATA: "Mag Angle (MAG_ANGLE)",
 }
 
 # Live Filter band options: (display name, (low, high)), None = off
@@ -262,8 +261,10 @@ class DeviceDataState:
         # Status line entries: (label, channels, nominal rate, data type)
         self.status_parts = None
         self.rate_lock = threading.Lock()
-        self.rate_counts: dict = {}
-        self.rate_window_start = time.time()
+        self.rate_total_counts: dict = {}
+        self.rate_stream_start: dict = {}
+        self.rate_stream_tags: dict = {}
+        self.rate_last_data_time = time.time()
         self.actual_rates: dict = {}
         self.nominal_rates: dict = {}
         self.nominal_channels: dict = {}
@@ -289,30 +290,31 @@ class DeviceDataState:
         now = time.time()
         with self.rate_lock:
             if n > 0:
-                self.rate_counts[dt] = self.rate_counts.get(dt, 0) + n
+                tag = data.startTimeStamp
+                if self.rate_stream_tags.get(dt) != tag:
+                    self.rate_stream_tags[dt] = tag
+                    self.rate_total_counts[dt] = 0
+                    self.rate_stream_start[dt] = now
+                self.rate_total_counts[dt] += n
+                self.rate_last_data_time = now
             if data.sampleRate and data.sampleRate > 0:
                 self.nominal_rates[dt] = data.sampleRate
             ch = data.channelCount
             if ch > 0:
                 self.nominal_channels[dt] = ch
-            self._settle_actual_rates(now)
 
-    def _settle_actual_rates(self, now: float):
-        # Call under rate_lock
-        elapsed = now - self.rate_window_start
-        if elapsed < 1.0:
-            return
-        self.actual_rates = {dt: c / elapsed for dt, c in self.rate_counts.items()}
-        self.rate_counts = {}
-        self.rate_window_start = now
-
-    def expire_actual_rates(self):
-        now = time.time()
+    def refresh_actual_rates(self, now: float):
         with self.rate_lock:
-            if now - self.rate_window_start > 2.0:
+            if now - self.rate_last_data_time > 2.0:
                 self.actual_rates = {}
-                self.rate_counts = {}
-                self.rate_window_start = now
+                self.rate_total_counts = {}
+                self.rate_stream_start = {}
+                self.rate_stream_tags = {}
+                return
+            self.actual_rates = {
+                dt: total / max(now - self.rate_stream_start.get(dt, now), 1e-3)
+                for dt, total in self.rate_total_counts.items()
+            }
 
     def build_status_text(self) -> str:
         name = self.sensor.BLEDevice.Name if self.sensor is not None else ""
@@ -853,6 +855,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._scan_missed_rounds: dict = {}     # Address -> consecutive absent scan rounds
         self.current_sensor: SensorProfile = None
         self.device_states: dict = {}               # Address -> DeviceDataState
+        self._connecting_addrs: set = set()         # Address with an in-flight connect
         self.sensor_controller = SensorController()
 
         self.active_data_type = DataType.NTF_ACC
@@ -1546,8 +1549,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if d is None:
                 return
             new_text = f"RSSI: {rssi}, Name: {d.Name}, Address: {d.Address}"
-            if text.startswith("[Connected] "):
-                new_text = "[Connected] " + new_text
+            for p in self._DEVICE_ITEM_PREFIXES:
+                if text.startswith(p):
+                    new_text = p + new_text
+                    break
             item.setText(new_text)
             item.setData(QtCore.Qt.UserRole, rssi)
             break
@@ -1579,25 +1584,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _update_button_states(self):
         addr = self._selected_address()
         connected = addr is not None and addr in self.device_states
-        self.btn_connect.setEnabled(addr is not None and not connected)
+        connecting = addr is not None and addr in self._connecting_addrs
+        self.btn_connect.setEnabled(addr is not None and not connected and not connecting)
         self.btn_disconnect.setEnabled(connected)
         streaming = any(state.sensor.isDataTransfering
                         for state in self.device_states.values())
         self.btn_multi_sync.setText("Multi Stop" if streaming else "Multi Start")
         self.btn_multi_sync.setEnabled(len(self.device_states) >= 1)
 
-    def _update_device_item_text(self, addr: str, connected: bool):
+    _DEVICE_ITEM_PREFIXES = ("[Connected] ", "[Connecting...] ", "[Disconnecting...] ")
+
+    def _set_device_item_prefix(self, addr: str, prefix: str):
         for i in range(self.device_list.count()):
             item = self.device_list.item(i)
             text = item.text()
             if f"Address: {addr}" not in text:
                 continue
-            if text.startswith("[Connected] "):
-                text = text[len("[Connected] "):]
-            if connected:
-                text = "[Connected] " + text
-            item.setText(text)
+            for p in self._DEVICE_ITEM_PREFIXES:
+                if text.startswith(p):
+                    text = text[len(p):]
+                    break
+            item.setText(prefix + text)
             break
+
+    def _update_device_item_text(self, addr: str, connected: bool):
+        self._set_device_item_prefix(addr, "[Connected] " if connected else "")
 
     def _run_ui_call(self, fn):
         fn()
@@ -1611,7 +1622,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     def _connect_selected_device(self):
         device = self._selected_list_device()
-        self._connect_device(device, self.chk_auto_reconnect.isChecked())
+        # connect/init/startDataNotification 都是阻塞式 SDK 调用，放到
+        # sensor.submit 的后台线程执行，避免长时间冻结 UI 线程
+        submit(self._connect_device, device,
+               self.chk_auto_reconnect.isChecked(), True)
 
     def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None):
         if device is None:
@@ -1624,12 +1638,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         self._app_log(f"User: connect {device.Name} ({addr})")
         if self.sensor_controller.isScanning:
-            self._stop_scan()
+            # 本函数可能运行在 sensor.submit 的工作线程：SDK 停止扫描直接调用，
+            # 按钮状态更新交回 UI 线程
+            self._app_log("Stop scan")
+            self.sensor_controller.stopScan()
+            self._ui(lambda: (self.btn_scan.setEnabled(True),
+                              self.btn_stop_scan.setEnabled(False)))
         sensor = self.sensor_controller.requireSensor(device)
         if sensor is None:
             self._app_log(f"App: failed to create SensorProfile for {addr}", "E")
             self._ui(lambda: self.status_label.setText("Failed to create SensorProfile"))
             return
+
+        self._connecting_addrs.add(addr)
+        self._ui(lambda a=addr: self._set_device_item_prefix(a, "[Connecting...] "))
+        self._ui(self._update_button_states)
 
         sensor.on_sensor_notify_data = self._on_data
         sensor.on_state_change = self._on_state_changed
@@ -1646,6 +1669,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             ok = sensor.connect()
             if not ok:
                 self._app_log(f"App: failed to connect to {device.Name} ({addr})", "E", sensor)
+                self._connecting_addrs.discard(addr)
+                self._ui(lambda a=addr: self._set_device_item_prefix(a, ""))
                 self._ui(lambda: self.status_label.setText(f"Failed to connect to {device.Name}"))
                 self._ui(self._update_button_states)
                 return
@@ -1657,6 +1682,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                              POWER_REFRESH_PERIOD_IN_MS)
             if not ok:
                 self._app_log(f"App: failed to initialize {device.Name} ({addr})", "E", sensor)
+                self._connecting_addrs.discard(addr)
+                self._ui(lambda a=addr: self._set_device_item_prefix(a, ""))
                 self._ui(lambda: self.status_label.setText(f"Failed to initialize {device.Name}"))
                 self._ui(self._update_button_states)
                 return
@@ -1695,6 +1722,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             ok = sensor.startDataNotification()
             if not ok:
                 self._app_log(f"App: failed to start data stream on {addr}", "E", sensor)
+                self._connecting_addrs.discard(addr)
+                self._ui(lambda a=addr: self._set_device_item_prefix(a, ""))
                 self._ui(lambda: self.status_label.setText("Failed to start data stream"))
                 self._ui(self._update_button_states)
                 return
@@ -1729,6 +1758,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if current and not str(current).startswith("Error"):
                 self._last_data_log_paths[addr] = current
 
+        self._connecting_addrs.discard(addr)
         self._ui(lambda: self._refresh_control_states(sensor))
 
         if self.current_sensor == sensor:
@@ -1740,7 +1770,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor = self.current_sensor
         if sensor is None:
             return
-        self._app_log(f"User: disconnect {sensor.BLEDevice.Address}", sensor=sensor)
+        addr = sensor.BLEDevice.Address
+        self._app_log(f"User: disconnect {addr}", sensor=sensor)
+        self._set_device_item_prefix(addr, "[Disconnecting...] ")
         self.btn_disconnect.setEnabled(False)
         self.btn_connect.setEnabled(False)
         for cb in self._ntf_checkboxes.values():
@@ -1748,7 +1780,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         for cb in self._filter_checkboxes.values():
             cb.setEnabled(False)
         self.status_label.setText("Disconnecting...")
-        sensor.disconnect()
+        # disconnect() 是阻塞式 SDK 调用，放后台线程执行；完成后由
+        # _on_device_disconnected 清掉列表前缀并恢复按钮状态
+        submit(sensor.disconnect)
 
     # -- Bin replay ----------------------------------------------------------------
 
@@ -3052,7 +3086,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         now = time.time()
         if now - self._rate_last_refresh >= 1.0:
             self._rate_last_refresh = now
-            state.expire_actual_rates()
+            state.refresh_actual_rates(now)
             self.status_label.setText(state.build_status_text())
             self.rate_label.setText(state.build_rate_text())
 
