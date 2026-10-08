@@ -46,7 +46,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.17"
+DEMO_VERSION               = "0.1.20"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -1378,9 +1378,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if result.startswith("OK"):
             first_line, _, extra = result.partition("\n")
             count = first_line.split(":", 1)[1].strip() if ":" in first_line else None
-            msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
             if count is not None:
-                msg += f"\nUsable dongle count: {count}"
+                usable = count.split("/", 1)[0].strip()
+                total = count.split("/", 1)[1].strip() if "/" in count else None
+                if usable == "0":
+                    msg = "USB BLE dongle(s) plugged in but none is usable by the SDK (driver not bound to WinUSB)."
+                    if total:
+                        msg += f"\nTotal dongles plugged: {total}"
+                    msg += "\nDisconnect all devices and run Check Dongle again to set up the driver."
+                else:
+                    msg = "USB BLE dongle is ready (driver installed and usable by the SDK)."
+                    msg += f"\nUsable dongle count: {usable}"
+                    if total:
+                        msg += f"\nTotal dongles plugged: {total}"
+            else:
+                msg = "No usable USB BLE dongle detected; the SDK is using the OS Bluetooth stack."
             if extra:
                 msg += f"\n{extra.strip()}"
             QtWidgets.QMessageBox.information(self, "Check Setup Dongle", msg)
