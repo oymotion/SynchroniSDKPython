@@ -6,10 +6,6 @@ OYMotion sdk for Python
 
 OYMotion SDK is the software development kit for developers to access OYMotion products.
 
-## Contributing
-
-See the [contributing guide](CONTRIBUTING.md) to learn how to contribute to the repository and the development workflow.
-
 ## License
 
 MIT
@@ -19,7 +15,7 @@ MIT
 ## Installation
 
 ```sh
-pip install sensor-sdk>=1.3.0
+pip install "sensor-sdk>=1.3.0"
 ```
 
 Requires Python >= 3.10. One wheel per platform covers every supported
@@ -69,7 +65,7 @@ version = SensorControllerInstance.getVersion()
 
 ### 2. Start scan
 
-Use `def startScan(period_in_ms: int) -> bool` to start scan
+Use `def startScan(periodInMs: int) -> bool` to start scan
 
 ```python
 success = SensorControllerInstance.startScan(6000)
@@ -77,17 +73,17 @@ success = SensorControllerInstance.startScan(6000)
 
 returns true if start scan success, periodInMS means onDeviceCallback will be called every periodInMS
 
-Use `def scan(period_in_ms: int) -> list[BLEDevice]` to scan once time
+Use `def scan(period: int) -> list[BLEDevice]` to scan once time
 
 ```python
 bleDevices = SensorControllerInstance.scan(6000)
 ```
 
-The asynchronous variant is `asyncScan(period_in_ms: int) -> list[BLEDevice]`.
+The asynchronous variant is `asyncScan(period: int) -> list[BLEDevice]`.
 
 ### 3. Stop scan
 
-Use `def stopScan() -> None` to stop scan
+Use `def stopScan() -> bool` to stop scan, returns True on success
 
 ```python
 SensorControllerInstance.stopScan()
@@ -268,7 +264,7 @@ bleDevice = sensorProfile.BLEDevice
 
 ### 15.1 Auto reconnect and resume data stream
 
-Use `property autoReconnect: bool` (default `True`) to control automatic recovery. While `True` and the device is streaming, an abnormal disconnect is followed by automatic reconnect → `init()` with the previous init arguments → re-applying the `setParam` parameters from the previous streaming session → `startDataNotification()`. Recovery retries on the next successful reconnect if a step fails. Explicit user calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel the pending resume, and setting `autoReconnect = False` disables the behavior entirely.
+Use `property autoReconnect: bool` (SDK default `True`) to control automatic recovery. The property is a locally cached mirror of the setting: reading it before you ever assign it reports `False` even though the SDK layer defaults to enabled, so set it explicitly once if the read value matters. While `True` and the device is streaming, an abnormal disconnect is followed by automatic reconnect → `init()` with the previous init arguments → re-applying the `setParam` parameters from the previous streaming session → `startDataNotification()`. Recovery retries on the next successful reconnect if a step fails. Explicit user calls (`connect()`, `disconnect()`, `stopDataNotification()`) cancel the pending resume, and setting `autoReconnect = False` disables the behavior entirely.
 
 ```python
 sensorProfile.autoReconnect = True   # default; set False to opt out
@@ -284,14 +280,17 @@ def on_reconnect(sensor, restore: bool, answer) -> None:
     #                   the SDK skips the default recovery
     # answer(False)  -> fall back to the default flow (connect -> init -> replay
     #                   setParam values -> startDataNotification)
-    sensor.init(32, 60000)
-    sensor.startDataNotification()
+    # sync calls (init / setParam / startDataNotification) raise RuntimeError
+    # when invoked on an SDK callback thread; offload them with submit(),
+    # which runs the callable on the binding's worker thread
+    submit(sensor.init, 32, 60000)
+    submit(sensor.startDataNotification)
     answer(True)   # answer exactly once, from any thread, at any later time
 
 sensorProfile.onAutoReconnect = on_reconnect
 ```
 
-The answer is **asynchronous**: the callback receives an `answer(handled)` callable and must invoke it exactly once — it may return immediately and answer later from any thread (e.g. after UI-thread work). If no answer arrives in time the SDK falls back to the default recovery. Callback exceptions are logged and treated as `answer(False)`. Blocking calls (`init()`, `setParam()`, `startDataNotification()`) are allowed inside the callback. The legacy two-argument form `callback(sensor, restore) -> bool` is still accepted; its return value is treated as the answer.
+The answer is **asynchronous**: the callback receives an `answer(handled)` callable and must invoke it exactly once — it may return immediately and answer later from any thread (e.g. after UI-thread work). If no answer arrives in time the SDK falls back to the default recovery. Callback exceptions are logged and treated as `answer(False)`. Blocking sync calls (`init()`, `setParam()`, `startDataNotification()`) must not be invoked directly inside the callback — they raise `RuntimeError` on an SDK callback thread; offload them with `submit(...)` (available from the same `from sensor import *`) as in the example above. The legacy two-argument form `callback(sensor, restore) -> bool` is still accepted; its return value is treated as the answer.
 
 ### 16. Get device info of SensorProfile
 
@@ -305,7 +304,7 @@ Please call after device in 'Ready' state and `init()` has succeeded, returns No
 # deviceInfo is a DeviceInfo object with attributes:
 #   DeviceName, ModelName, HardwareVersion, FirmwareVersion, MTUSize
 #   plus a ChannelCount / SampleRate attribute pair for each modality:
-#   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat
+#   Ppg, Spo2, Impe, Emg, Eeg, Ecg, Acc, Gyro, Brth, MagAngle, Euler, Quat, Gest
 #   plus EmgMaxSampleRate / EegMaxSampleRate / EcgMaxSampleRate: the maximum
 #   sample rate reported by the device capability query (0 = not reported).
 #   plus ImuChannelCount / ImuSampleRate: the aggregated NTF_IMU stream
@@ -335,7 +334,7 @@ Please call after device in 'Ready' state, return True if init succeed.
 success = sensorProfile.init(5, 60*1000)
 ```
 
-packageSampleCount:   set sample counts of SensorData.channelSamples per batch in onDataCallback()
+packageSampleCount:   set the sample count per channel of each SensorData batch delivered to onDataCallback() (getSampleCount())
 powerRefreshInterval: callback period for onPowerChanged()
 
 ### 18. Check if init data transfer succeed
@@ -360,7 +359,7 @@ success = sensorProfile.startDataNotification()
 
 #### 19.2 Synchronized start on multiple devices
 
-Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 30.0, maxDelayDispersionMs: int = 5, maxAttempts: int = 3) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting.
+Use `def multiStartDataNotification(sensors: list[SensorProfile], timeout: float = 0.0, maxDelayDispersionMs: int = 5, maxAttempts: int = 3) -> dict[str, bool]` on `SensorController` (async variant: `asyncMultiStartDataNotification`) to start data notification on several devices at once. Every sensor must be `Ready` and `hasInited`; the result maps each device MAC to its success flag — devices that fail validation do not prevent the others from starting. The default `timeout = 0.0` auto-picks the timing from the devices' models: (30 s, 5 ms dispersion, 3 attempts) when every device reports the same model, (60 s, no dispersion check, 5 attempts) for mixed or unknown models.
 
 On the dongle backend the start commands of all devices are released at virtually the same time; on the native backend the starts are simply issued concurrently.
 
@@ -376,7 +375,7 @@ results = SensorControllerInstance.multiStartDataNotification([sensor1, sensor2]
 
 #### 19.3 Synchronized stop on multiple devices
 
-`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 10.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the dongle backend the stop commands of all devices go out at virtually the same time; on the native backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
+`def multiStopDataNotification(sensors: list[SensorProfile], timeout: float = 0.0) -> dict[str, bool]` (async variant: `asyncMultiStopDataNotification`) is the stop counterpart of `multiStartDataNotification`: on the dongle backend the stop commands of all devices go out at virtually the same time; on the native backend the stops are issued concurrently. Devices that are not streaming count as successful (nothing to stop); invalid devices do not affect the others.
 
 ```python
 results = SensorControllerInstance.multiStopDataNotification([sensor1, sensor2])
@@ -385,7 +384,7 @@ results = SensorControllerInstance.multiStopDataNotification([sensor1, sensor2])
 Data type list：
 
 ```python
-class DataType(Enum):
+class DataType(IntEnum):
     NTF_ACC = 0x1            # acceleration, unit is g
     NTF_GYRO = 0x2           # gyroscope, unit is degree/s
     NTF_EULER_DATA = 0x4     # euler angle, unit is degree
@@ -408,9 +407,9 @@ class DataType(Enum):
 Process data in onDataCallback. Each invocation delivers a list of SensorData batches parsed together; loop over the list to process each batch. SensorData's public interface:
 
 - metadata: `getDeviceMac()` / `getDataType()` / `getSampleRate()` / `getChannelCount()` / `getSampleCount()` / `getChannelMask()` / `getLostPackageCount()` / `getStartTimeStamp()` / `getStartTimeSec()` (wall-clock stream-start anchor in Unix seconds, 0.0 when unknown) / `getDelay()` / `isDataValid()`
-- whole batch: read-only `channelSamples` / `startSampleIndex` properties, `clone()` for a deep copy
+- whole batch: read-only `startSampleIndex` property, `isChannelEnabled(ch)` to test a channel against the channel mask, `as_numpy()` for a NumPy structured-array view of the whole batch shaped `(channelCount, sampleCount)` (requires numpy), `clone()` for a deep copy
 - single-point accessors (`ci` = channel index, `si` = sample index): `getChannelSample(ci, si)` returns the `Sample`; `getData(ci, si)` / `getRawData(ci, si)` / `getImpedance(ci, si)` / `getSaturation(ci, si)` / `getSampleIndex(ci, si)` / `getTimeStampInMs(ci, si)` / `getAbsTimeStampInSec(ci, si)` (absolute timestamp in seconds, 0.0 when the stream-start anchor is unknown) / `isLost(ci, si)` return the individual field
-- Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `absTimeStampInSec`, `isLost`) are read-only properties.
+- Sample fields (`data`, `rawData`, `impedance`, `saturation`, `sampleIndex`, `channelIndex`, `absTimeStampInSec`, `isLost`) are plain attributes.
 
 ```python
 def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
@@ -420,16 +419,23 @@ def on_data_callback(sensor: SensorProfile, data_list: List[SensorData]):
         elif data.getDataType() == DataType.NTF_ECG:
             pass
 
-        # process data as you wish
-        for oneChannelSamples in data.channelSamples:
-            for sample in oneChannelSamples:
-                if sample.isLost:
+        # process data as you wish: one isDataValid() probe per batch (a stale
+        # batch reads as zeros); masked-out channels stay zeroed
+        if not data.isDataValid():
+            continue
+        for ch in range(data.getChannelCount()):
+            if not data.isChannelEnabled(ch):
+                continue
+            for si in range(data.getSampleCount()):
+                if data.isLost(ch, si):
                     # do some logic
                     pass
                 else:
-                    # draw with sample.data & sample.channelIndex
-                    # print(f"{sample.channelIndex} | {sample.sampleIndex} | {sample.data} | {sample.impedance}")
+                    # draw with data.getData(ch, si)
+                    # print(f"{ch} | {data.getSampleIndex(ch, si)} | {data.getData(ch, si)} | {data.getImpedance(ch, si)}")
                     pass
+        # or take the whole batch as a NumPy array: samples = data.as_numpy()
+        # (structured array, shape (channelCount, sampleCount))
 
 sensorProfile.onDataCallback = on_data_callback
 ```
@@ -458,7 +464,8 @@ Use `def getBatteryLevel() -> int` to get battery level. Please call after devic
 batteryPower = sensorProfile.getBatteryLevel()
 
 # batteryPower is battery level returned, value ranges from 0 to 100, 0 means out of battery, while 100 means full;
-# -1 means no valid reading is available yet (onPowerChanged never reports -1).
+# returns the cached reading when one exists, otherwise queries the device; -1 means the query failed
+# (onPowerChanged never reports -1).
 ```
 
 Please check console.py in examples directory
@@ -467,8 +474,8 @@ Please check console.py in examples directory
 
 All methods starting with `async` are async methods; they have the same params and return result as the sync methods:
 
-- `SensorController`: `asyncScan`, `asyncMultiStartDataNotification`, `asyncMultiStopDataNotification`, `asyncGetParam`, `asyncSetParam`
-- `SensorProfile`: `asyncConnect`, `asyncDisconnect`, `asyncInit`, `asyncStartDataNotification`, `asyncStopDataNotification`, `asyncSetParam`, `asyncGetParam`, `asyncGetBatteryLevel`
+- `SensorController`: `asyncScan`, `asyncMultiStartDataNotification`, `asyncMultiStopDataNotification`, `asyncParseBinToCsv`, `asyncCheckSetupDongle`, `asyncGetParam`, `asyncSetParam`
+- `SensorProfile`: `asyncConnect`, `asyncDisconnect`, `asyncInit`, `asyncStartDataNotification`, `asyncStopDataNotification`, `asyncSetParam`, `asyncGetParam`, `asyncGetBatteryLevel`, `asyncFetchDeviceInfo`
 
 Please check async_console.py in examples directory
 
@@ -495,13 +502,8 @@ result = sensorProfile.setParam("NTF_MAG_ANGLE", "ON")
 result = sensorProfile.setParam("NTF_PPG", "ON")
 result = sensorProfile.setParam("NTF_PPG_RAW", "ON")   # alias of NTF_PPG
 result = sensorProfile.setParam("NTF_SPO2", "ON")
-result = sensorProfile.setParam("NTF_GFORCE_EULER", "ON")
-result = sensorProfile.setParam("NTF_GFORCE_QUAT", "ON")
-result = sensorProfile.setParam("NTF_GFORCE_ACC", "ON")
-result = sensorProfile.setParam("NTF_GFORCE_GYRO", "ON")
 # set data stream to ON or OFF, result is "OK" if succeed
-# NTF_IMU is the master switch of the four NTF_GFORCE_* streams: toggling it
-# updates all four, and toggling any of the four updates the aggregated NTF_IMU state.
+# NTF_IMU switches the four split ACC/GYRO/EULER/QUAT streams together.
 # Note: on legacy EMG devices, NTF_GEST and NTF_EMG are mutually exclusive.
 
 # Firmware filter toggles
@@ -686,7 +688,7 @@ SensorControllerInstance.replayBinFile("path/to/session.bin", sensor, realtime=T
 - `sensor`: an existing SensorProfile to replay through. When `None`, the controller creates (or reuses) a profile from the bin config record; in that mode the profile is returned only after replay finishes, so register callbacks on an existing profile to receive data.
 - `realtime`: `True` replays at the recorded pace; `False` replays as fast as possible.
 - `timeout`: seconds to wait for completion. `None` auto-estimates from the bin duration. On timeout the call returns while replay may still be running in the background.
-- Replay is rejected while the target sensor is streaming live data.
+- Replay is rejected while the target sensor's live device is linked (Connected/Ready) or already replaying.
 
 ### Pause / resume / stop replay
 
@@ -699,7 +701,7 @@ result = SensorControllerInstance.stopBinReplay(sensor)    # abort; the blocking
 
 ### Replay multiple bin files in sync (shared clock)
 
-Use `def multiReplayBinFile(self, file_paths: List[str], sensors: Optional[List[Optional[SensorProfile]]] = None, realtime: bool = True, timeout: Optional[float] = None) -> List[Optional[SensorProfile]]` to replay several bin captures on one shared clock aligned by record timestamps, so concurrently recorded captures keep their original relative offsets (a device that started streaming later delivers its first data correspondingly later).
+Use `def multiReplayBinFile(self, file_paths: List[str], sensors: List[SensorProfile], realtime: bool = True, timeout: Optional[float] = None) -> List[Optional[SensorProfile]]` to replay several bin captures on one shared clock aligned by record timestamps, so concurrently recorded captures keep their original relative offsets (a device that started streaming later delivers its first data correspondingly later).
 
 ```python
 sensors = [SensorControllerInstance.requireSensor(device1),
@@ -709,11 +711,11 @@ for s in sensors:
 results = SensorControllerInstance.multiReplayBinFile(
     ["path/to/dev1.bin", "path/to/dev2.bin"], sensors=sensors, realtime=True)
 # results is aligned with file_paths; a None entry marks a member that failed
-# (file missing / no config record / duplicate MAC / device streaming or
-#  already replaying).
+# (file missing / no config record / duplicate MAC / device linked
+#  (Connected/Ready) or already replaying).
 ```
 
-- `sensors`: optional list aligned with `file_paths`; a `None` entry (or omitting the parameter) makes the controller create (or reuse) the profile from that bin's config record — register callbacks on existing profiles to receive data.
+- `sensors`: required list aligned with `file_paths` (the target MAC is read from each profile); a length mismatch or a `None` entry raises `ValueError` — register callbacks on these profiles to receive data.
 - `realtime`: `True` replays on the aligned group clock; `False` replays every member as fast as possible (no alignment).
 - `timeout`: seconds to wait for the whole group. `None` auto-estimates from the group's duration.
 - `pauseBinReplay` / `resumeBinReplay` on any member pauses/resumes the **whole group** (alignment is preserved); `stopBinReplay` still works per device.
