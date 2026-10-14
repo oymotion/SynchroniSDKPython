@@ -19,6 +19,7 @@ class _Qt:
     AlignCenter = None        # 下方 _install_qt5_shim 中填充
     Checked = None
     DirectConnection = None
+    UserRole = None
     WindowMinimized = None
 
 
@@ -42,6 +43,7 @@ def _install_qt5_shim():
     _Qt.AlignCenter = qt6core.Qt.AlignmentFlag.AlignCenter
     _Qt.Checked = qt6core.Qt.CheckState.Checked
     _Qt.DirectConnection = qt6core.Qt.ConnectionType.DirectConnection
+    _Qt.UserRole = qt6core.Qt.ItemDataRole.UserRole
     _Qt.WindowMinimized = qt6core.Qt.WindowState.WindowMinimized
 
     qtcore = _ForwardingModule("PyQt5.QtCore", qt6core)

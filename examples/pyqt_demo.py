@@ -46,7 +46,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.20"
+DEMO_VERSION               = "0.1.30"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -57,17 +57,6 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 matplotlib.rcParams['lines.antialiased'] = False
 matplotlib.rcParams['agg.path.chunksize'] = 10000
 
-
-def _device_info_from_bin(d: Optional[dict]) -> DeviceInfo:
-    info = DeviceInfo()
-    for key, value in (d or {}).items():
-        if not hasattr(info, key):
-            continue
-        try:
-            setattr(info, key, value)
-        except (TypeError, ValueError):
-            pass
-    return info
 
 CHANNEL_LABELS = {
     DataType.NTF_ACC:        ["ACC-X", "ACC-Y", "ACC-Z"],
@@ -184,6 +173,7 @@ class DeviceDataState:
         self.lost_counts: dict = {}
         self.ntf_states: dict = {}     # key -> (enabled, checked)
         self.filter_states: dict = {}  # key -> (enabled, checked)
+        self.impedance_enabled = False
         self.sample_rate_state: tuple = ([], 0)  # (options, current rate) EEG/ECG
         self.emg_sample_rate_state: tuple = ([], 0)  # (options, current rate) EMG
         self.imu_sample_rate_state: tuple = ([], 0)  # (options, current rate) IMU
@@ -269,7 +259,7 @@ class DeviceDataState:
         self.nominal_rates: dict = {}
         self.nominal_channels: dict = {}
         self.stream_delay_ms = 0
-        self.stream_start_time_sec = 0.0
+        self.stream_start_times: dict = {}
 
     def note_data_received(self, data: SensorData):
         if data.channelCount <= 0 or data.sampleCount <= 0:
@@ -279,7 +269,7 @@ class DeviceDataState:
             self.stream_delay_ms = delay
         start_sec = data.startTimeSec
         if start_sec > 0:
-            self.stream_start_time_sec = start_sec
+            self.stream_start_times[data.dataType] = start_sec
         if data.dataType == DataType.NTF_IMU:
             for sub in split_imu_aggregate(data):
                 self.note_data_received(sub)
@@ -341,11 +331,12 @@ class DeviceDataState:
                 continue
             nominal = nominal_rates.get(dt) or sr
             nominal_txt = f"{nominal:g}" if nominal else "--"
-            entries.append(f"{label} {actual:.1f} / {nominal_txt}Hz")
-        if self.stream_start_time_sec > 0:
-            sec = self.stream_start_time_sec
-            start_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(sec)) + f".{int(sec * 1000) % 1000:03d}"
-            entries.append(f"start {start_txt}")
+            entry = f"{label} {actual:.1f} / {nominal_txt}Hz"
+            sec = self.stream_start_times.get(dt, 0)
+            if sec > 0:
+                start_txt = time.strftime("%H:%M:%S", time.localtime(sec)) + f".{int(sec * 1000) % 1000:03d}"
+                entry += f" (start {start_txt})"
+            entries.append(entry)
         if self.stream_delay_ms:
             entries.append(f"delay {self.stream_delay_ms}ms")
         return "Actual: " + " | ".join(entries) if entries else ""
@@ -1187,12 +1178,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._dongle_debug_checkbox.setChecked(True)
         self._dongle_debug_checkbox.stateChanged.connect(self._on_dongle_debug_toggled)
         debug_log_layout.addWidget(self._dongle_debug_checkbox)
+        self._translate_imu_checkbox = QtWidgets.QCheckBox("Translate IMU (split ACC/GYRO/EULER/QUAT)")
+        self._translate_imu_checkbox.setChecked(True)
+        self._translate_imu_checkbox.stateChanged.connect(self._on_translate_imu_toggled)
+        debug_log_layout.addWidget(self._translate_imu_checkbox)
         debug_log_group.setLayout(debug_log_layout)
 
         ntf_group = QtWidgets.QGroupBox("Data Notification")
         ntf_layout = QtWidgets.QHBoxLayout()
         self._ntf_checkboxes = {
             "NTF_EEG":  QtWidgets.QCheckBox("EEG"),
+            "NTF_IMPEDANCE": QtWidgets.QCheckBox("IMPE"),
             "NTF_EMG":  QtWidgets.QCheckBox("EMG"),
             "NTF_GEST": QtWidgets.QCheckBox("GESTURE"),
             "NTF_PPG":  QtWidgets.QCheckBox("PPG"),
@@ -1378,10 +1374,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if result.startswith("OK"):
             first_line, _, extra = result.partition("\n")
             count = first_line.split(":", 1)[1].strip() if ":" in first_line else None
+            any_connected = any(state.sensor.isReady
+                                for state in self.device_states.values())
             if count is not None:
                 usable = count.split("/", 1)[0].strip()
                 total = count.split("/", 1)[1].strip() if "/" in count else None
-                if usable == "0":
+                if usable == "0" and any_connected:
+                    msg = "Every USB BLE dongle is in use by the current connections."
+                    if total:
+                        msg += f"\nTotal dongles plugged: {total}"
+                    msg += "\nDisconnect a device to free one."
+                elif usable == "0":
                     msg = "USB BLE dongle(s) plugged in but none is usable by the SDK (driver not bound to WinUSB)."
                     if total:
                         msg += f"\nTotal dongles plugged: {total}"
@@ -1421,14 +1424,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             transferring = [s for s in sensors if s.isDataTransfering]
             if transferring:
                 stop_results = self.sensor_controller.multiStopDataNotification(transferring)
-                stop_failed = [mac for mac, ok in stop_results.items() if not ok]
+                stop_failed = [f"{r['mac']}: {r['error']}" for r in stop_results if not r["ok"]]
                 if stop_failed:
                     self._app_log(f"App: multi stop failed on: {', '.join(stop_failed)}", "W")
                     self.status_label.setText(
                         f"Multi stop failed on: {', '.join(stop_failed)}")
                     return
             results = self._start_with_model_params(sensors)
-            failed = [mac for mac, ok in results.items() if not ok]
+            failed = [f"{r['mac']}: {r['error']}" for r in results if not r["ok"]]
             if failed:
                 self._app_log(f"App: multi start failed on: {', '.join(failed)}", "W")
                 self.status_label.setText(
@@ -1452,7 +1455,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_multi_sync.setEnabled(False)
         try:
             results = self.sensor_controller.multiStopDataNotification(sensors)
-            failed = [mac for mac, ok in results.items() if not ok]
+            failed = [f"{r['mac']}: {r['error']}" for r in results if not r["ok"]]
             if failed:
                 self._app_log(f"App: multi stop failed on: {', '.join(failed)}", "W")
                 self.status_label.setText(
@@ -1482,7 +1485,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._auto_reconnect_enabled = bool(checked)
         self._app_log(f"User: auto reconnect {'ON' if checked else 'OFF'}")
         for state in self.device_states.values():
-            state.sensor.setAutoReconnect(checked)
+            state.sensor.autoReconnect = checked
 
     def _on_use_clone_data_toggled(self, checked: bool):
         self._use_clone_data = checked
@@ -1672,7 +1675,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.on_power_changed = self._on_power_changed
         sensor.on_device_info_update = self._on_device_info_update
         sensor.on_auto_reconnect = self._on_auto_reconnect
-        sensor.setAutoReconnect(auto_reconnect)
+        sensor.autoReconnect = auto_reconnect
 
         self._ui(lambda: self.status_label.setText(f"Connecting: {device.Name} ..."))
         self._ui(lambda: self.btn_connect.setEnabled(False))
@@ -1815,6 +1818,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._debug_log_checkbox.setEnabled(not replaying)
         self._data_debug_log_checkbox.setEnabled(not replaying)
         self._dongle_debug_checkbox.setEnabled(not replaying)
+        self._translate_imu_checkbox.setEnabled(not replaying)
 
     def _replay_bin_file(self):
         if self.device_states:
@@ -1864,13 +1868,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.status_label.setText("Invalid bin file: no config record found")
             return
 
-        mac = config.get("device_mac")
+        mac = config.Mac
         if not mac:
             self.status_label.setText("Invalid bin file: config missing device_mac")
             return
-        name = config.get("device_name") or ""
+        name = config.DeviceName or ""
 
-        info = _device_info_from_bin(config.get("device_info"))
+        info = config.DeviceInfo
 
         # The replay profile is created by the controller
         try:
@@ -1886,15 +1890,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.on_error_callback = self._on_error
         sensor.on_device_info_update = self._on_device_info_update
         sensor.on_data_transfer_state_change = self._on_replay_transfer_state
-        sensor.setAutoReconnect(self.chk_auto_reconnect.isChecked())
+        sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
         self._replay_sensor = sensor
 
         state = DeviceDataState(sensor)
         state.info = info
         state.init_buffers(info, EEG_AXIS_COUNT)
-        duration = config.get("replay_duration", 0.0)
-        version = config.get("version", "?")
+        duration = config.DurationSec
+        version = config.ConfigVersion
         state.status_text = (
             f"Replaying: {Path(path).name} (config v{version}, duration {duration:.1f}s, realtime) ...")
         self.device_states[mac] = state
@@ -1934,7 +1938,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             except Exception as e:
                 self._app_log(f"App: invalid bin file ({e}): {path}", "W")
                 continue
-            mac = config.get("device_mac") if config is not None else None
+            mac = config.Mac if config is not None else None
             if config is None:
                 self._app_log(f"App: invalid bin file (no config record): {path}", "W")
                 continue
@@ -1969,16 +1973,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             sensor.on_error_callback = self._on_error
             sensor.on_device_info_update = self._on_device_info_update
             sensor.on_data_transfer_state_change = self._on_replay_transfer_state
-            sensor.setAutoReconnect(self.chk_auto_reconnect.isChecked())
+            sensor.autoReconnect = self.chk_auto_reconnect.isChecked()
 
-            info = _device_info_from_bin(config.get("device_info"))
+            info = config.DeviceInfo
             state = DeviceDataState(sensor)
             state.info = info
             state.init_buffers(info, EEG_AXIS_COUNT)
-            duration = config.get("replay_duration", 0.0)
+            duration = config.DurationSec
             state.status_text = (
                 f"Replaying: {Path(path).name} (duration {duration:.1f}s, multi-sync) ...")
-            self.device_states[config.get("device_mac")] = state
+            self.device_states[config.Mac] = state
             if info.EegSampleRate > 0:
                 state.sample_rate_state = ([], int(info.EegSampleRate))
             if info.EmgSampleRate > 0:
@@ -3205,7 +3209,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
                         if dt == DataType.NTF_EEG:
                             imp_list = bio_impedance_copy.get(dt, [])
-                            if ch_idx < len(imp_list) and isinstance(imp_list[ch_idx], (int, float)):
+                            if state.impedance_enabled and ch_idx < len(imp_list) and isinstance(imp_list[ch_idx], (int, float)):
                                 current_impedance = imp_list[ch_idx] / 1000.0
                                 if current_impedance <= 500:
                                     imp_color = "green"
@@ -3339,7 +3343,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         mx += 1
                     ax.set_ylim(mn - margin, mx + margin)
 
-                    if eeg_ch < len(eeg_impedance_copy) and isinstance(eeg_impedance_copy[eeg_ch], (int, float)):
+                    if state.impedance_enabled and eeg_ch < len(eeg_impedance_copy) and isinstance(eeg_impedance_copy[eeg_ch], (int, float)):
                         current_impedance = eeg_impedance_copy[eeg_ch] / 1000.0
                         if current_impedance <= 500:
                             color = "green"
@@ -3353,6 +3357,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
+                    else:
+                        ax.set_ylabel(
+                            f"EEG-{eeg_ch + 1}",
+                            fontsize=8, color=line.get_color(), rotation=0,
+                            va='center', ha='left', labelpad=10
+                        )
 
                 # Per-row FFT snapshots for this EEG page and the ECG/Angle rows
                 now_fft = time.time()
@@ -3427,7 +3437,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     mx += 1
                 ax.set_ylim(mn - margin, mx + margin)
 
-                if ecg_impedance_copy and len(ecg_impedance_copy) > 0 and isinstance(ecg_impedance_copy[0], (int, float)):
+                if state.impedance_enabled and ecg_impedance_copy and len(ecg_impedance_copy) > 0 and isinstance(ecg_impedance_copy[0], (int, float)):
                     current_impedance = ecg_impedance_copy[0] / 1000.0
                     if current_impedance <= 500:
                         color = "green"
@@ -3441,6 +3451,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         va='center', ha='left', labelpad=10
                     )
                     ax.yaxis.set_label_position("right")
+                else:
+                    ax.set_ylabel(
+                        "ECG",
+                        fontsize=8, color=self.ecg_line.get_color(), rotation=0,
+                        va='center', ha='left', labelpad=10
+                    )
 
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_ECG] = current_last_idx
@@ -3479,7 +3495,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         mx += 1
                     ax.set_ylim(mn - margin, mx + margin)
 
-                    if ch < len(emg_impedance_copy) and isinstance(emg_impedance_copy[ch], (int, float)):
+                    if state.impedance_enabled and ch < len(emg_impedance_copy) and isinstance(emg_impedance_copy[ch], (int, float)):
                         current_impedance = emg_impedance_copy[ch] / 1000.0
                         if current_impedance <= 500:
                             color = "green"
@@ -3493,6 +3509,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
+                    else:
+                        ax.set_ylabel(
+                            f"EMG-{ch + 1}",
+                            fontsize=8, color=line.get_color(), rotation=0,
+                            va='center', ha='left', labelpad=10
+                        )
 
                 # Per-channel FFT snapshots for the displayed EMG channels and the Angle row
                 now_fft = time.time()
@@ -3823,6 +3845,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._dongle_debug_enabled = enabled
         self._apply_dongle_debug()
 
+    def _on_translate_imu_toggled(self, state: int):
+        value = "True" if state == QtCore.Qt.Checked else "False"
+        self._app_log(f"User: translate IMU {value}")
+        result = self.sensor_controller.setParam("TRANSLATE_IMU", value)
+        self._app_log(f"App: setParam(TRANSLATE_IMU, {value}) -> {result}")
+
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
         self._app_log(f"User: data debug log {'ON' if enabled else 'OFF'}")
@@ -3866,10 +3894,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             "NTF_BRTH":  info.BrthChannelCount if info else 0,
             "NTF_IMPEDANCE": info.ImpeChannelCount if info else 0,
             "NTF_MAG_ANGLE": info.MagAngleChannelCount if info else 0,
-            "NTF_GFORCE_EULER": info.EulerChannelCount if info else 0,
-            "NTF_GFORCE_QUAT": info.QuatChannelCount if info else 0,
-            "NTF_GFORCE_ACC": info.AccChannelCount if info else 0,
-            "NTF_GFORCE_GYRO": info.GyroChannelCount if info else 0,
         }
 
         ntf_states = {}
@@ -3980,6 +4004,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if state is not None:
             state.ntf_states = ntf_states
             state.filter_states = filter_states
+            imp_supported, imp_on = ntf_states.get("NTF_IMPEDANCE", (False, False))
+            state.impedance_enabled = imp_supported and imp_on
             state.sample_rate_state = sample_rate_state
             state.emg_sample_rate_state = emg_sample_rate_state
             state.imu_sample_rate_state = imu_sample_rate_state
