@@ -17,14 +17,15 @@
   NTF_EMG                "NTF_EMG"           EmgChannelCount=8     5s
   NTF_GEST               "NTF_GEST"          EmgChannelCount=8     5s（DeviceInfo 无独立 GEST 标称值）
   NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount=8    25s（1Hz，需较长采集）
-  NTF_IMU                "NTF_IMU"           ImuChannelCount=6     5s（acc3+gyro3 聚合）
+  NTF_ACC/GYRO           "NTF_IMU"           ImuChannelCount=6     5s（6 轴 IMU 二路独立投递）
 
 说明：
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
   - IMPEDANCE 采样率 1Hz，packageSampleCount=20 约需 20s 凑满一批，故采集 25s。
-  - gForceUltra 为「新 EMG 设备」，ACC/GYRO 不以独立 NTF_ACC/NTF_GYRO 流投递，
-    而是以 NTF_IMU 聚合流投递（ImuChannelCount=6：acc 0-2 / gyro 3-5）；无欧拉/四元数。
-    因此本条只测 NTF_IMU，通道布局细节见 DATA-FUNC-010。
+  - gForceUltra 的 6 轴 IMU 不以 NTF_IMU(0x13) 聚合流投递，而是拆成 2 路独立 DataType
+    （NTF_ACC/NTF_GYRO）分别投递，无欧拉/四元数；开关仍用 "NTF_IMU" 打开，
+    DeviceInfo 仍以 ImuChannelCount=6 描述 6 轴 IMU 能力。故本条按这 2 路独立类型聚合断言，
+    通道布局细节见 DATA-FUNC-010。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -53,16 +54,18 @@ def _dt_name(dt):
         return str(dt)
 
 
-# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数)
+# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 断言类型列表)
+# 断言类型列表非 None 时按这些类型聚合统计样本（gForceUltra 的 6 轴 IMU 二路独立投递时用）
 MODALITIES = [
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
-     "请用力握拳或绷紧被测部位肌肉，让 EMG 产生信号", 5),
+     "请用力握拳或绷紧被测部位肌肉，让 EMG 产生信号", 5, None),
     ("GEST", DataType.NTF_GEST, "NTF_GEST", "EmgChannelCount",
-     "请做手势动作（握拳/张手/翻转手腕等），触发手势识别", 5),
+     "请做手势动作（握拳/张手/翻转手腕等），触发手势识别", 5, None),
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
-     "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25),
+     "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25, None),
     ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
-     "请晃动/旋转腕带，让 6 轴 IMU（acc+gyro）产生变化", 5),
+     "请晃动/旋转腕带，让 6 轴 IMU（acc+gyro）产生变化", 5,
+     [DataType.NTF_ACC, DataType.NTF_GYRO]),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名
@@ -238,13 +241,13 @@ def main():
 
     # 先全部 OFF，清理初始状态（尤其 GEST/EMG 互斥）
     print("\n[准备] 关闭所有目标模态，清理初始状态 ...", flush=True)
-    for disp, dt, param, field, hint, _sec in MODALITIES:
+    for disp, dt, param, field, hint, _sec, _assert_types in MODALITIES:
         try:
             sensor.setParam(param, "OFF")
         except Exception as e:
             print(f"  [清理] {param} OFF 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    for disp, dt, param, field, hint, collect_sec in MODALITIES:
+    for disp, dt, param, field, hint, collect_sec, assert_types in MODALITIES:
         ch_count = getattr(info, field, 0)
         print(f"\n{'=' * 40}", flush=True)
         print(f"[模态] {disp}  DataType={_dt_name(dt)}  ChannelCount({field})={ch_count}", flush=True)
@@ -289,14 +292,22 @@ def main():
         except Exception:
             pass
 
-        # 统计该 DataType 数据
-        entry = collector.by_type.get(dt, {'batches': 0, 'samples': 0})
-        got = entry['samples'] > 0
+        # 统计该模态数据：assert_types 非 None 时按多类型聚合（gForceUltra 的 6 轴 IMU 二路独立投递）
+        if assert_types:
+            samples = sum(collector.by_type.get(t, {}).get('samples', 0) for t in assert_types)
+            batches = sum(collector.by_type.get(t, {}).get('batches', 0) for t in assert_types)
+            type_label = "+".join(_dt_name(t) for t in assert_types)
+        else:
+            entry = collector.by_type.get(dt, {'batches': 0, 'samples': 0})
+            samples = entry['samples']
+            batches = entry['batches']
+            type_label = _dt_name(dt)
+        got = samples > 0
         got_types = {_dt_name(k): v['batches'] for k, v in collector.by_type.items()}
-        print(f"[采集] {disp} 收到批次={entry['batches']} 样本数={entry['samples']} 全部类型={got_types}", flush=True)
+        print(f"[采集] {disp} 收到批次={batches} 样本数={samples} 全部类型={got_types}", flush=True)
         record(results, f"{disp} 流能收到数据且类型匹配", got,
-               f"收到 {_dt_name(dt)} 数据（样本数>0）",
-               f"该类型样本数={entry['samples']} 批次={entry['batches']}")
+               f"收到 {type_label} 数据（样本数>0）",
+               f"该类型样本数={samples} 批次={batches}")
 
     # 清理
     try:

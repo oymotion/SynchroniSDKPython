@@ -1,0 +1,449 @@
+# -*- coding: utf-8 -*-
+"""gForceMax E2E 冒烟：一次走通「连接 → 起流 → 查看 bin」主链路，尽量非交互。
+
+覆盖的主要接口（均为 auto，无需人工动作，前提是设备已上电且在范围内）：
+  1) 环境：SensorController.isEnable / getVersion / getBLEBackendName
+  2) 扫描：scan_and_match（带重试）
+  3) 连接：requireSensor / connect → Ready / init / hasInited
+  4) 设备信息：getDeviceInfo（型号、固件、通道数等）
+  5) 参数：setParam / getParam（FILTER 聚合查询）
+  6) 数据流：startDataNotification / onDataCallback 计数 / isDataTransfering / stopDataNotification
+  7) 电量：getBatteryLevel
+  8) bin：DEBUG_BLE_DATA_PATH=True 导出 → getParam 取路径 → 文件存在
+  9) bin 解析：getBinFileInfo（元数据）→ parseBinToCsv（转 CSV）
+ 10) bin 回放：replayBinFile(realtime=False) 快速回放并确认有数据回调
+
+说明：
+  不设 input() 人工暂停；若设备未上电/未匹配到，直接判 FAIL 并给出原因。
+  与 gForceUltra 的 e2e_smoke.py 同构，仅改设备名；四元数能力由 spec + probe 覆盖。
+"""
+
+import os
+import re
+import subprocess
+import sys
+import time
+import threading
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTOMATION_DIR = os.path.dirname(BASE_DIR)
+sys.path.insert(0, AUTOMATION_DIR)
+
+from sensor import *
+import config
+import common
+from common import record, _identity_of, scan_and_match, resolve_target_identity
+
+COLLECT_SECONDS = 60  # 起流采集时长（秒），录制足够长便于后续 debug bin
+
+def _list_bins(log_dir):
+    if not log_dir or not os.path.isdir(log_dir):
+        return {}
+    out = {}
+    try:
+        for fn in os.listdir(log_dir):
+            if fn.lower().endswith(".bin"):
+                out[fn] = os.path.join(log_dir, fn)
+    except OSError:
+        pass
+    return out
+
+def _get_ble_path(sensor):
+    try:
+        return sensor.getParam("DEBUG_BLE_DATA_PATH")
+    except Exception as e:
+        return f"抛异常 {type(e).__name__}: {e}"
+
+class DataCounter:
+    def __init__(self):
+        self.batches = 0
+        self.samples = 0
+        self.dt_samples = {}      # DataType 名字 -> 累计样本数（n_ch * n_smp）
+        self.first_emg_ts = None  # 首次收到 EMG 数据的时刻（time.monotonic 秒）
+        self.lock = threading.Lock()
+
+    def __call__(self, sensor, data):
+        items = data if isinstance(data, list) else [data]
+        with self.lock:
+            self.batches += len(items)
+            for it in items:
+                # SDK 1.3.0 移除了 channelSamples，改用 getSampleCount/getChannelCount
+                try:
+                    n_ch = it.getChannelCount()
+                    n_smp = it.getSampleCount()
+                    if n_ch > 0 and n_smp > 0:
+                        n = n_ch * n_smp
+                        self.samples += n
+                        dt = it.getDataType()
+                        name = dt.name if isinstance(dt, DataType) else "?"
+                        self.dt_samples[name] = self.dt_samples.get(name, 0) + n
+                        if name == "NTF_EMG" and self.first_emg_ts is None:
+                            self.first_emg_ts = time.monotonic()
+                except Exception:
+                    continue
+
+    def snapshot(self):
+        with self.lock:
+            return self.batches, self.samples
+
+    def emg_samples(self):
+        with self.lock:
+            return self.dt_samples.get("NTF_EMG", 0)
+
+    def emg_first_ts(self):
+        with self.lock:
+            return self.first_emg_ts
+
+    def stats(self):
+        with self.lock:
+            return dict(self.dt_samples)
+
+def main():
+    sanity_log = common.setup_sanity_log(BASE_DIR)
+    if sanity_log:
+        print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
+
+    ctrl = SensorControllerInstance
+    target_identity = resolve_target_identity()
+
+    print("=" * 60, flush=True)
+    print("gForceMax E2E 冒烟：连接 → 起流 → 查看 bin", flush=True)
+    print("=" * 60, flush=True)
+    print(f"sdk version = {ctrl.getVersion()}", flush=True)
+    print(f"ble backend = {ctrl.getBLEBackendName()}", flush=True)
+
+    print("\n[前置条件]", flush=True)
+    print("  - 主机(电脑)：蓝牙已开启", flush=True)
+    print("  - 待测设备：gForceMax 上电、在范围内", flush=True)
+
+    results = []
+
+    # 受控日志目录（固定路径，便于事后定位 bin/log）
+    log_dir = os.path.join(BASE_DIR, "e2e_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"\n[日志目录] 使用固定目录 {log_dir}", flush=True)
+    try:
+        ctrl.setLogPath(True, log_dir)
+        log_ok = True
+        log_txt = f"setLogPath(True, {log_dir}) 无异常"
+    except Exception as e:
+        log_ok = False
+        log_txt = f"setLogPath 抛异常 {type(e).__name__}: {e}"
+    print(f"[日志目录] {log_txt}", flush=True)
+    record(results, "SensorController.setLogPath 设置日志目录", log_ok,
+           "setLogPath(True, dir) 无异常", log_txt)
+
+    try:
+        ctrl.setDebugEnabled(True)
+        debug_ok = True
+    except Exception as e:
+        debug_ok = False
+        print(f"[日志] SensorController.setDebugEnabled(True) 抛异常 {type(e).__name__}: {e}", flush=True)
+    record(results, "SensorController.setDebugEnabled(True) 开启 debug 日志", debug_ok,
+           "setDebugEnabled(True) 无异常", "无异常" if debug_ok else "抛异常")
+
+    bins_before = _list_bins(log_dir)
+
+    # 环境检查
+    is_enable = ctrl.isEnable
+    print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
+    if is_enable is not True:
+        print("[跳过] 前置条件不满足：电脑蓝牙未开启。请先开启【电脑】蓝牙后重跑。", flush=True)
+        record(results, "SensorController.isEnable 为 True", False, "isEnable == True", f"isEnable == {is_enable}")
+        ctrl.terminate()
+        return
+    record(results, "SensorController.isEnable 为 True", True, "isEnable == True", f"isEnable == {is_enable}")
+
+    # 扫描匹配
+    if target_identity:
+        print(f"\n[扫描] 目标 identity: {', '.join(target_identity)}（命令行指定）", flush=True)
+    else:
+        print(f"\n[扫描] 目标 identity: {', '.join(common.TARGET_IDENTITIES)}（config 默认）", flush=True)
+    target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS, target_identity=target_identity)
+    if target is None:
+        print("[FAIL] 未匹配到目标设备", flush=True)
+        record(results, "scan 匹配到目标设备", False, "scan 返回含目标设备", "未匹配到目标")
+        print("\n结论: FAIL", flush=True)
+        ctrl.terminate()
+        return
+
+    name = getattr(target, 'Name', '?')
+    addr = getattr(target, 'Address', '?')
+    print(f"[扫描] 目标设备: {name} {addr}", flush=True)
+    record(results, "scan 匹配到目标设备", True, "scan 返回含目标设备", f"匹配到 {name} {addr}")
+
+    # requireSensor
+    sensor = ctrl.requireSensor(target)
+    if sensor is None:
+        print("[FAIL] SensorController.requireSensor 返回 None", flush=True)
+        record(results, "requireSensor 返回 SensorProfile", False, "返回 SensorProfile", "返回 None")
+        print("\n结论: FAIL", flush=True)
+        ctrl.terminate()
+        return
+    record(results, "SensorController.requireSensor 返回 SensorProfile", isinstance(sensor, SensorProfile),
+           "返回 SensorProfile", f"返回 {type(sensor).__name__}")
+
+    # connect
+    print("\n[连接] SensorProfile.connect() ...", flush=True)
+    try:
+        ok = sensor.connect()
+        connect_txt = f"返回 {ok}"
+    except Exception as e:
+        ok = None
+        connect_txt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[连接] SensorProfile.connect() -> {connect_txt}  state={sensor.deviceState}", flush=True)
+    record(results, "SensorProfile.connect 返回 True", ok is True,
+           "connect() 返回 True", f"connect() -> {connect_txt}")
+
+    # 到达 Ready
+    t0 = time.time()
+    while time.time() - t0 < 15 and sensor.deviceState != DeviceStateEx.Ready:
+        time.sleep(0.2)
+    ready = (sensor.deviceState == DeviceStateEx.Ready)
+    record(results, "connect 后到达 Ready", ready, "deviceState==Ready", f"state={sensor.deviceState}")
+    if not ready:
+        print("[FAIL] 未到达 Ready，无法继续", flush=True)
+        try:
+            sensor.disconnect()
+        except Exception:
+            pass
+        print("\n结论: FAIL", flush=True)
+        ctrl.terminate()
+        return
+
+    # init
+    print(f"\n[init] SensorProfile.init({config.PACKAGE_SAMPLE_COUNT}, {config.POWER_REFRESH_INTERVAL_MS}) ...", flush=True)
+    try:
+        iret = sensor.init(config.PACKAGE_SAMPLE_COUNT, config.POWER_REFRESH_INTERVAL_MS)
+        init_txt = f"返回 {iret}"
+    except Exception as e:
+        iret = None
+        init_txt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[init] SensorProfile.init() -> {init_txt}  hasInited={sensor.hasInited}", flush=True)
+    record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
+    record(results, "SensorProfile.hasInited 为 True", sensor.hasInited is True,
+           "hasInited == True", f"hasInited == {sensor.hasInited}")
+
+    # 设备信息
+    try:
+        info = sensor.getDeviceInfo()
+    except Exception as e:
+        info = None
+        print(f"[设备信息] getDeviceInfo 抛异常 {type(e).__name__}: {e}", flush=True)
+    info_ok = info is not None
+    if info_ok:
+        model = getattr(info, 'ModelName', '?')
+        fw = getattr(info, 'FirmwareVersion', '?')
+        emg_ch = getattr(info, 'EmgChannelCount', '?')
+        emg_rate = getattr(info, 'EmgSampleRate', '?')
+        acc_ch = getattr(info, 'AccChannelCount', '?')
+        quat_ch = getattr(info, 'QuatChannelCount', '?')
+        print(f"[设备信息] Model={model} FW={fw} EmgChannel={emg_ch} EmgRate={emg_rate} "
+              f"AccChannel={acc_ch} QuatChannel={quat_ch}", flush=True)
+    record(results, "SensorProfile.getDeviceInfo 返回 DeviceInfo", info_ok,
+           "init 后 getDeviceInfo() 返回非 None", f"返回 {type(info).__name__}" if info_ok else "返回 None")
+
+    # 实际当前采样率以 getParam 为准（DeviceInfo.EmSampleRate 是设备信息里的声明值，可能≠实际起流采样率）
+    try:
+        emg_rate_actual = sensor.getParam("EMG_SAMPLE_RATE")
+    except Exception as e:
+        emg_rate_actual = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[采样率] getParam('EMG_SAMPLE_RATE') -> {emg_rate_actual!r}", flush=True)
+
+    # 参数（FILTER 聚合查询）
+    try:
+        flt = sensor.getParam("FILTER")
+    except Exception as e:
+        flt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[参数] SensorProfile.getParam('FILTER') -> {flt!r}", flush=True)
+    flt_ok = isinstance(flt, str) and (not flt.startswith("Error"))
+    record(results, "SensorProfile.getParam('FILTER') 返回有效值", flt_ok,
+           "getParam('FILTER') 不以 'Error' 开头", f"getParam -> {flt!r}")
+
+    # 开启 bin 导出
+    print("\n[bin] SensorProfile.setParam('DEBUG_BLE_DATA_PATH', 'True') ...", flush=True)
+    try:
+        bret = sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
+    except Exception as e:
+        bret = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[bin] setParam('DEBUG_BLE_DATA_PATH', 'True') -> {bret!r}", flush=True)
+    record(results, "setParam('DEBUG_BLE_DATA_PATH', 'True') 返回 OK", bret == "OK",
+           "setParam 返回 'OK'", f"setParam -> {bret!r}")
+
+    # 起流
+    counter = DataCounter()
+    sensor.onDataCallback = counter
+    print("\n[起流] SensorProfile.startDataNotification() ...", flush=True)
+    try:
+        sret = sensor.startDataNotification()
+        start_txt = f"返回 {sret}"
+    except Exception as e:
+        sret = None
+        start_txt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[起流] SensorProfile.startDataNotification() -> {start_txt}  isDataTransfering={sensor.isDataTransfering}", flush=True)
+    record(results, "SensorProfile.startDataNotification 返回 True", sret is True,
+           "startDataNotification() 返回 True", f"startDataNotification() -> {start_txt}")
+    record(results, "SensorProfile.isDataTransfering 为 True", sensor.isDataTransfering is True,
+           "isDataTransfering == True", f"isDataTransfering == {sensor.isDataTransfering}")
+
+    # 复现「connect 后 EMG 无数据」：起流后短窗口内观察 EMG 是否已有数据。
+    # 现象：pyqt_demo 里 connect 后波形区不立即出数据，需重启设备；其他设备 connect 后立即有数据。
+    # 这里用 SDK 起流后 5s 内是否收到 NTF_EMG 样本来量化判定。
+    emg_window = 5
+    print(f"\n[EMG 早期检查] 起流后等待 {emg_window}s，观察 EMG 流是否已有数据 ...", flush=True)
+    emg_start_ts = time.monotonic()
+    time.sleep(emg_window)
+    emg_early = counter.emg_samples()
+    emg_first = counter.emg_first_ts()
+    emg_latency = (emg_first - emg_start_ts) if emg_first is not None else None
+    print(f"[EMG 早期检查] {emg_window}s 内 EMG 样本数 = {emg_early}"
+          + (f"，首包延迟 = {emg_latency:.2f}s" if emg_latency is not None else "，未收到 EMG")
+          + f"；各族统计 = {counter.stats()}", flush=True)
+    record(results, "startDataNotification 后 EMG 流立即有数据", emg_early > 0,
+           f"起流后 {emg_window}s 内 EMG 样本数 > 0",
+           f"EMG样本={emg_early}" + (f" 首包延迟={emg_latency:.2f}s" if emg_latency is not None else "") + f" 各族={counter.stats()}")
+
+    remaining = COLLECT_SECONDS - emg_window
+    if remaining > 0:
+        print(f"\n[采集] 继续等待剩余 {remaining}s ...", flush=True)
+        time.sleep(remaining)
+    batches, samples = counter.snapshot()
+    print(f"[采集] 累计收到 {batches} 批 / {samples} 样本", flush=True)
+    record(results, "onDataCallback 收到数据", samples > 0,
+           "起流后样本数 > 0", f"批数={batches} 样本数={samples}")
+
+    # 电量
+    try:
+        battery = sensor.getBatteryLevel()
+    except Exception as e:
+        battery = None
+        print(f"[电量] getBatteryLevel 抛异常 {type(e).__name__}: {e}", flush=True)
+    print(f"[电量] SensorProfile.getBatteryLevel() -> {battery}", flush=True)
+    record(results, "SensorProfile.getBatteryLevel 返回有效值", isinstance(battery, int) and battery != -1,
+           "getBatteryLevel() 返回 0~100 且不为 -1", f"getBatteryLevel -> {battery}")
+
+    # 停流
+    try:
+        sensor.stopDataNotification()
+    except Exception as e:
+        print(f"[停流] stopDataNotification 抛异常 {type(e).__name__}: {e}", flush=True)
+
+    ble_path = _get_ble_path(sensor)
+    print(f"[bin] stop 后 getParam('DEBUG_BLE_DATA_PATH') = {ble_path!r}", flush=True)
+
+    # 断开：释放 BLE、让 bin 落盘。离线回放必须在「全新、从未连接」的 profile 上跑
+    # （本进程的 sensor 已连接/起流过，直接回放会拿到 0 批，且随后 disconnect 会访问越界），
+    # 所以回放放到后面的独立子进程里（fresh controller + fresh profile）。
+    try:
+        sensor.disconnect()
+    except Exception as e:
+        print(f"[断开] SensorProfile.disconnect 抛异常 {type(e).__name__}: {e}", flush=True)
+
+    if not isinstance(ble_path, str) or not ble_path.strip():
+        ble_path = _get_ble_path(sensor)
+        print(f"[bin] disconnect 后 getParam('DEBUG_BLE_DATA_PATH') = {ble_path!r}", flush=True)
+
+    time.sleep(0.5)
+
+    bins_after = _list_bins(log_dir)
+    new_bins = sorted(set(bins_after.keys()) - set(bins_before.keys()))
+    bin_path = ble_path if (isinstance(ble_path, str) and ble_path.strip()) else None
+    if bin_path is None and new_bins:
+        bin_path = bins_after[new_bins[0]]
+    have_bin = bool(bin_path) and os.path.isfile(bin_path)
+    print(f"[bin] 新增 bin 文件: {new_bins if new_bins else '无'}", flush=True)
+    print(f"[bin] bin 路径: {bin_path!r}，文件存在={have_bin}", flush=True)
+    record(results, "起流后生成 .bin 文件", have_bin,
+           "DEBUG_BLE_DATA_PATH=True 且文件存在", f"{bin_path!r}（存在={have_bin}）")
+
+    # 查看 bin：元数据 + CSV（进程内、纯文件操作）
+    if have_bin:
+        try:
+            info = ctrl.getBinFileInfo(bin_path)
+        except Exception as e:
+            info = None
+            print(f"[bin] getBinFileInfo 抛异常 {type(e).__name__}: {e}", flush=True)
+        info_ok = bool(isinstance(info, dict) and info)
+        if info_ok:
+            print(f"[bin] getBinFileInfo -> device_name={info.get('device_name')}, "
+                  f"replay_duration={info.get('replay_duration')}", flush=True)
+        record(results, "SensorController.getBinFileInfo 返回元数据", info_ok,
+               "返回非空 dict", f"返回 {type(info).__name__}" if info else "返回 None/空")
+
+        try:
+            csv_path = ctrl.parseBinToCsv(bin_path)
+        except Exception as e:
+            csv_path = None
+            print(f"[bin] parseBinToCsv 抛异常 {type(e).__name__}: {e}", flush=True)
+        csv_ok = bool(csv_path) and os.path.isfile(csv_path)
+        print(f"[bin] parseBinToCsv -> {csv_path!r}（存在={csv_ok}）", flush=True)
+        record(results, "SensorController.parseBinToCsv 生成 CSV", csv_ok,
+               "返回 CSV 路径且文件存在", f"{csv_path!r}（存在={csv_ok}）")
+    else:
+        record(results, "SensorController.getBinFileInfo 返回元数据", None, "返回非空 dict", "无有效 bin")
+        record(results, "SensorController.parseBinToCsv 生成 CSV", None, "返回 CSV 路径且文件存在", "无有效 bin")
+
+    # 清理并终止本进程的 SDK（释放 dongle，避免与下面的回放子进程冲突）
+    try:
+        sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
+    except Exception:
+        pass
+    try:
+        ctrl.setDebugEnabled(False)
+    except Exception:
+        pass
+
+    ctrl.terminate()
+
+    # 回放：独立子进程里跑（fresh controller + fresh profile，复用官方 console.py --replay 的离线回放逻辑）
+    if have_bin:
+        print(f"[回放] 子进程离线回放 console.py --replay ...", flush=True)
+        rb = 0
+        rerr = None
+        try:
+            console_path = os.path.normpath(
+                os.path.join(AUTOMATION_DIR, "..", "..", "examples", "console.py"))
+            proc = subprocess.run(
+                [sys.executable, console_path, "--replay", bin_path],
+                capture_output=True, text=True, timeout=180)
+            stdout = proc.stdout or ""
+            m = re.search(r"received\s+(\d+)\s+data batches", stdout)
+            rb = int(m.group(1)) if m else 0
+            if proc.returncode != 0:
+                rerr = f"console.py --replay 退出码 {proc.returncode}"
+            elif rb <= 0:
+                rerr = "回放解析到 0 批数据"
+            print(f"[回放] 子进程 stdout: {stdout.strip()}", flush=True)
+            if (proc.stderr or "").strip():
+                print(f"[回放] 子进程 stderr: {proc.stderr.strip()}", flush=True)
+        except Exception as e:
+            rerr = f"{type(e).__name__}: {e}"
+            print(f"[回放] 抛异常 {rerr}", flush=True)
+        print(f"[回放] 收到 {rb} 批", flush=True)
+        record(results, "replayBinFile 回放产生数据", rerr is None and rb > 0,
+               "回放后批数 > 0", f"批数={rb}" + (f" err={rerr}" if rerr else ""))
+    else:
+        record(results, "replayBinFile 回放产生数据", None, "回放后批数 > 0", "无有效 bin")
+
+    # 汇总
+    print("\n" + "=" * 60, flush=True)
+    print("测试结果汇总", flush=True)
+    print("=" * 60, flush=True)
+    all_pass = True
+    for rname, status, expect, actual in results:
+        if status == "PASS":
+            print(f"  [PASS] {rname}（实际: {actual}）", flush=True)
+        elif status == "SKIP":
+            print(f"  [SKIP] {rname}（{actual}）", flush=True)
+        else:
+            print(f"  [FAIL] {rname}", flush=True)
+            print(f"         期待: {expect}", flush=True)
+            print(f"         实际: {actual}", flush=True)
+        if status == "FAIL":
+            all_pass = False
+
+    print(f"\n[提示] 本次日志/bin 落盘目录: {log_dir}", flush=True)
+    print("\n结论: " + ("PASS" if all_pass else "FAIL"), flush=True)
+
+if __name__ == "__main__":
+    main()

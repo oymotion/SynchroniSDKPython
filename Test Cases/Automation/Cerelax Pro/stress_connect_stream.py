@@ -358,6 +358,10 @@ def _one_round(ctrl, round_num, log_dir, target_identity=None):
 
 
 def main():
+    sanity_log = common.setup_sanity_log(BASE_DIR)
+    if sanity_log:
+        print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
+
     ctrl = SensorControllerInstance
     target_identity = resolve_target_identity()
 

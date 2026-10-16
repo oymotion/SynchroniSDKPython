@@ -213,20 +213,22 @@ def main():
     input("\n>>> [人工操作] 请【重新开启】待测设备 OB6000C 电源（或移回范围），完成后按回车继续 ...")
 
     print(f"\n[观察不自动重连] 观察窗口 {NO_RECONNECT_WINDOW}s ...", flush=True)
-    reached_ready = False
     t0 = time.time()
     while time.time() - t0 < NO_RECONNECT_WINDOW:
-        if sensor.deviceState == DeviceStateEx.Ready:
-            reached_ready = True
-            print("  [观察] 检测到 deviceState==Ready（出现自动重连），提前结束观察", flush=True)
+        # 出现自动重连信号（onAutoReconnect 触发）则提前结束观察
+        if len(reconnects) > 0:
+            print("  [观察] 检测到 onAutoReconnect 触发，提前结束观察", flush=True)
             break
         time.sleep(0.5)
 
+    # 自动重连判据：最终 deviceState 回到 Ready，或 onAutoReconnect 回调触发。
+    # 不用「观察窗口内是否曾短暂 == Ready」判断，避免底层 BLE 瞬时重连造成误判。
+    auto_reconnected = (sensor.deviceState == DeviceStateEx.Ready) or (len(reconnects) > 0)
     print(f"[观察] deviceState={sensor.deviceState} onAutoReconnect {len(reconnects)} 次 状态序列 {[str(s) for s in states]}", flush=True)
 
-    record(results, "恢复供电后未自动重连（deviceState 保持 Disconnected）", not reached_ready,
-           "观察窗口内 deviceState 不回到 Ready",
-           f"state={sensor.deviceState} 状态序列={[str(s) for s in states]}")
+    record(results, "恢复供电后未自动重连（deviceState 保持 Disconnected）", not auto_reconnected,
+           "观察窗口后 deviceState 不回到 Ready 且 onAutoReconnect 不触发",
+           f"state={sensor.deviceState} onAutoReconnect={len(reconnects)} 次 状态序列={[str(s) for s in states]}")
     record(results, "onAutoReconnect 未触发（0 次）", len(reconnects) == 0,
            "onAutoReconnect 触发 0 次",
            f"触发 {len(reconnects)} 次 restore={reconnects!r}")

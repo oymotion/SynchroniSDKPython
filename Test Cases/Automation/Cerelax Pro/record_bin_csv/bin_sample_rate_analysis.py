@@ -98,8 +98,8 @@ def main():
         if not info:
             _log(f"[FAIL] getBinFileInfo 返回空: {bin_path}")
             return
-        sensor = ctrl.requireSensor(BLEDevice(info.get("device_name") or "",
-                                              info.get("device_mac") or "", 0))
+        sensor = ctrl.requireSensor(BLEDevice(info.DeviceName or "",
+                                              info.Mac or "", 0))
         if sensor is None:
             _log("[FAIL] requireSensor 返回 None")
             return
@@ -119,8 +119,8 @@ def main():
 
         sensor.onDataCallback = on_data
         _log(f"[回放] {bin_path}")
-        _log(f"       replay_duration={info.get('replay_duration')}  "
-             f"device_name={info.get('device_name')}")
+        _log(f"       replay_duration={info.DurationSec}  "
+             f"device_name={info.DeviceName}")
         ctrl.replayBinFile(bin_path, sensor, realtime=False)
         _log(f"[回放] 结束，EEG 批数={len(batches)}")
 

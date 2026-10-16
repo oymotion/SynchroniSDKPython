@@ -624,6 +624,7 @@ def main():
         # 采样率主口径：唯一样本数 / host 精确窗口（t_end - t_start），host 墙钟作参考、与设备无关。
         #   设备端 absTimeStampInSec 已确认是「sampleIndex ÷ 标称采样率」反推（循环论证，永远 ≈ 标称，
         #   测不出真实偏差），故只作「固件自报」对比，不参与主判定。
+        session_rates = {}  # stream -> (actual, expected, unique)，用于本会话两流相对时钟偏移
         for it in ok_targets:
             unique, dur_host, dur_abs, delivered, ch = collector.result_for(it["dt_type"])
             if unique <= 0:
@@ -632,6 +633,7 @@ def main():
             win_dur = t_end - t_start
             denom = win_dur
             actual = unique / denom
+            session_rates[it["stream"]] = (actual, it["expected"], unique)
             dev = abs(actual - it["expected"]) / it["expected"] if it["expected"] > 0 else float("inf")
             ok = dev <= SAMPLE_RATE_TOLERANCE
             print(f"[结果] {it['label']} 期望={it['expected']}Hz, 实际≈{actual:.3f}Hz 偏差={dev:.3%} "
@@ -658,6 +660,24 @@ def main():
                 print("      [漂移] 有效段不足，无法计算", flush=True)
             summaries.append((it["label"], ok,
                               f"期望={it['expected']}Hz, 实际≈{actual:.3f}Hz 偏差={dev:.3%}（唯一样本={unique}）"))
+
+        # 两流相对时钟偏移：EMG vs IMU（仅当本会话同时测到两者时输出）
+        emg = session_rates.get("NTF_EMG")
+        imu = session_rates.get("NTF_IMU")
+        if emg and imu:
+            emg_actual, emg_expected, _ = emg
+            imu_actual, imu_expected, _ = imu
+            emg_factor = emg_actual / emg_expected
+            imu_factor = imu_actual / imu_expected
+            rel = imu_factor - emg_factor          # >0 = IMU 采样时钟相对 EMG 偏快
+            rel_ppm = rel * 1e6
+            shift = rel * (t_end - t_start)        # 本会话采集时长内两流时间轴累积错位（秒）
+            direction = "IMU 相对 EMG 快" if rel >= 0 else "IMU 相对 EMG 慢"
+            print(f"[相对时钟偏移] EMG vs IMU：", flush=True)
+            print(f"      EMG 实际/标称 = {emg_actual:.3f}/{emg_expected:.0f}Hz = {emg_factor:.6f}", flush=True)
+            print(f"      IMU 实际/标称 = {imu_actual:.3f}/{imu_expected:.0f}Hz = {imu_factor:.6f}", flush=True)
+            print(f"      相对频偏 = {rel:+.6f}（{rel_ppm:+.0f} ppm，{direction}）", flush=True)
+            print(f"      采集 {(t_end - t_start):.0f}s 累积错位 ≈ {abs(shift):.2f}s", flush=True)
 
     # 清理
     for s in streams_to_enable:

@@ -276,6 +276,10 @@ def _get_ble_path(sensor):
 
 
 def main():
+    sanity_log = common.setup_sanity_log(BASE_DIR)
+    if sanity_log:
+        print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
+
     target_identity = sys.argv[1].strip().upper() if len(sys.argv) > 1 else None
     ctrl = SensorControllerInstance
 

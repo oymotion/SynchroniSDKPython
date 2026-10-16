@@ -17,7 +17,7 @@
 ### BIN-FUNC-002 getBinFileInfo 返回字段
 - **测试目的**：验证 bin 信息。
 - **流程与逻辑**：对有效 bin 调 `getBinFileInfo`。
-- **预期结果**：返回含 `device_mac/device_name/chip_type/is_universal_stream/feature_map/device_info/sensor_datas/replay_duration` 的 dict。
+- **预期结果**：返回 `BinFileInfo` 对象（无效时返回 None），字段为 PascalCase 属性：`Mac/DeviceName/ChipType/IsUniversalStream/FeatureMap/DeviceInfo/SensorDatas/DurationSec`；另含新增字段 `ConfigVersion/IsNewEmg/IsContainQat6/PpgModel/NotifyDataFlag/Valid/FirstDataTsMs/LastDataTsMs`。
 - **有效性说明**：bin 元数据完整。
 - **可自动化**：auto
 - **人工介入**：无
@@ -88,7 +88,7 @@
 
 ### BIN-FUNC-010 multiReplayBinFile 多文件同步回放
 - **测试目的**：验证 0.9.7 新增的 `multiReplayBinFile` 多 bin 文件按共享时钟对齐同步回放。
-- **流程与逻辑**：准备 ≥2 个不同 MAC 的有效 bin 文件；`multiReplayBinFile(file_paths, sensors=None, realtime=True)`；统计各成员 `onDataCallback` 批数与 DataType。
+- **流程与逻辑**：准备 ≥2 个不同 MAC 的有效 bin 文件；`multiReplayBinFile(file_paths, sensors, realtime=True)`（`sensors` 必填，与 `file_paths` 等长）；统计各成员 `onDataCallback` 批数与 DataType。
 - **预期结果**：返回列表长度等于输入文件数，每个成员返回对应 `SensorProfile`（或 None 表示该成员失败）；各成员均产生回放数据；DataType 覆盖各自 live 类型；全组以最早首条数据记录为 t=0，保留录制时相对偏移。
 - **有效性说明**：多设备/多段 bin 的同步回放是 0.9.7 新能力。
 - **可自动化**：auto
@@ -115,7 +115,7 @@
 
 ### BIN-BND-002 multiReplayBinFile 无效/重复/不足输入
 - **测试目的**：验证多文件回放入参容错。
-- **流程与逻辑**：`multiReplayBinFile([])`；`multiReplayBinFile([单文件])`；`multiReplayBinFile(含无效 bin 的列表)`；`multiReplayBinFile(含重复 device_mac 的列表)`。
+- **流程与逻辑**：`multiReplayBinFile([])`；`multiReplayBinFile([单文件])`；`multiReplayBinFile(含无效 bin 的列表)`；`multiReplayBinFile(含重复 Mac 的列表)`。
 - **预期结果**：空列表/单文件被拒绝；无效 bin 成员返回 None 不崩溃；重复 MAC 按 SDK 语义处理，其余成员正常回放，不抛异常。
 - **有效性说明**：多文件接口容错。
 - **可自动化**：auto

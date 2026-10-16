@@ -48,7 +48,7 @@ def _make_sensor(controller, bin_path):
     if info is None:
         return None, None, "getBinFileInfo 返回 None（无 config record 或文件无效）"
     sensor = controller.requireSensor(
-        BLEDevice(info.get("device_name") or "", info.get("device_mac") or "", 0)
+        BLEDevice(info.DeviceName or "", info.Mac or "", 0)
     )
     if sensor is None:
         return None, info, "requireSensor 返回 None（无法创建回放 profile）"

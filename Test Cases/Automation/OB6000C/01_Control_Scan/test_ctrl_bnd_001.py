@@ -10,12 +10,12 @@
   单进程内 try/except 无法捕获进程崩溃，因此每个边界值都在【独立子进程】中调用，
   主进程收集 returncode / 输出，从而能捕获"非法值导致崩溃"这类最严重缺陷。
 
-边界值（MAX 假设为 int32 上限，实测若 SDK 有文档化上限请调整）：
+边界值（MAX = int32 上限 0x7FFFFFFF，SDK 校验 0 < period <= 0x7FFFFFFF）：
   0、1、MAX-1、MAX、-1、MAX+1
 
 判定：
-  - 合法值（0/1/MAX-1/MAX）：不抛异常即通过（返回 True/False 记录，False 可能是蓝牙未开启所致）
-  - 非法值（-1/MAX+1）：被拒绝（返回 False 或抛异常）即通过；返回 True 判 FAIL
+  - 合法值（1/MAX-1/MAX）：不抛异常即通过（返回 True/False 记录，False 可能是蓝牙未开启所致）
+  - 非法值（0/-1/MAX+1）：被拒绝（返回 False 或抛异常）即通过；返回 True 判 FAIL
   - 任一边界值导致子进程崩溃（returncode != 0）判 FAIL
 """
 
@@ -29,9 +29,9 @@ sys.path.insert(0, AUTOMATION_DIR)
 
 from common import record
 
-MAX_INT32 = 2147483647  # period_in_ms 假设上限（int32 max）
+MAX_INT32 = 2147483647  # period_in_ms 上限（SDK 校验 0 < period <= 0x7FFFFFFF）
 BOUNDARY_VALUES = [0, 1, MAX_INT32 - 1, MAX_INT32, -1, MAX_INT32 + 1]
-LEGAL = {0, 1, MAX_INT32 - 1, MAX_INT32}
+LEGAL = {1, MAX_INT32 - 1, MAX_INT32}
 
 # 子进程探针：调用 startScan(int(sys.argv[1])) 并打印结果
 PROBE = (

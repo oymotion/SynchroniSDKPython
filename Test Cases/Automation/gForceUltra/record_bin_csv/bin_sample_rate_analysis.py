@@ -19,12 +19,18 @@
   - 分段漂移直接看「每周期样本数 spc」序列是否平移，与 fs_nom 绝对准确性无关。
 
 用法：
-  python bin_sample_rate_analysis <bin路径> [通道] [参考频率Hz] [标称采样率Hz]
+  python bin_sample_rate_analysis <bin路径> [通道] [参考频率Hz] [标称采样率Hz] [--stream EMG|IMU]
+
+  --stream（可选，默认 EMG）：
+    EMG : 正弦参考 + 采样率/时钟漂移 + DC 基线漂移（原行为）
+    IMU : 仅 DC 基线漂移（IMU 静止无正弦参考；通道 0-2=acc 单位 g，3-5=gyro 单位 dps）
+    其它 : 同 IMU，按 DataType 名字片段匹配（如 EEG）
 
   例：
-    python bin_sample_rate_analysis gForceUltra_data_xxx.bin            # 自动定位通道、识别参考频率
-    python bin_sample_rate_analysis gForceUltra_data_xxx.bin 2          # 只给通道，自动识别 ref/采样率
-    python bin_sample_rate_analysis gForceUltra_data_xxx.bin 2 20 1000  # 显式 ch=2, 20Hz, 1000Hz
+    python bin_sample_rate_analysis gForceUltra_data_xxx.bin              # EMG 完整分析
+    python bin_sample_rate_analysis gForceUltra_data_xxx.bin 2            # 只给通道，自动识别 ref/采样率
+    python bin_sample_rate_analysis gForceUltra_data_xxx.bin 2 20 1000    # 显式 ch=2, 20Hz, 1000Hz
+    python bin_sample_rate_analysis gForceUltra_data_xxx.bin --stream IMU # 只看 IMU 的 DC 基线漂移
 
 依赖：numpy + 本仓库 Python SDK。
 """
@@ -82,11 +88,53 @@ def _locate_sine_channel(arr, fs, band_lo, band_hi):
     return best_ch, best_amp
 
 
+def _dc_baseline_drift(arr, fs_nom, seg=SEG, units="uV"):
+    """对所有通道做 DC 基线漂移分析（分段中位数），输出每通道首/尾/峰峰。
+
+    用于判断信号基线是否随时间漂移（传感器静止时基线应稳定）。
+    arr    : as_numpy 拼接后的结构化数组 (n_ch, n)，字段 'data'/'isLost'。
+    fs_nom : 标称采样率（Hz），仅用于把样本序号换算成时间（秒）。
+    units  : 单位标注，str（所有通道同一单位）或 list（每通道一个单位，长度不足补末位）。
+    """
+    n_ch, n = arr.shape[0], arr.shape[1]
+    if isinstance(units, str):
+        unit_per_ch = [units] * n_ch
+    else:
+        unit_per_ch = list(units)
+        if len(unit_per_ch) < n_ch:
+            unit_per_ch += [unit_per_ch[-1]] * (n_ch - len(unit_per_ch))
+    t_axis = np.arange(n, dtype=np.float64)
+    edges = np.linspace(0, n, seg + 1)
+    _log(f"\n[DC 基线漂移] 通道数={n_ch}  每通道样本={n}  分 {seg} 段（每段约 {n / fs_nom / seg:.0f}s）")
+    for ci in range(n_ch):
+        u = unit_per_ch[ci]
+        data = arr[ci]["data"].astype(np.float64)
+        dc = []
+        for k in range(seg):
+            m = (t_axis >= edges[k]) & (t_axis < edges[k + 1])
+            if m.sum() == 0:
+                continue
+            dc.append((edges[k] / fs_nom, np.median(data[m])))
+        if len(dc) < 2:
+            _log(f"  ch={ci}: 有效段不足，无法判断漂移")
+            continue
+        meds = np.array([v[1] for v in dc])
+        _log(f"  ch={ci}: mean={data.mean():.6f}{u}  DC 首 {meds[0]:.6f} -> 尾 {meds[-1]:.6f} {u}"
+             f"（Δ{meds[-1] - meds[0]:+.6f}{u}） 峰峰 {meds.max() - meds.min():.6f}{u}")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
-        _log("用法: python bin_sample_rate_analysis <bin> [通道] [参考频率Hz] [标称采样率Hz]")
+        _log("用法: python bin_sample_rate_analysis <bin> [通道] [参考频率Hz] [标称采样率Hz] [--stream EMG|IMU]")
         return
+    # 提取可选 --stream（默认 EMG）；其余按位置解析
+    stream = "EMG"
+    if "--stream" in args:
+        i = args.index("--stream")
+        if i + 1 < len(args):
+            stream = args[i + 1].strip().upper() or "EMG"
+        args = [a for j, a in enumerate(args) if j != i and j != i + 1]
     bin_path = args[0]
     ch_arg = int(args[1]) if len(args) > 1 else None
     ref = float(args[2]) if len(args) > 2 else None
@@ -98,8 +146,8 @@ def main():
         if not info:
             _log(f"[FAIL] getBinFileInfo 返回空: {bin_path}")
             return
-        sensor = ctrl.requireSensor(BLEDevice(info.get("device_name") or "",
-                                              info.get("device_mac") or "", 0))
+        sensor = ctrl.requireSensor(BLEDevice(info.DeviceName or "",
+                                              info.Mac or "", 0))
         if sensor is None:
             _log("[FAIL] requireSensor 返回 None")
             return
@@ -112,20 +160,20 @@ def main():
             for d in items:
                 name = d.getDataType()
                 name = name.name if isinstance(name, DataType) else DataType(name).name
-                if "EMG" in name.upper():
+                if stream.upper() in name.upper():
                     if fs_reported["v"] is None:
                         fs_reported["v"] = d.getSampleRate()
                     batches.append(d.as_numpy())
 
         sensor.onDataCallback = on_data
         _log(f"[回放] {bin_path}")
-        _log(f"       replay_duration={info.get('replay_duration')}  "
-             f"device_name={info.get('device_name')}")
+        _log(f"       replay_duration={info.DurationSec}  "
+             f"device_name={info.DeviceName}")
         ctrl.replayBinFile(bin_path, sensor, realtime=False)
-        _log(f"[回放] 结束，EMG 批数={len(batches)}")
+        _log(f"[回放] 结束，{stream} 批数={len(batches)}")
 
         if not batches:
-            _log("[FAIL] 无 EMG 数据")
+            _log(f"[FAIL] 无 {stream} 数据")
             return
 
         arr = np.concatenate(batches, axis=1)
@@ -137,6 +185,17 @@ def main():
         else:
             _log(f"[数据] 标称采样率：命令行指定 = {fs_nom}Hz")
         _log(f"[数据] 通道={n_ch}  每通道样本={n}  标称采样率={fs_nom}Hz")
+
+        # 非 EMG 流（如 IMU）：静止无正弦参考，只做 DC 基线漂移（所有通道），跳过正弦/采样率分析
+        if stream != "EMG":
+            _log(f"\n[模式] 流类型={stream}，仅做 DC 基线漂移（跳过正弦/采样率分析）")
+            if stream == "IMU":
+                # IMU 6 通道 = acc(0-2, 单位 g) + gyro(3-5, 单位 dps)
+                units = ["g"] * 3 + ["dps"] * 3
+            else:
+                units = "uV"
+            _dc_baseline_drift(arr, fs_nom, units=units)
+            return
 
         # ---- 1) 定位正弦通道 ----
         if ch_arg is None:

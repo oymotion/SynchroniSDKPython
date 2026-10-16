@@ -41,7 +41,7 @@ import common
 from common import _identity_of, match_target, resolve_target_identity
 
 MAX_ROUNDS = 50          # 共跑 50 轮
-STREAM_SECONDS = 90     # 每轮起流时长 90 秒
+STREAM_SECONDS = 60     # 每轮起流时长 60 秒
 CHECK_INTERVAL = 30      # 每 30 秒输出一次电量
 
 

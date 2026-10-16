@@ -19,16 +19,17 @@
   NTF_EMG                "NTF_EMG"           EmgChannelCount       5s（能力门控）
   NTF_GEST               "NTF_GEST"          EmgChannelCount       5s（DeviceInfo 无独立 GEST 标称值）
   NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount      5s（与 NTF_EEG 同起才有数据）
-  NTF_IMU                "NTF_IMU"           ImuChannelCount       5s（acc3+gyro3+euler3+quat4 聚合）
+  NTF_ACC/GYRO/EULER/QUAT "NTF_IMU"          ImuChannelCount       5s（6 轴 IMU 四路独立投递）
 
 说明：
   - 每个模态是否测试由 getDeviceInfo() 的 ChannelCount 运行时判定（>0 才起流）。
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
   - IMPEDANCE / IMU 均需与 NTF_EEG 同时起流才有数据（脑电设备以 EEG 为主线，
     阻抗与 6 轴 IMU 为伴随流），故二者均与 EEG 同起。
-  - ACC/GYRO/EULER/QUAT 不以独立 NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION 流投递，
-    而是以 NTF_IMU 聚合流投递（ImuChannelCount=13：acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12），
-    故本条只测 NTF_IMU，通道布局细节见 DATA-FUNC-010。
+  - OB6000C 的 6 轴 IMU 不以 NTF_IMU(0x13) 聚合流投递，而是拆成 4 路独立 DataType
+    （NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION）分别投递；开关仍用 "NTF_IMU" 打开，
+    DeviceInfo 仍以 ImuChannelCount 描述 6 轴 IMU 能力。故本条按这 4 路独立类型聚合断言，
+    通道布局细节见 DATA-FUNC-010。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -57,21 +58,23 @@ def _dt_name(dt):
         return str(dt)
 
 
-# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 伴随起流 key)
+# (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 伴随起流 key, 断言类型列表)
 # 伴随起流 key 非 None 时与该模态同时 setParam ON 一起起流（IMPEDANCE 需与 EEG 同起才有数据）
+# 断言类型列表非 None 时按这些类型聚合统计样本（OB6000C 的 6 轴 IMU 四路独立投递时用）
 MODALITIES = [
     ("EEG", DataType.NTF_EEG, "NTF_EEG", "EegChannelCount",
-     "请保持电极接触良好，EEG 静息即有信号，无需额外动作", 5, None),
+     "请保持电极接触良好，EEG 静息即有信号，无需额外动作", 5, None, None),
     ("ECG", DataType.NTF_ECG, "NTF_ECG", "EcgChannelCount",
-     "请保持电极接触良好，让 ECG 产生信号", 5, None),
+     "请保持电极接触良好，让 ECG 产生信号", 5, None, None),
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
-     "请保持电极接触良好，让 EMG 产生信号", 5, None),
+     "请保持电极接触良好，让 EMG 产生信号", 5, None, None),
     ("GEST", DataType.NTF_GEST, "NTF_GEST", "EmgChannelCount",
-     "若设备支持，请触发相应手势识别", 5, None),
+     "若设备支持，请触发相应手势识别", 5, None, None),
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
-     "请保持电极接触良好，让阻抗测量产生信号", 5, "NTF_EEG"),
+     "请保持电极接触良好，让阻抗测量产生信号", 5, "NTF_EEG", None),
     ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
-     "请晃动/旋转设备，让 6 轴 IMU（acc+gyro+euler+quat）产生变化", 5, "NTF_EEG"),
+     "请晃动/旋转设备，让 6 轴 IMU（acc+gyro+euler+quat）产生变化", 5, "NTF_EEG",
+     [DataType.NTF_ACC, DataType.NTF_GYRO, DataType.NTF_EULER_DATA, DataType.NTF_QUATERNION]),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名
@@ -334,7 +337,7 @@ def main():
 
     # 先全部 OFF，清理初始状态（尤其 GEST/EMG 互斥）
     print("\n[准备] 关闭所有目标模态，清理初始状态 ...", flush=True)
-    for disp, dt, param, field, hint, _sec, co_key in MODALITIES:
+    for disp, dt, param, field, hint, _sec, co_key, _assert_types in MODALITIES:
         try:
             sensor.setParam(param, "OFF")
         except Exception as e:
@@ -345,7 +348,7 @@ def main():
             except Exception as e:
                 print(f"  [清理] {co_key} OFF 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    for disp, dt, param, field, hint, collect_sec, co_key in MODALITIES:
+    for disp, dt, param, field, hint, collect_sec, co_key, assert_types in MODALITIES:
         ch_count = getattr(info, field, 0)
         print(f"\n{'=' * 40}", flush=True)
         print(f"[模态] {disp}  DataType={_dt_name(dt)}  ChannelCount({field})={ch_count}", flush=True)
@@ -402,14 +405,22 @@ def main():
             except Exception:
                 pass
 
-        # 统计该 DataType 数据
-        entry = collector.by_type.get(dt, {'batches': 0, 'samples': 0})
-        got = entry['samples'] > 0
+        # 统计该模态数据：assert_types 非 None 时按多类型聚合（OB6000C 的 6 轴 IMU 四路独立投递）
+        if assert_types:
+            samples = sum(collector.by_type.get(t, {}).get('samples', 0) for t in assert_types)
+            batches = sum(collector.by_type.get(t, {}).get('batches', 0) for t in assert_types)
+            type_label = "+".join(_dt_name(t) for t in assert_types)
+        else:
+            entry = collector.by_type.get(dt, {'batches': 0, 'samples': 0})
+            samples = entry['samples']
+            batches = entry['batches']
+            type_label = _dt_name(dt)
+        got = samples > 0
         got_types = {_dt_name(k): v['batches'] for k, v in collector.by_type.items()}
-        print(f"[采集] {disp} 收到批次={entry['batches']} 样本数={entry['samples']} 全部类型={got_types}", flush=True)
+        print(f"[采集] {disp} 收到批次={batches} 样本数={samples} 全部类型={got_types}", flush=True)
         record(results, f"{disp} 流能收到数据且类型匹配", got,
-               f"收到 {_dt_name(dt)} 数据（样本数>0）",
-               f"该类型样本数={entry['samples']} 批次={entry['batches']}")
+               f"收到 {type_label} 数据（样本数>0）",
+               f"该类型样本数={samples} 批次={batches}")
 
     # 清理
     try:

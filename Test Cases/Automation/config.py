@@ -24,9 +24,9 @@ POWER_REFRESH_INTERVAL_MS = 1000    # init(..., powerRefreshInterval)
 MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 
 # ---- 当前目标设备（逗号分隔，脚本统一从 common.py 读）----
-TARGET_IDENTITY = "80E1"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
-#TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
-#TARGET_IDENTITY = "854A" 
+#TARGET_IDENTITY = "B383"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
+TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
+#TARGET_IDENTITY = "A2CD" 
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
@@ -113,6 +113,11 @@ DEVICES = [
         "identity": "80E1",
     },
     {
+        "name_prefix": "gForceUltra",
+        "mac": "BC:93:2A:3F:A2:CD",
+        "identity": "A2CD",
+    },
+    {
         "name_prefix": "Cerelax",
         "mac": "BC:93:2A:3F:85:0B",
         "identity": "850B",
@@ -127,6 +132,11 @@ DEVICES = [
         "mac": "BC:93:2A:3F:85:4A",
         "identity": "854A"
     },
+    {
+        "name_prefix": "gForceMax",
+        "mac": "BC:93:2A:3F:9A:91",           
+        "identity": "9A91",
+    },
 ]
 
 # ---- 设备规格映射（name_prefix -> device_specs 下的文件名，不含 .py 后缀）----
@@ -140,4 +150,5 @@ MODEL_SPEC = {
     "OB6000C": "ob6000c",
     "OB": "ob6000c",   # 兜底：未知 OB 型号暂按 OB6000C
     "Cerelax": "cerelax_pro",
+    "gForceMax": "gforce_max",
 }

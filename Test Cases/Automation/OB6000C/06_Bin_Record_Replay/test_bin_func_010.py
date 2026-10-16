@@ -13,9 +13,9 @@
   5) 校验：返回列表长度 == 输入成员数；每个成员返回非 None；每个成员 count > 0
 
 说明：
-  SDK 0.9.7 新增 multiReplayBinFile(file_paths, sensors=None, realtime=True, timeout=None)，
+  SDK 0.9.7 新增 multiReplayBinFile(file_paths, sensors, realtime=True, timeout=None)，
   多成员共享对齐时钟（全组最早首条数据为 t=0，保留采集时相对偏移）。
-  sensors 参数某项为 None（或整体为 None）时按对应 bin 配置记录自动创建 profile。
+  1.3.0 起 sensors 为必填（与 file_paths 等长，元素为 MAC 字符串或 SensorProfile，不可为 None）。
   本用例显式创建 profile 以便注册 onDataCallback 校验各成员均产生数据。
   返回列表与 file_paths 对齐，对应成员失败（文件不存在/无配置/MAC 重复/正在传输）为 None。
   本脚本按 config.TARGET_IDENTITIES 连接 ≥2 台目标设备，每台各录制一段 bin（不同 MAC），

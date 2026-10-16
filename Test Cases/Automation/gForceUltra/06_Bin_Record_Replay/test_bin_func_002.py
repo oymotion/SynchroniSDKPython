@@ -13,7 +13,8 @@
   6) getBinFileInfo(bin_path) 并校验返回 dict 含 device_mac/device_name/chip_type/is_universal_stream/feature_map/device_info/sensor_datas/replay_duration
 
 说明：
-  README：getBinFileInfo(file_path) -> Optional[dict]，返回 dict 字段包括 device_mac、
+  SDK 1.3.9 起 getBinFileInfo 返回 BinFileInfo 对象（旧版 README 记为 Optional[dict]），
+  经 common.bin_info_to_dict shim 转回 dict；字段包括 device_mac、
   device_name、chip_type、is_universal_stream、feature_map、device_info、sensor_datas、
   replay_duration（录制秒数，在 close 时写入 header）；文件不存在或无 config record 时
   返回 None。

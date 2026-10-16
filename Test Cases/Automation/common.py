@@ -58,6 +58,151 @@ def record(results, name, ok, expect, actual):
     results.append((name, status, expect, actual))
 
 
+class _CompatBinInfo(dict):
+    """BinFileInfo 的旧 dict 语义视图。
+
+    既支持旧脚本的 .get("device_mac") 等 dict 用法，也支持 SDK 1.3.9 内部
+    replayBinFile 对 .Mac / .DeviceName / .DurationSec 的属性访问（见
+    sensor_controller.replayBinFile/_start_replay），保证回放引擎不被破坏。
+    """
+
+    _ATTR_TO_KEY = {
+        "Mac": "device_mac",
+        "DeviceName": "device_name",
+        "DurationSec": "replay_duration",
+        "ConfigVersion": "version",
+        "ChipType": "chip_type",
+        "IsUniversalStream": "is_universal_stream",
+        "IsNewEmg": "is_new_emg",
+        "IsContainQat6": "is_contain_qat6",
+        "PpgModel": "ppg_model",
+        "FeatureMap": "feature_map",
+        "NotifyDataFlag": "notify_data_flag",
+        "DeviceInfo": "device_info",
+        "SensorDatas": "sensor_datas",
+        "Valid": "valid",
+        "FirstDataTsMs": "first_data_ts_ms",
+        "LastDataTsMs": "last_data_ts_ms",
+    }
+
+    def __getattr__(self, name):
+        key = self._ATTR_TO_KEY.get(name, name)
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self[self._ATTR_TO_KEY.get(name, name)] = value
+
+
+def bin_info_to_dict(info):
+    """把 SDK 1.3.9+ 的 BinFileInfo 对象转回旧版 getBinFileInfo 返回的 dict 结构。
+
+    背景：SDK 1.3.9 将 SensorController.getBinFileInfo 返回类型从 dict 改为
+    BinFileInfo 对象（属性 PascalCase）。旧脚本用 .get("device_mac") 等 dict 语义，
+    升级后会 AttributeError。此函数做兼容转换，使旧脚本无需改动即可继续用 .get()。
+
+    参数：
+        info : getBinFileInfo 返回值（可能是 BinFileInfo / dict / None）
+
+    返回：
+        - None             : info 为 None
+        - _CompatBinInfo   : 兼容旧版键结构（device_mac/device_name/replay_duration/
+                             version/chip_type/is_universal_stream/feature_map/
+                             device_info/sensor_datas/...），同时支持 .Mac 等属性访问
+        - 原样 dict        : info 已是 dict 时原样返回（幂等）
+    """
+    if info is None:
+        return None
+    if isinstance(info, dict):
+        return info
+
+    def _obj_to_dict(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            return [_obj_to_dict(x) for x in obj]
+        d = getattr(obj, "__dict__", None)
+        if d is not None:
+            return {k: _obj_to_dict(v) for k, v in d.items() if not k.startswith("_")}
+        return obj
+
+    device_info = _obj_to_dict(getattr(info, "DeviceInfo", None))
+    sensor_datas = _obj_to_dict(getattr(info, "SensorDatas", None)) or []
+
+    return _CompatBinInfo({
+        "device_mac": getattr(info, "Mac", ""),
+        "device_name": getattr(info, "DeviceName", ""),
+        "replay_duration": getattr(info, "DurationSec", 0.0),
+        "version": getattr(info, "ConfigVersion", 0),
+        "chip_type": getattr(info, "ChipType", 0),
+        "is_universal_stream": getattr(info, "IsUniversalStream", False),
+        "is_new_emg": getattr(info, "IsNewEmg", False),
+        "is_contain_qat6": getattr(info, "IsContainQat6", False),
+        "ppg_model": getattr(info, "PpgModel", 0),
+        "feature_map": getattr(info, "FeatureMap", 0),
+        "notify_data_flag": getattr(info, "NotifyDataFlag", 0),
+        "device_info": device_info,
+        "sensor_datas": sensor_datas,
+        "valid": getattr(info, "Valid", False),
+        "first_data_ts_ms": getattr(info, "FirstDataTsMs", 0),
+        "last_data_ts_ms": getattr(info, "LastDataTsMs", 0),
+    })
+
+
+def setup_sanity_log(base_dir, script_name=None):
+    """把脚本 stdout tee 到 SanityLogs/<script>_<timestamp>.log，同时保留终端输出。
+
+    用途：让「长稳 / 压力 / 采样率 / e2e」这类脚本的 print 输出落盘到固定目录，
+    跑完能回看「到底跑没跑、结果如何」。仅落盘脚本自身的 print 输出，不改动
+    SDK 的 setLogPath 日志目录。
+
+    参数：
+        base_dir     : 脚本所在目录（SanityLogs 建在它下面）
+        script_name  : 日志文件名前缀；默认取 sys.argv[0] 的 basename（去 .py）
+
+    返回：日志文件的绝对路径；创建失败返回 None（stdout 保持原样）。
+    """
+    log_dir = os.path.join(base_dir, "SanityLogs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        return None
+    if not script_name:
+        script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0] or "script"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"{script_name}_{ts}.log")
+
+    try:
+        fh = open(log_path, "w", encoding="utf-8")
+    except OSError:
+        return None
+
+    class _TeeStream:
+        def __init__(self, *streams):
+            self.streams = streams
+
+        def write(self, data):
+            for s in self.streams:
+                try:
+                    s.write(data)
+                except Exception:
+                    pass
+
+        def flush(self):
+            for s in self.streams:
+                try:
+                    s.flush()
+                except Exception:
+                    pass
+
+    sys.stdout = _TeeStream(sys.stdout, fh)
+    return log_path
+
+
 def resolve_target_identity():
     """解析命令行参数指定的目标 identity（逗号分隔，覆盖 config.TARGET_IDENTITY）。
 
@@ -319,3 +464,33 @@ async def async_scan_and_match_all(ctrl, scan_ms=None, required=None, retries=3,
             print(f"[common] 未匹配齐目标设备（{len(matched)}/{required}），{interval}s 后重试（{attempt}/{retries}）...", flush=True)
             await asyncio.sleep(interval)
     return matched, devices
+
+
+def _install_bin_info_compat_shim():
+    """安装 getBinFileInfo 兼容 shim（SDK 1.3.9 dict -> BinFileInfo 破坏性变更）。
+
+    在 import common 的测试进程里，把 SensorController.getBinFileInfo 包装一层，
+    使其返回 bin_info_to_dict 的结果（_CompatBinInfo，dict 子类）：
+      - 旧脚本的 isinstance(info, dict) 与 info.get("device_mac") 恢复可用；
+      - 同时保留 .Mac/.DeviceName/.DurationSec 属性访问，replayBinFile 内部仍正常。
+
+    幂等：重复 import 不会重复包装（只包裹一次）。
+    """
+    try:
+        import sensor.sensor_controller as _sc
+
+        _orig = _sc.SensorController.getBinFileInfo
+        if getattr(_orig, "_sdk139_compat_wrapped", False):
+            return
+
+        def _wrapped(self, file_path):
+            return bin_info_to_dict(_orig(self, file_path))
+
+        _wrapped._sdk139_compat_wrapped = True
+        _sc.SensorController.getBinFileInfo = _wrapped
+    except Exception:
+        # sensor 未安装或接口变化时静默降级，不影响 common 其他功能
+        pass
+
+
+_install_bin_info_compat_shim()

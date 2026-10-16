@@ -50,7 +50,7 @@ import config
 import common
 from common import _identity_of, scan_and_match, resolve_target_identity
 
-MIN_DURATION_SECONDS = 3 * 3600  # 最小运行时长（秒），默认 5 小时
+MIN_DURATION_SECONDS = 3 * 3600  # 最小运行时长（秒），默认 3 小时
 LOW_BATTERY_THRESHOLD = 5        # 电量低于该百分比则退出
 CHECK_INTERVAL = 60              # 每 60 秒输出一次状态
 BIN_COMPLETENESS_RATIO = 0.99    # bin 录制时长/实际起流时长 的完整度下界
@@ -268,6 +268,10 @@ def _teardown(ctrl, sensor, log_dir, bins_before, stream_seconds=None):
 
 
 def main():
+    sanity_log = common.setup_sanity_log(BASE_DIR)
+    if sanity_log:
+        print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
+
     target_identity = resolve_target_identity()
     ctrl = SensorControllerInstance
 

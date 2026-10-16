@@ -29,14 +29,14 @@ def run_bin_replay(bin_path: str) -> int:
     print(
         "bin info: config v%s, duration %.1fs, device %s (%s)"
         % (
-            info.get("version"),
-            info.get("replay_duration", 0.0),
-            info.get("device_name"),
-            info.get("device_mac"),
+            info.ConfigVersion,
+            info.DurationSec,
+            info.DeviceName,
+            info.Mac,
         )
     )
     sensor = controller.requireSensor(
-        BLEDevice(info.get("device_name") or "", info.get("device_mac") or "", 0)
+        BLEDevice(info.DeviceName or "", info.Mac or "", 0)
     )
     if sensor is None:
         print("failed to create SensorProfile for replay")

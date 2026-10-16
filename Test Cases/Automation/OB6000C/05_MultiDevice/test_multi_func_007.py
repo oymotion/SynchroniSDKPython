@@ -130,14 +130,20 @@ def main():
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     restart_ok = False
-    if isinstance(mret, dict):
-        mac1 = s1.BLEDevice.Address
-        mac2 = s2.BLEDevice.Address
-        s1_ok = mret.get(mac1) is True
-        s2_ok = mret.get(mac2) is True
+    # multiStartDataNotification 返回 list[dict]，每个 dict 为 {'mac','ok','error'}，
+    # 不是 {mac: bool}。按 mac 索引（大小写不敏感）解析两台设备各自的结果。
+    if isinstance(mret, list):
+        mac1 = (s1.BLEDevice.Address or "").upper()
+        mac2 = (s2.BLEDevice.Address or "").upper()
+        by_mac = {str(item.get('mac', '')).upper(): item
+                  for item in mret if isinstance(item, dict)}
+        r1 = by_mac.get(mac1)
+        r2 = by_mac.get(mac2)
+        s1_ok = bool(r1 and r1.get('ok') is True)
+        s2_ok = bool(r2 and r2.get('ok') is True)
         restart_ok = s1_ok and s2_ok
-        print(f"[multiStart] {tid1}({mac1}): result={mret.get(mac1)}, isDataTransfering={s1.isDataTransfering}", flush=True)
-        print(f"[multiStart] {tid2}({mac2}): result={mret.get(mac2)}, isDataTransfering={s2.isDataTransfering}", flush=True)
+        print(f"[multiStart] {tid1}({mac1}): result={r1}, isDataTransfering={s1.isDataTransfering}", flush=True)
+        print(f"[multiStart] {tid2}({mac2}): result={r2}, isDataTransfering={s2.isDataTransfering}", flush=True)
 
     # 观察 multiStart 期间/之后数据是否真的在传（区分「返回 False 但数据在传」vs「真没起流」）
     after = dict(collector.batch_counts)
