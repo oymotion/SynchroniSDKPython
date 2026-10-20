@@ -21,10 +21,10 @@
 | 陀螺仪 GYRO | `GyroChannelCount > 0` | 支持 | 适用 |
 | 欧拉角 Euler | `EulerChannelCount > 0` | 支持 | 适用 |
 | 四元数 Quat | `QuatChannelCount > 0` | 支持 | 适用 |
-| 聚合 IMU（`NTF_IMU`） | `ImuChannelCount > 0` | 不支持（仅新 EMG） | 待确认 |
-| 磁角度 MAG_ANGLE | `MagAngleChannelCount > 0` | 腕带通常无 | 待确认 |
-| 阻抗 IMPEDANCE | `ImpeChannelCount > 0` | 腕带通常无 | 待确认 |
-| EEG/ECG/PPG/SpO2/BRTH | 对应 `ChannelCount > 0` | 腕带通常无 | 待确认 |
+| 聚合 IMU（`NTF_IMU`） | `ImuChannelCount > 0` | 支持（13 通道 acc3+gyro3+euler3+quat4） | 适用 |
+| 磁角度 MAG_ANGLE | `MagAngleChannelCount > 0` | 不支持（无磁力计） | 不支持 |
+| 阻抗 IMPEDANCE | `ImpeChannelCount > 0` | 支持（8 通道电极接触检测） | 适用 |
+| EEG/ECG/PPG/SpO2/BRTH | 对应 `ChannelCount > 0` | 不支持（0） | 不支持 |
 
 > “待确认”项不省略，执行时以 `getDeviceInfo()` 为准：字段 `>0` 才执行对应用例，否则记录“设备不支持，跳过”。
 
