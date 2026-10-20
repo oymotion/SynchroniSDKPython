@@ -16,7 +16,7 @@
 
 说明：
   SDK 1.3.0 已文档化 IMU_SAMPLE_RATE / PPG_SAMPLE_RATE / EMG_RESOLUTION 及各自 _LIST
-  查询键。这些键按设备能力门控：gForceUltra 有 IMU（NTF_IMU/NTF_GFORCE_*），PPG 按
+  查询键。这些键按设备能力门控：gForceUltra 有 IMU（NTF_IMU 聚合流），PPG 按
   PpgChannelCount 判定，EMG_RESOLUTION 仅 legacy RAW-signal EMG（新 EMG 预期 Error/空）。
   因此本用例不做"必须返回有效值"的硬断言，只验证查询接口正确返回（不崩溃）且返回值
   属于"有效值 或 Error 开头/空"两种合法形态之一；能力形态另作 informational 输出。

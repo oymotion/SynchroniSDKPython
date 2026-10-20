@@ -6,7 +6,7 @@
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 对代表性 NTF_*/FILTER_* 键（NTF_EMG/NTF_GEST/NTF_IMU/NTF_GFORCE_ACC/
+  2) 对代表性 NTF_*/FILTER_* 键（NTF_EMG/NTF_GEST/NTF_IMU/
      FILTER_50HZ/FILTER_LPF）逐一传非法 value：
      - 空串 ""
      - 非 ON/OFF（"INVALID"）
@@ -38,7 +38,7 @@ import config
 import common
 from common import record, scan_and_match
 
-TEST_KEYS = ["NTF_EMG", "NTF_GEST", "NTF_IMU", "NTF_GFORCE_ACC", "FILTER_50HZ", "FILTER_LPF"]
+TEST_KEYS = ["NTF_EMG", "NTF_GEST", "NTF_IMU", "FILTER_50HZ", "FILTER_LPF"]
 
 # 非法 value 列表：(显示名, 实际值)
 INVALID_VALUES = [

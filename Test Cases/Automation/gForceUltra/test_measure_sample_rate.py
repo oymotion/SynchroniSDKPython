@@ -7,7 +7,7 @@
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) 读取 device_specs/gforce_ultra.py 的 spec["sample_rates"]
   3) 一次把全部待测流 setParam("NTF_XXX","ON")，跨会话保持 ON
-  4) 会话数 = 所有「可设置」流里 rates 数量最多的那个；每会话只设「还没测完」的档
+  4) 会话数 = 所有「可设置」流里 rates 数量最多的那个；每会话只设「还没测完」的档（从最高档倒序对齐）
   5) 每会话：setParam 新档 -> 静置 -> 起流 -> 等首批 -> 预热 -> 正式采集 MEASURE_SECONDS 秒
      -> 停流 -> 对本次新设档的流（+第 0 次会话的固定流）按 DataType 分桶统计
   6) 实际采样率 = 唯一样本数 / host 精确窗口（t_end - t_start）；与标称比对
@@ -15,8 +15,10 @@
 要点：
   - 采样率来源统一为 spec["sample_rates"]（含固定 1Hz 的 IMPEDANCE），脚本不硬编码。
   - stream 既是 setParam("NTF_XXX","ON") 开关 key，也是 DataType.NTF_XXX 类型名。
+  - 聚合流：spec 中带 sub_streams 的条目（如 IMU）无独立 DataType，数据按多路子流投递，
+    脚本按 sub_streams 合并统计（unique 取全局首末不重复计数，通道数求和）。
   - 多流并测：所有流全程 ON，同一次起流里各 DataType 同时到达，用多路分桶一起统计。
-  - 只设没测的档：某流 i >= len(rates) 时不再 setParam 采样率（流仍保持 ON 在流），
+  - 只设没测的档（从最高档倒序对齐）：某流 i >= len(rates) 时不再 setParam 采样率（流仍保持 ON 在流），
     只对本次新设档的流出结果；固定流只在第 0 次会话测一次。
   - 起流后先预热 10s（丢弃起流初期不稳定样本），再正式计数。
   - 去重口径：unique = max_sample_index - min_sample_index + 1（通道0 sampleIndex 首末跨度）。
@@ -163,14 +165,50 @@ class RateCollector:
             if batch_min is not None:
                 s["timeline"].append((now, batch_min, batch_max))
 
-    def result_for(self, dt):
+    def _merged_stats(self, dts):
+        """返回单个 DataType 或 DataType 列表合并后的统计 dict；无数据返回 None。
+
+        聚合语义（IMU 用）：多路子流共享同一采样时钟/样本索引，合并时对 sampleIndex 取
+        全局首末（unique 不重复计数），delivered/channel_count 求和，timeline 合并后按到达时刻排序。
+        """
+        if not isinstance(dts, (list, tuple)):
+            return self.stats.get(dts)
+        subs = [self.stats.get(dt) for dt in dts if self.stats.get(dt)]
+        if not subs:
+            return None
+        merged = {
+            "delivered": 0, "channel_count": 0,
+            "first_ts": None, "last_ts": None,
+            "min_idx": None, "max_idx": None,
+            "min_abs_ts": None, "max_abs_ts": None,
+            "timeline": [],
+        }
+        for s in subs:
+            merged["delivered"] += s["delivered"]
+            merged["channel_count"] += s["channel_count"]
+            if s["first_ts"] is not None and (merged["first_ts"] is None or s["first_ts"] < merged["first_ts"]):
+                merged["first_ts"] = s["first_ts"]
+            if s["last_ts"] is not None and (merged["last_ts"] is None or s["last_ts"] > merged["last_ts"]):
+                merged["last_ts"] = s["last_ts"]
+            if s["min_idx"] is not None and (merged["min_idx"] is None or s["min_idx"] < merged["min_idx"]):
+                merged["min_idx"] = s["min_idx"]
+                merged["min_abs_ts"] = s["min_abs_ts"]
+            if s["max_idx"] is not None and (merged["max_idx"] is None or s["max_idx"] > merged["max_idx"]):
+                merged["max_idx"] = s["max_idx"]
+                merged["max_abs_ts"] = s["max_abs_ts"]
+            merged["timeline"].extend(s["timeline"])
+        merged["timeline"].sort(key=lambda t: t[0])
+        return merged
+
+    def result_for(self, dts):
         """返回 (unique, dur_host, dur_abs, delivered, channel_count)；无数据返回 (0, 0.0, 0.0, 0, 0)。
 
+        dts : 单个 DataType，或 DataType 列表（聚合流）。
         dur_host : host 侧数据到达首末时刻差（last_ts - first_ts），受 BLE 传输/缓冲影响会偏小。
         dur_abs  : 设备端采样时刻差（max_abs_ts - min_abs_ts），与 sampleIndex 严格对齐；
                    当 absTimeStampInSec 未知（起流锚点未建立）时为 0。
         """
-        s = self.stats.get(dt)
+        s = self._merged_stats(dts)
         if not s:
             return 0, 0.0, 0.0, 0, 0
         unique = 0
@@ -185,14 +223,15 @@ class RateCollector:
             dur_abs = s["max_abs_ts"] - s["min_abs_ts"]
         return unique, dur_host, dur_abs, s["delivered"], s["channel_count"]
 
-    def minute_rates(self, dt, t_start, t_end, window=60.0):
+    def minute_rates(self, dts, t_start, t_end, window=60.0):
         """按 window 秒切分 timeline，返回每段采样率数组（unique / 窗口时长）。
 
         仅在采集结束后调用（timeline 在采集阶段只做轻量 append，不影响采样）。
         分母用 host 窗口（方案 A：host NTP 墙钟作参考，量设备采样时钟相对 host 的漂移）；
         无数据的段记为 0.0，用于暴露断流/静默断流。
+        dts : 单个 DataType 或 DataType 列表（聚合流）。
         """
-        s = self.stats.get(dt)
+        s = self._merged_stats(dts)
         if not s or not s["timeline"]:
             return []
         tl = s["timeline"]
@@ -283,9 +322,13 @@ class SessionMonitor:
             pass
 
 
-def _mk(key, rate, stream, co_stream=None):
+def _mk(key, rate, stream, co_stream=None, sub_streams=None):
     dt_type = getattr(DataType, stream, None) if stream else None
     label_stream = stream or key
+    sub_dt_types = None
+    if sub_streams:
+        sub_dt_types = [getattr(DataType, s, None) for s in sub_streams]
+        sub_dt_types = [d for d in sub_dt_types if d is not None] or None
     return {
         "key": key,
         "rate": str(rate),
@@ -294,13 +337,15 @@ def _mk(key, rate, stream, co_stream=None):
         "co_stream": co_stream,   # 伴随流（随主流量打包投递）非 None；其设备时间戳不可信
         "label": f"{label_stream}@{rate}",
         "dt_type": dt_type,
+        "sub_dt_types": sub_dt_types,  # 聚合流：无 NTF_IMU 独立类型时，按多路 DataType 聚合统计
     }
 
 
 def _schedule(sample_rates):
     """把 sample_rates 编排成若干会话，返回 (sessions, fixed_items)。
 
-    sessions    : list[list[dict]]，每会话为需 setParam 的档（settable 且 i < len(rates)）。
+    sessions    : list[list[dict]]，每会话为需 setParam 的档（settable 且 i < len(rates)，
+                  第 i 会话取各流倒数第 i 档 rates[-(i+1)]，即从最高档倒序对齐）。
     fixed_items : list[dict]，固定采样率流（仅第 0 次会话测）。
     """
     settable = [(k, e) for k, e in sample_rates.items() if e.get("settable", True)]
@@ -316,13 +361,14 @@ def _schedule(sample_rates):
         for key, entry in settable:
             rates = entry.get("rates", [])
             if i < len(rates):
-                items.append(_mk(key, rates[i], entry.get("stream"), entry.get("co_stream")))
+                # 从最高档开始倒序对齐：第 i 会话取各流倒数第 i 档，满负荷优先暴露性能问题
+                items.append(_mk(key, rates[-(i + 1)], entry.get("stream"), entry.get("co_stream"), entry.get("sub_streams")))
         sessions.append(items)
 
     fixed_items = []
     for key, entry in fixed:
         rates = entry.get("rates", ["1"])
-        it = _mk(key, rates[0], entry.get("stream"), entry.get("co_stream"))
+        it = _mk(key, rates[0], entry.get("stream"), entry.get("co_stream"), entry.get("sub_streams"))
         it["fixed"] = True
         fixed_items.append(it)
 
@@ -626,7 +672,8 @@ def main():
         #   测不出真实偏差），故只作「固件自报」对比，不参与主判定。
         session_rates = {}  # stream -> (actual, expected, unique)，用于本会话两流相对时钟偏移
         for it in ok_targets:
-            unique, dur_host, dur_abs, delivered, ch = collector.result_for(it["dt_type"])
+            dt_key = it["sub_dt_types"] if it.get("sub_dt_types") else it["dt_type"]
+            unique, dur_host, dur_abs, delivered, ch = collector.result_for(dt_key)
             if unique <= 0:
                 summaries.append((it["label"], None, f"未收到 {it['stream']} 数据（唯一样本={unique}）"))
                 continue
@@ -647,7 +694,7 @@ def main():
             if extra:
                 print("      [口径] " + " | ".join(extra), flush=True)
             # 分段漂移趋势（方案 A：host NTP 墙钟作参考，逐分钟看速率漂移）
-            minute_arr = collector.minute_rates(it["dt_type"], t_start, t_end)
+            minute_arr = collector.minute_rates(dt_key, t_start, t_end)
             print(f"      [分段/分钟] {minute_arr}", flush=True)
             # 独立漂移指标：斜率 / 首尾差 / 峰峰抖动
             drift = collector.drift_metrics(minute_arr)

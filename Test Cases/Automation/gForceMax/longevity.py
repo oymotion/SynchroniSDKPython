@@ -485,16 +485,23 @@ def main():
 
     sensor.onPowerChanged = on_power_changed
 
-    # 错误回调：设备断连/异常时立即打印 + 写 SDK 错误日志（不等下一轮 60s 轮询）
+    # 错误回调：区分「丢包告警(LOST SAMPLE)」与「真断连」，分别打印 + 写日志（不等下一轮 60s 轮询）
     def on_error(sensor, reason):
         name = getattr(getattr(sensor, 'BLEDevice', None), 'Name', '?')
         addr = getattr(getattr(sensor, 'BLEDevice', None), 'Address', '?')
-        msg = f"设备异常/断连: {name} {addr} reason={reason}"
-        print(f"\n[ERROR] {msg}", flush=True)
+        reason_s = str(reason)
+        if "LOST SAMPLE" in reason_s.upper():
+            msg = f"丢包告警: {name} {addr} reason={reason}"
+            level = "W"
+            print(f"\n[丢包] {msg}", flush=True)
+        else:
+            msg = f"设备异常/断连: {name} {addr} reason={reason}"
+            level = "E"
+            print(f"\n[ERROR] {msg}", flush=True)
         try:
-            ctrl.log(f"[Longevity] {msg}", "E")
+            ctrl.log(f"[Longevity] {msg}", level)
         except Exception as e:
-            print(f"[ERROR] ctrl.log 写错误日志抛异常 {type(e).__name__}: {e}", flush=True)
+            print(f"[ERROR] ctrl.log 写日志抛异常 {type(e).__name__}: {e}", flush=True)
 
     sensor.onErrorCallback = on_error
 

@@ -17,14 +17,14 @@
   NTF_EMG                "NTF_EMG"           EmgChannelCount=8     5s
   NTF_GEST               "NTF_GEST"          EmgChannelCount=8     5s（DeviceInfo 无独立 GEST 标称值）
   NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount=8    25s（1Hz，需较长采集）
-  NTF_ACC/GYRO           "NTF_IMU"           ImuChannelCount=6     5s（6 轴 IMU 二路独立投递）
+  NTF_IMU                "NTF_IMU"           ImuChannelCount=13    5s（13 轴 IMU 聚合流）
 
 说明：
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
   - IMPEDANCE 采样率 1Hz，packageSampleCount=20 约需 20s 凑满一批，故采集 25s。
-  - gForceUltra 的 6 轴 IMU 不以 NTF_IMU(0x13) 聚合流投递，而是拆成 2 路独立 DataType
-    （NTF_ACC/NTF_GYRO）分别投递，无欧拉/四元数；开关仍用 "NTF_IMU" 打开，
-    DeviceInfo 仍以 ImuChannelCount=6 描述 6 轴 IMU 能力。故本条按这 2 路独立类型聚合断言，
+  - gForceUltra 最新固件（与 gForceMax 同源）的 13 轴 IMU 以 NTF_IMU(0x13) 聚合流投递
+    （acc3+gyro3+euler3+quat4），不再拆成 NTF_ACC/NTF_GYRO 二路独立投递；
+    无欧拉/四元数独立开关，统一由 "NTF_IMU" 打开，DeviceInfo 以 ImuChannelCount=13 描述能力，
     通道布局细节见 DATA-FUNC-010。
 
 前置条件：
@@ -55,7 +55,7 @@ def _dt_name(dt):
 
 
 # (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 断言类型列表)
-# 断言类型列表非 None 时按这些类型聚合统计样本（gForceUltra 的 6 轴 IMU 二路独立投递时用）
+# 断言类型列表非 None 时按这些类型聚合统计样本；gForceUltra 现为 NTF_IMU 单一聚合流，故为 None
 MODALITIES = [
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
      "请用力握拳或绷紧被测部位肌肉，让 EMG 产生信号", 5, None),
@@ -64,8 +64,7 @@ MODALITIES = [
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
      "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25, None),
     ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
-     "请晃动/旋转腕带，让 6 轴 IMU（acc+gyro）产生变化", 5,
-     [DataType.NTF_ACC, DataType.NTF_GYRO]),
+     "请晃动/旋转腕带，让 13 轴 IMU（acc+gyro+euler+quat）产生变化", 5, None),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名
@@ -292,7 +291,7 @@ def main():
         except Exception:
             pass
 
-        # 统计该模态数据：assert_types 非 None 时按多类型聚合（gForceUltra 的 6 轴 IMU 二路独立投递）
+        # 统计该模态数据：assert_types 非 None 时按多类型聚合（当前 gForceUltra 各模态均为单一类型）
         if assert_types:
             samples = sum(collector.by_type.get(t, {}).get('samples', 0) for t in assert_types)
             batches = sum(collector.by_type.get(t, {}).get('batches', 0) for t in assert_types)

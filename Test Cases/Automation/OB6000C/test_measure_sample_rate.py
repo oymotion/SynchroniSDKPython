@@ -7,7 +7,7 @@
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) 读取 device_specs/ob6000c.py 的 spec["sample_rates"]
   3) 一次把全部待测流 setParam("NTF_XXX","ON")，跨会话保持 ON
-  4) 会话数 = 所有「可设置」流里 rates 数量最多的那个；每会话只设「还没测完」的档
+  4) 会话数 = 所有「可设置」流里 rates 数量最多的那个；每会话只设「还没测完」的档（从最高档倒序对齐）
   5) 每会话：setParam 新档 -> 静置 -> 起流 -> 等首批 -> 预热 -> 正式采集 MEASURE_SECONDS 秒
      -> 停流 -> 对本次新设档的流（+第 0 次会话的固定流）按 DataType 分桶统计
   6) 实际采样率 = 唯一样本数 / 该流首末样本到达时长；与标称比对
@@ -16,7 +16,7 @@
   - 采样率来源统一为 spec["sample_rates"]（含固定 1Hz 的 IMPEDANCE），脚本不硬编码。
   - stream 既是 setParam("NTF_XXX","ON") 开关 key，也是 DataType.NTF_XXX 类型名。
   - 多流并测：所有流全程 ON，同一次起流里各 DataType 同时到达，用多路分桶一起统计。
-  - 只设没测的档：某流 i >= len(rates) 时不再 setParam 采样率（流仍保持 ON 在流），
+  - 只设没测的档（从最高档倒序对齐）：某流 i >= len(rates) 时不再 setParam 采样率（流仍保持 ON 在流），
     只对本次新设档的流出结果；固定流只在第 0 次会话测一次。
   - 起流后先预热 10s（丢弃起流初期不稳定样本），再正式计数。
   - 去重口径：unique = max_sample_index - min_sample_index + 1（通道0 sampleIndex 首末跨度）。
@@ -160,7 +160,8 @@ def _mk(key, rate, stream):
 def _schedule(sample_rates):
     """把 sample_rates 编排成若干会话，返回 (sessions, fixed_items)。
 
-    sessions    : list[list[dict]]，每会话为需 setParam 的档（settable 且 i < len(rates)）。
+    sessions    : list[list[dict]]，每会话为需 setParam 的档（settable 且 i < len(rates)，
+                  第 i 会话取各流倒数第 i 档 rates[-(i+1)]，即从最高档倒序对齐）。
     fixed_items : list[dict]，固定采样率流（仅第 0 次会话测）。
     """
     settable = [(k, e) for k, e in sample_rates.items() if e.get("settable", True)]
@@ -176,7 +177,8 @@ def _schedule(sample_rates):
         for key, entry in settable:
             rates = entry.get("rates", [])
             if i < len(rates):
-                items.append(_mk(key, rates[i], entry.get("stream")))
+                # 从最高档开始倒序对齐：第 i 会话取各流倒数第 i 档，满负荷优先暴露性能问题
+                items.append(_mk(key, rates[-(i + 1)], entry.get("stream")))
         sessions.append(items)
 
     fixed_items = []

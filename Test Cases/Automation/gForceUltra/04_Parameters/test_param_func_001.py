@@ -6,15 +6,18 @@
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 对每个 NTF_* 键逐一 setParam("ON")/setParam("OFF")，校验返回 "OK"
+  2) 对每个适用 NTF_* 键逐一 setParam("ON")/setParam("OFF")，校验返回 "OK"
      且 getParam("NTF") 中对应键状态一致（ON 后为 ON，OFF 后为 OFF）
-  3) NTF_MAG_ANGLE / NTF_SPO2 / NTF_PPG / NTF_PPG_RAW 按 DeviceInfo 对应
+  3) NTF_GFORCE_ACC/GYRO/EULER/QUAT 无独立开关（getParam 返回 Error），记录"不适用"
+  4) NTF_MAG_ANGLE / NTF_SPO2 / NTF_PPG / NTF_PPG_RAW 按 DeviceInfo 对应
      ChannelCount 判定：>0 测，==0 记录"不适用，跳过"
 
 说明：
   NTF_PPG_RAW 是 NTF_PPG 的别名（README），getParam("NTF") 核对时统一查
   NTF_PPG 键。getParam("NTF") 返回 pipe 分隔串 "KEY|VALUE|KEY|VALUE|..."。
-  gForceUltra 为传统腕带，EmgChannelCount>0；MAG_ANGLE/SPO2/PPG 通常为 0，跳过。
+  gForceUltra 最新固件（与 gForceMax 同源）无 NTF_GFORCE_* 独立开关，
+  acc/gyro/euler/quat 打包进 NTF_IMU 聚合流，故这四键记录"不适用"。
+  MAG_ANGLE/SPO2/PPG 通常为 0，跳过。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -48,15 +51,17 @@ def _parse_pipe(s):
 
 
 # 每个待测 NTF 键：need_field 为 None 表示无条件测；否则按 DeviceInfo 字段判定
-# get_key 为 getParam("NTF") 中用于核对的键（NTF_PPG_RAW 是 NTF_PPG 的别名）。
+# unapplicable=True 表示该 key 无独立开关（gForceUltra 最新固件无 NTF_GFORCE_* 开关），
+# 不测、直接记录"不适用"。get_key 为 getParam("NTF") 中用于核对的键
+# （NTF_PPG_RAW 是 NTF_PPG 的别名）。
 KEY_SPECS = [
     {"key": "NTF_EMG", "need_field": None, "get_key": "NTF_EMG"},
     {"key": "NTF_GEST", "need_field": None, "get_key": "NTF_GEST"},
     {"key": "NTF_IMU", "need_field": None, "get_key": "NTF_IMU"},
-    {"key": "NTF_GFORCE_ACC", "need_field": None, "get_key": "NTF_GFORCE_ACC"},
-    {"key": "NTF_GFORCE_GYRO", "need_field": None, "get_key": "NTF_GFORCE_GYRO"},
-    {"key": "NTF_GFORCE_EULER", "need_field": None, "get_key": "NTF_GFORCE_EULER"},
-    {"key": "NTF_GFORCE_QUAT", "need_field": None, "get_key": "NTF_GFORCE_QUAT"},
+    {"key": "NTF_GFORCE_ACC", "need_field": None, "get_key": "NTF_GFORCE_ACC", "unapplicable": True},
+    {"key": "NTF_GFORCE_GYRO", "need_field": None, "get_key": "NTF_GFORCE_GYRO", "unapplicable": True},
+    {"key": "NTF_GFORCE_EULER", "need_field": None, "get_key": "NTF_GFORCE_EULER", "unapplicable": True},
+    {"key": "NTF_GFORCE_QUAT", "need_field": None, "get_key": "NTF_GFORCE_QUAT", "unapplicable": True},
     {"key": "NTF_MAG_ANGLE", "need_field": "MagAngleChannelCount", "get_key": "NTF_MAG_ANGLE"},
     {"key": "NTF_SPO2", "need_field": "Spo2ChannelCount", "get_key": "NTF_SPO2"},
     {"key": "NTF_PPG", "need_field": "PpgChannelCount", "get_key": "NTF_PPG"},
@@ -178,6 +183,13 @@ def main():
         key = spec["key"]
         get_key = spec["get_key"]
         need_field = spec["need_field"]
+
+        # 无独立开关的 key（gForceUltra 最新固件无 NTF_GFORCE_* 开关），直接记录不适用
+        if spec.get("unapplicable", False):
+            print(f"[SKIP] {key}：无独立开关（getParam 返回 Error），记录不适用", flush=True)
+            record(results, f"{key} ON/OFF 返回 OK 且 getParam 一致", None,
+                   f"存在 {key} 独立开关时校验", "无独立开关，不适用")
+            continue
 
         # 能力判定
         if need_field is not None:

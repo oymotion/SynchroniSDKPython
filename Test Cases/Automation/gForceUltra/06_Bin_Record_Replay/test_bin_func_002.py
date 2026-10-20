@@ -378,6 +378,10 @@ def main():
                 st = (spec.get("streams") or {}).get(sk)
                 if not st:
                     continue
+                # supported=False 表示无独立流（channels=0 意为打包进 NTF_IMU 聚合流，
+                # 不是该 ChannelCount 字段应为 0），不参与通道数比对
+                if st.get("supported") is False:
+                    continue
                 expect = st.get("channels")
                 actual = di.get(bk)
                 if actual != expect:

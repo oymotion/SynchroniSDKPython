@@ -38,8 +38,8 @@ import common
 from common import _identity_of, match_target, resolve_target_identity
 
 MAX_ROUNDS = 50          # 共跑 50 轮
-STREAM_SECONDS = 90     # 每轮起流时长 90 秒
-CHECK_INTERVAL = 30      # 每 30 秒输出一次电量
+STREAM_SECONDS = 40     # 每轮起流时长 40 秒
+CHECK_INTERVAL = 20      # 每 20 秒输出一次电量
 CONNECT_RETRIES = 5      # connect 重试次数（针对「连上即断」的复位循环）
 CONNECT_RETRY_WAIT = 5   # connect 重试间隔（秒），给设备重启/恢复留时间
 CMD_STALL_THRESHOLD = 3.0   # 命令通道停滞阈值（秒）：SDK 内部每秒轮询电量触发 onPowerChanged，超过此值未回调即命令通道异常

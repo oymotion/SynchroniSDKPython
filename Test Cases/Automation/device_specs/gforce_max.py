@@ -88,6 +88,9 @@ SPEC = {
         "IMU_SAMPLE_RATE": {
             "rates": ["50", "100", "200"], "default": "50",   # 默认待确认（probe 观察到当前 getParam=200，可能非上电默认）
             "stream": "NTF_IMU", "settable": True, "co_stream": None,
+            # 固件无 NTF_IMU 独立数据类型：IMU 数据按 acc/gyro/euler/quat 四路 DataType 投递，
+            # 采样率统计需聚合这四路（与 DeviceInfo.ImuChannelCount=13 一致）。
+            "sub_streams": ["NTF_ACC", "NTF_GYRO", "NTF_EULER_DATA", "NTF_QUATERNION"],
         },
         "IMPEDANCE": {
             "rates": ["1"], "default": "1",

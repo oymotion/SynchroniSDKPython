@@ -7,46 +7,63 @@
 同一型号（name_prefix == "gForceUltra"）的多台设备共用本文件，
 通过 config.MODEL_SPEC 映射、common.load_spec() 读取，无需逐次确认。
 
-数据来源（实测固化，2026-09-14，设备 80E1，probe_device_info.py dump）：
-  - ModelName = 'gForceUltra'，Hardware 1.40，Firmware V1.0.8_2026-09-04_6302890
+数据来源（最新固件，与 gForceMax 同源，能力对齐 gforce_max.py）：
+  - ModelName = 'gForceUltra'（gForceMax 固件亦上报此名，仅广播名区分）
   - EmgChannelCount = 8；ImpeChannelCount = 8（8 电极接触检测）
-  - AccChannelCount = 3；GyroChannelCount = 3；ImuChannelCount = 6（acc3+gyro3，6 轴聚合）
-  - Ppg/Spo2/Eeg/Ecg/Brth/MagAngle/Euler/Quat ChannelCount = 0（不支持）
+  - AccChannelCount = 3；GyroChannelCount = 3；EulerChannelCount = 3；QuatChannelCount = 4
+  - ImuChannelCount = 13（acc3+gyro3+euler3+quat4 聚合）
+  - Ppg/Spo2/Eeg/Ecg/Brth/MagAngle ChannelCount = 0（不支持）
   - EMG_SAMPLE_RATE_LIST = 500|1000，上电默认 1000（EmgMaxSampleRate=1000）
-  - IMU_SAMPLE_RATE_LIST = 50（仅 50Hz 一档）
-  - 采样率 key 均可 getParam/setParam（见 examples/SynchroniSDKPython_DemoNewMulti.py）
+  - IMU_SAMPLE_RATE_LIST = 50|100|200（三档）
+
+关键差异（相对旧固件 V1.0.8）：
+  - 无 NTF_GFORCE_ACC/GYRO/EULER/QUAT 独立开关（getParam 全部 Error: Not supported），
+    acc/gyro/euler/quat 统一打包进 NTF_IMU 聚合流（13 通道，单一开关）。
+  - 新增欧拉角（EulerChannelCount=3）与四元数（QuatChannelCount=4）。
+  - IMU 采样率三档 50/100/200（旧固件固定 50）。
 
 关键判定口径：
-  getParam('NTF_XXX') 对几乎全部 key 都返回 'ON'（仅 NTF_PPG_RAW 返回 Error），
-  但 'ON' 只表示参数开关被设备接受，不等于该流有数据。
-  本文件以 DeviceInfo 的 ChannelCount 为准：ChannelCount > 0 才算支持。
+  getParam('NTF_XXX') 对部分 key 返回 'ON'，但 'ON' 只表示参数开关被设备接受，
+  不等于该流有数据。本文件以 DeviceInfo 的 ChannelCount 为准：ChannelCount > 0 才算支持。
 """
 
 SPEC = {
     # ===== 身份 =====
     "model": "gForceUltra",
-    "type": "EMG 腕带（8 通道肌电 + 手势识别 + 6 轴 IMU + 8 通道电极接触检测）",
+    "type": "EMG 腕带（8 通道肌电 + 手势识别 + 13 通道 IMU[acc3+gyro3+euler3+quat4] + 8 通道电极接触检测）",
     "name_prefix": "gForceUltra",
 
     # ===== 数据流能力（对应 DeviceInfo 的 ChannelCount 期望）=====
     # supported=True 表示该数据流应存在并产出数据；channels 为期望通道数。
     # supported=False 表示该数据流不应存在（DeviceInfo 对应 ChannelCount==0，
-    #   起流后也不应收到该 DataType 数据）。
+    #   或该流无独立开关、被打包进其它聚合流）。
+    # 注意：gForceUltra 最新固件的 NTF_GFORCE_* 无独立开关（getParam 返回 Error），
+    #   acc/gyro/euler/quat 能力见 imu_sub_channels，统一由 NTF_IMU 控制。
     "streams": {
         "NTF_EMG":          {"supported": True,  "channels": 8},   # 8 通道干电极肌电
         "NTF_GEST":         {"supported": True,  "channels": 1},   # 手势 ID（单值流）
-        "NTF_GFORCE_ACC":   {"supported": True,  "channels": 3},   # 加速度 3 轴
-        "NTF_GFORCE_GYRO":  {"supported": True,  "channels": 3},   # 陀螺仪 3 轴
-        "NTF_GFORCE_EULER": {"supported": False, "channels": 0},   # 6 轴 IMU 无欧拉角输出
-        "NTF_GFORCE_QUAT":  {"supported": False, "channels": 0},   # 6 轴 IMU 无四元数输出
-        "NTF_IMU":          {"supported": True,  "channels": 6},   # ImuChannelCount=6（acc3+gyro3 聚合）
-        "NTF_MAG_ANGLE":    {"supported": False, "channels": 0},   # 6 轴 IMU 无磁力计
+        "NTF_GFORCE_ACC":   {"supported": False, "channels": 0},   # 无独立开关（acc 打包进 NTF_IMU）
+        "NTF_GFORCE_GYRO":  {"supported": False, "channels": 0},   # 无独立开关（gyro 打包进 NTF_IMU）
+        "NTF_GFORCE_EULER": {"supported": False, "channels": 0},   # 无独立开关（euler 打包进 NTF_IMU）
+        "NTF_GFORCE_QUAT":  {"supported": False, "channels": 0},   # 无独立开关（quat 打包进 NTF_IMU）
+        "NTF_IMU":          {"supported": True,  "channels": 13},  # ImuChannelCount=13（acc3+gyro3+euler3+quat4 聚合）
+        "NTF_MAG_ANGLE":    {"supported": False, "channels": 0},   # 无磁力计
         "NTF_IMPEDANCE":    {"supported": True,  "channels": 8},   # ImpeChannelCount=8（电极接触检测，固定 1Hz，见 sample_rates.IMPEDANCE）
         "NTF_EEG":          {"supported": False, "channels": 0},   # 腕带无 EEG
         "NTF_ECG":          {"supported": False, "channels": 0},   # 腕带无 ECG
         "NTF_BRTH":         {"supported": False, "channels": 0},   # 腕带无呼吸
         "NTF_PPG":          {"supported": False, "channels": 0},   # 腕带无 PPG（NTF_PPG_RAW 为其别名）
         "NTF_SPO2":         {"supported": False, "channels": 0},   # 腕带无 SpO2
+    },
+
+    # ===== NTF_IMU 聚合流的子通道组成（无独立开关，统一由 NTF_IMU 控制）=====
+    # 最新固件把 IMU 从 6 轴扩到 13 轴（新增欧拉角 3 轴 + 四元数 4 分量），
+    # 但只有一个 NTF_IMU 开关（与 gForceMax 一致）。
+    "imu_sub_channels": {
+        "AccChannelCount":   3,   # 加速度 3 轴
+        "GyroChannelCount":  3,   # 陀螺仪 3 轴
+        "EulerChannelCount": 3,   # 欧拉角 3 轴（最新固件新增）
+        "QuatChannelCount":  4,   # 四元数 4 分量（最新固件新增）
     },
 
     # ===== 滤波开关（FILTER_* 支持 ON/OFF）=====
@@ -68,8 +85,11 @@ SPEC = {
             "stream": "NTF_EMG", "settable": True, "co_stream": None,
         },
         "IMU_SAMPLE_RATE": {
-            "rates": ["50"], "default": "50",
-            "stream": "NTF_IMU", "settable": True, "co_stream": "NTF_EMG",
+            "rates": ["50", "100", "200"], "default": "50",   # 默认待确认（probe 观察到当前 getParam 可能非上电默认）
+            "stream": "NTF_IMU", "settable": True, "co_stream": None,
+            # 新固件无 NTF_IMU 独立数据类型：IMU 数据按 acc/gyro/euler/quat 四路 DataType 投递，
+            # 采样率统计需聚合这四路（与 DeviceInfo.ImuChannelCount=13 一致）。
+            "sub_streams": ["NTF_ACC", "NTF_GYRO", "NTF_EULER_DATA", "NTF_QUATERNION"],
         },
         "IMPEDANCE": {
             "rates": ["1"], "default": "1",
