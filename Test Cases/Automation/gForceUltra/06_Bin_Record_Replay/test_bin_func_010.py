@@ -333,6 +333,17 @@ def main():
                "所有成员非 None",
                f"None 成员 {sum(1 for r in results_list if r is None)}/{len(results_list)}")
 
+    # 1.3.9 的 multiReplayBinFile(block=True) 与 replayBinFile 一样，会因
+    # sensor_controller._async_wait_replay_done 里 `if not isDataTransfering: return`
+    # （回放 profile 该 flag 恒 False）而立即返回，回放引擎在原生层后台异步泵数据。
+    # 故返回后不能马上统计，须主动等各成员 onData 流入，避免读到 count=0 就 terminate。
+    _flow_timeout = 20.0
+    _flow_deadline = time.time() + _flow_timeout
+    while time.time() < _flow_deadline:
+        if all(counter.snapshot(mac)[0] > 0 for _, mac, _, _ in members):
+            break
+        time.sleep(0.2)
+
     # 各成员产生数据
     print("\n[校验] 各成员回放数据:", flush=True)
     all_have_data = True

@@ -69,8 +69,12 @@ def main():
     print(f"\n[扫描] SensorController.scan({config.SCAN_TIMEOUT_MS}) ...", flush=True)
     target, devices = scan_and_match(ctrl, scan_ms=config.SCAN_TIMEOUT_MS)
     if target is None:
-        print("[FAIL] 未匹配到 config 中启用的设备（gForceUltra/80F3）", flush=True)
-        record(results, "scan 匹配到目标设备", False, "scan 返回含 gForceUltra", "未匹配到目标")
+        print(f"[FAIL] 未匹配到 config 中启用的设备（TARGET_IDENTITY={config.TARGET_IDENTITY}）", flush=True)
+        if devices:
+            print("[FAIL] 实际扫描到设备：", flush=True)
+            for d in devices:
+                print(f"    Name={getattr(d, 'Name', '?')!r}  Address={getattr(d, 'Address', '?')!r}", flush=True)
+        record(results, "scan 匹配到目标设备", False, f"scan 返回含 identity {config.TARGET_IDENTITY}", "未匹配到目标")
         ctrl.terminate()
         return
 

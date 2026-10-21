@@ -93,7 +93,8 @@ def main():
         mret = None
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    started = isinstance(mret, dict) and all(v is True for v in mret.values())
+    started = isinstance(mret, list) and len(mret) == len(sensors) and \
+        all(isinstance(item, dict) and item.get("ok") is True for item in mret)
     if not started:
         record(results, "multiStart 起流", False, "两台均起流", f"multiStart 返回 {mret}")
         disconnect_all(sensors)
@@ -111,15 +112,17 @@ def main():
         print(f"[multiStop] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     all_stopped = False
-    if isinstance(sret, dict) and len(sret) == len(sensors):
-        all_stopped = all(v is True for v in sret.values())
+    if isinstance(sret, list) and len(sret) == len(sensors):
+        all_stopped = all(isinstance(item, dict) and item.get("ok") is True for item in sret) and \
+                      all(not s.isDataTransfering for s in sensors)
+        for item in sret:
+            print(f"[multiStop] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
         for s in sensors:
-            mac = s.BLEDevice.Address
-            print(f"[multiStop] {mac}: result={sret.get(mac)}, isDataTransfering={s.isDataTransfering}", flush=True)
+            print(f"[multiStop] {s.BLEDevice.Address}: isDataTransfering={s.isDataTransfering}", flush=True)
 
     record(results, "multiStopDataNotification 两台均停流",
            all_stopped,
-           "两台 multiStop 返回均为 True，isDataTransfering==False",
+           "两台 multiStop 返回 ok=True 且 isDataTransfering==False",
            f"multiStop 返回 {sret}")
 
     disconnect_all(sensors)

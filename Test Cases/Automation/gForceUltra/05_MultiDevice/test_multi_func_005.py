@@ -93,15 +93,17 @@ def main():
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     all_started = False
-    if isinstance(mret, dict) and len(mret) == len(sensors):
-        all_started = all(v is True for v in mret.values())
+    if isinstance(mret, list) and len(mret) == len(sensors):
+        all_started = all(isinstance(item, dict) and item.get("ok") is True for item in mret) and \
+                      all(s.isDataTransfering for s in sensors)
+        for item in mret:
+            print(f"[multiStart] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
         for s in sensors:
-            mac = s.BLEDevice.Address
-            print(f"[multiStart] {mac}: result={mret.get(mac)}, isDataTransfering={s.isDataTransfering}", flush=True)
+            print(f"[multiStart] {s.BLEDevice.Address}: isDataTransfering={s.isDataTransfering}", flush=True)
 
     record(results, "maxDelayDispersionMs=-1 两台均起流（不校验时差）",
            all_started,
-           "两台 multiStart 返回均为 True，仅要求首包到达不校验时差",
+           "两台 multiStart 返回 ok=True 且 isDataTransfering==True，仅要求首包到达不校验时差",
            f"multiStart 返回 {mret}")
 
     # 停流

@@ -97,9 +97,10 @@ def main():
         mret = None
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    started = isinstance(mret, dict) and all(v is True for v in mret.values())
+    started = isinstance(mret, list) and len(mret) == len(sensors) and \
+        all(isinstance(item, dict) and item.get("ok") is True for item in mret)
     record(results, "multiStart 两台均起流", started,
-           "两台 multiStart 返回均为 True", f"multiStart 返回 {mret}")
+           "两台 multiStart 返回 ok=True", f"multiStart 返回 {mret}")
 
     if not started:
         disconnect_all(sensors)

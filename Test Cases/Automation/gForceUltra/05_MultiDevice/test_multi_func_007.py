@@ -33,6 +33,49 @@ from multi_common import (
 )
 
 
+def _noop(sensor, data):
+    pass
+
+
+class StreamEvidence:
+    """采集某台设备起流后收到的数据证据，用于证明 restart（先停后起）。
+
+    restart 的可靠证据是流被重新起：
+      - startTimeStamp 更新（新流起流时刻晚于旧流）；
+      - startSampleIndex 回退（新流样本重新编号）。
+    """
+
+    def __init__(self):
+        self.batches = 0
+        self.first_ts = None
+        self.last_ts = None
+        self.min_sidx = None
+        self.max_sidx = None
+
+    def on_data(self, sensor, data):
+        items = data if isinstance(data, list) else [data]
+        for d in items:
+            self.batches += 1
+            try:
+                ts = d.getStartTimeStamp()
+            except Exception:
+                ts = None
+            try:
+                sidx = d.startSampleIndex
+            except Exception:
+                sidx = None
+            if ts:
+                self.first_ts = ts if self.first_ts is None else self.first_ts
+                self.last_ts = ts
+            if sidx is not None:
+                self.min_sidx = sidx if self.min_sidx is None else min(self.min_sidx, sidx)
+                self.max_sidx = sidx if self.max_sidx is None else max(self.max_sidx, sidx)
+
+    def describe(self):
+        return (f"批数={self.batches} startTimeStamp(首/末)={self.first_ts}/{self.last_ts} "
+                f"sampleIndex范围=[{self.min_sidx},{self.max_sidx}]")
+
+
 def main():
     ctrl = SensorControllerInstance
 
@@ -85,9 +128,11 @@ def main():
         return
 
     s1, s2 = sensors[0], sensors[1]
-    tid1, tid2 = matched[0][1], matched[1][1]
+    tid1, tid2 = matched[0][0], matched[1][0]
 
-    # 第一台单独起流
+    # 第一台单独起流，采集旧流证据（用于后续对比 restart）
+    ev1 = StreamEvidence()
+    s1.onDataCallback = ev1.on_data
     print(f"\n[单独起流] {tid1} startDataNotification() ...", flush=True)
     try:
         sret = s1.startDataNotification()
@@ -107,8 +152,13 @@ def main():
     record(results, f"单独起流({tid1})", True,
            "startDataNotification() 返回 True", f"返回 {sret}")
 
-    # 等待一下确保起流稳定
+    # 等待一下确保起流稳定，并采集旧流证据
     time.sleep(2)
+    print(f"[单独起流] {tid1} 旧流证据: {ev1.describe()}", flush=True)
+
+    # multiStart 前解绑采集器，避免旧流尾声污染 restart 证据
+    s1.onDataCallback = _noop
+    s2.onDataCallback = _noop
 
     print(f"\n[multiStart] 对已起流的 {tid1} 和未起流的 {tid2} 执行 multiStart ...", flush=True)
     try:
@@ -118,20 +168,42 @@ def main():
         mret = None
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
+    # multiStart 返回后采集重启后的新流证据
+    ev1_after = StreamEvidence()
+    ev2_after = StreamEvidence()
+    s1.onDataCallback = ev1_after.on_data
+    s2.onDataCallback = ev2_after.on_data
+    time.sleep(2)
+    print(f"[multiStart] {tid1} 新流证据: {ev1_after.describe()}", flush=True)
+    print(f"[multiStart] {tid2} 新流证据: {ev2_after.describe()}", flush=True)
+
     restart_ok = False
-    if isinstance(mret, dict):
-        mac1 = s1.BLEDevice.Address
-        mac2 = s2.BLEDevice.Address
-        s1_ok = mret.get(mac1) is True
-        s2_ok = mret.get(mac2) is True
-        restart_ok = s1_ok and s2_ok
-        print(f"[multiStart] {tid1}({mac1}): result={mret.get(mac1)}, isDataTransfering={s1.isDataTransfering}", flush=True)
-        print(f"[multiStart] {tid2}({mac2}): result={mret.get(mac2)}, isDataTransfering={s2.isDataTransfering}", flush=True)
+    restart_detail = ""
+    if isinstance(mret, list) and len(mret) == len(sensors):
+        all_ok = all(isinstance(item, dict) and item.get("ok") is True for item in mret)
+        s1_transferring = s1.isDataTransfering
+        s2_transferring = s2.isDataTransfering
+        # restart（先停后起）证据：s1 旧流与新流 startTimeStamp 更新 / sampleIndex 回退
+        ts_restarted = (ev1.last_ts is not None and ev1_after.first_ts is not None
+                        and ev1_after.first_ts > ev1.last_ts)
+        sidx_restarted = (ev1.max_sidx is not None and ev1_after.min_sidx is not None
+                          and ev1_after.min_sidx < ev1.max_sidx)
+        restart_evidence = ts_restarted or sidx_restarted
+        restart_ok = all_ok and s1_transferring and s2_transferring and restart_evidence
+        restart_detail = (f"all_ok={all_ok}, s1_isTransferring={s1_transferring}, "
+                          f"s2_isTransferring={s2_transferring}, "
+                          f"startTimeStamp更新={ts_restarted}, sampleIndex回退={sidx_restarted}")
+
+        for item in mret:
+            print(f"[multiStart] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
+        print(f"[multiStart] {tid1}({s1.BLEDevice.Address}): isDataTransfering={s1.isDataTransfering}", flush=True)
+        print(f"[multiStart] {tid2}({s2.BLEDevice.Address}): isDataTransfering={s2.isDataTransfering}", flush=True)
+        print(f"[multiStart] restart 判定: {restart_detail}", flush=True)
 
     record(results, "已起流设备 multiStart 先停后起（restart 语义）",
            restart_ok,
-           "s1（已起流）先停后起，s2（空闲）起流，均成功，无异常",
-           f"multiStart 返回 {mret}")
+           "s1（已起流）先停后起（startTimeStamp 更新或 sampleIndex 回退），s2 起流，均成功",
+           (f"multiStart 返回 {mret}" + (f"；{restart_detail}" if restart_detail else "")))
 
     try:
         ctrl.multiStopDataNotification(sensors)

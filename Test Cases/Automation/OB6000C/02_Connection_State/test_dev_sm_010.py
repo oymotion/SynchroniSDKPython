@@ -15,12 +15,13 @@
   4) connect 到 Ready -> init -> startDataNotification 起流
   5) 人工断电/移出范围 -> 观察断链（Disconnected + onErrorCallback）
   6) 人工恢复供电/移回范围 -> 等待 onAutoReconnect 触发（restore 参数）
-     answer(True) 后观察窗口内确认【跳过默认恢复】（未自动回到 Ready/未自动起流）
+     answer(True) 后观察窗口内确认【跳过默认恢复】（自动重连仍回到 Ready，但未自动起流）
 
-语义说明（来自 examples/SynchroniSDKPython_DemoNewMulti.py）：
-  - onAutoReconnect(sensor, restore, answer) 在自动重连找回设备时触发
-  - answer(True)：由应用接管，SDK 不再执行默认的参数回放恢复
-  - answer(False)：SDK 执行默认恢复（connect -> init -> replay setParam -> startDataNotification）
+语义说明（来自 README 15.1 + examples/SynchroniSDKPython_DemoNewMulti.py）：
+  - onAutoReconnect(sensor, restore, answer) 在自动重连找回设备、已回到 Ready、即将恢复数据流时触发
+  - answer 只控制「是否恢复数据流」，不控制「连接」：连接层自动重连在回调触发前已把设备带回 Ready
+  - answer(True)：由应用接管，SDK 不再执行默认的参数回放恢复（init -> replay setParam -> startDataNotification）
+  - answer(False)：SDK 执行默认恢复（init -> replay setParam -> startDataNotification）
 """
 
 import os
@@ -227,24 +228,24 @@ def main():
         while time.time() - t0 < NO_RECONNECT_WINDOW:
             if sensor.deviceState == DeviceStateEx.Ready:
                 reached_ready = True
-                print("  [观察] 检测到 deviceState==Ready（默认恢复未跳过），提前结束观察", flush=True)
+                print("  [观察] 检测到 deviceState==Ready（自动重连完成），提前结束观察", flush=True)
                 break
             time.sleep(0.5)
 
         transferring_after = sensor.isDataTransfering
         print(f"[观察] deviceState={sensor.deviceState} isDataTransfering={transferring_after} 状态序列 {[str(s) for s in states]}", flush=True)
 
-        record(results, "answer(True) 后跳过默认恢复（未自动回到 Ready）", not reached_ready,
-               "onAutoReconnect answer(True) 后 deviceState 不自动回到 Ready",
+        record(results, "answer(True) 后自动重连仍回到 Ready（answer 不拦截连接）", reached_ready,
+               "onAutoReconnect answer(True) 后 deviceState 回到 Ready",
                f"state={sensor.deviceState} 状态序列={[str(s) for s in states]}")
-        record(results, "answer(True) 后未自动起流（isDataTransfering 保持 False）", transferring_after is not True,
+        record(results, "answer(True) 后跳过默认恢复（未自动起流，isDataTransfering 保持 False）", transferring_after is not True,
                "onAutoReconnect answer(True) 后 isDataTransfering 不自动恢复 True",
                f"isDataTransfering={transferring_after}")
     else:
-        record(results, "answer(True) 后跳过默认恢复（未自动回到 Ready）", None,
-               "onAutoReconnect answer(True) 后 deviceState 不自动回到 Ready",
+        record(results, "answer(True) 后自动重连仍回到 Ready（answer 不拦截连接）", None,
+               "onAutoReconnect answer(True) 后 deviceState 回到 Ready",
                "onAutoReconnect 未触发，无法验证（前置失败）")
-        record(results, "answer(True) 后未自动起流（isDataTransfering 保持 False）", None,
+        record(results, "answer(True) 后跳过默认恢复（未自动起流，isDataTransfering 保持 False）", None,
                "onAutoReconnect answer(True) 后 isDataTransfering 不自动恢复 True",
                "onAutoReconnect 未触发，无法验证（前置失败）")
 

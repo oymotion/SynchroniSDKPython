@@ -39,6 +39,18 @@ import common
 from common import record, scan_and_match
 
 LOST_OBSERVE_SECONDS = 15  # 采集观察时长（秒），留足人工制造干扰的时间
+EVIDENCE_DIR = os.path.join(BASE_DIR, "evidence")  # bin/log 取证输出目录
+
+
+def _list_bins(d):
+    """列出目录下所有 .bin 文件（文件名 -> 绝对路径）。"""
+    if not d or not os.path.isdir(d):
+        return {}
+    out = {}
+    for fn in os.listdir(d):
+        if fn.lower().endswith(".bin"):
+            out[fn] = os.path.join(d, fn)
+    return out
 
 
 class LostCollector:
@@ -126,6 +138,20 @@ def main():
 
     results = []
 
+    # ---- 取证：开启 log（必须在 scan/connect 之前开启，否则早期日志不落盘）----
+    out_dir = EVIDENCE_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"\n[取证] bin/log 输出目录: {out_dir}", flush=True)
+    try:
+        ctrl.setLogPath(True, out_dir)
+    except Exception as e:
+        print(f"[取证] setLogPath 抛异常 {type(e).__name__}: {e}", flush=True)
+    try:
+        ctrl.setDebugEnabled(True)
+    except Exception as e:
+        print(f"[取证] setDebugEnabled 抛异常 {type(e).__name__}: {e}", flush=True)
+    bins_before = _list_bins(out_dir)
+
     # 环境检查
     is_enable = ctrl.isEnable
     print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
@@ -201,6 +227,12 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
+    # 开启 BLE 层调试日志（记录底层收发，用于报 bug 取证）
+    try:
+        sensor.setParam("DEBUG_LOG_PATH", "True")
+    except Exception as e:
+        print(f"[取证] setParam('DEBUG_LOG_PATH','True') 抛异常 {type(e).__name__}: {e}", flush=True)
+
     # 起 EMG 流
     print("\n[起流] SensorProfile.setParam('NTF_EMG', 'ON') ...", flush=True)
     try:
@@ -225,9 +257,17 @@ def main():
     record(results, "SensorProfile.startDataNotification 返回 True", sret is True,
            "startDataNotification() 返回 True", f"startDataNotification() -> {start_txt}")
 
+    # 开始录 bin（起流后即录，覆盖整个观察窗口，落盘丢包数据用于报 bug 取证）
+    try:
+        bret = sensor.setParam("DEBUG_BLE_DATA_PATH", "True")
+        print(f"[取证] setParam('DEBUG_BLE_DATA_PATH','True') -> {bret!r}", flush=True)
+    except Exception as e:
+        print(f"[取证] setParam('DEBUG_BLE_DATA_PATH','True') 抛异常 {type(e).__name__}: {e}", flush=True)
+
     # 采集窗口（semi-auto：人工制造轻微干扰触发丢包）
     input("\n>>> [人工操作] 请轻微遮挡/移远待测设备制造信号干扰（保持 deviceState==Ready，勿导致断链），"
           "用于触发丢包，完成后按回车开始采集 ...")
+
     print(f"\n[采集] 观察 {LOST_OBSERVE_SECONDS}s ...", flush=True)
     time.sleep(LOST_OBSERVE_SECONDS)
     print(f"[采集] 收到批数={len(collector.batches)} 样本数={collector.total_samples}", flush=True)
@@ -260,6 +300,10 @@ def main():
     except Exception:
         pass
     try:
+        sensor.setParam("DEBUG_BLE_DATA_PATH", "False")
+    except Exception:
+        pass
+    try:
         sensor.setParam("NTF_EMG", "OFF")
     except Exception:
         pass
@@ -267,6 +311,51 @@ def main():
         sensor.disconnect()
     except Exception as e:
         print(f"[断开] SensorProfile.disconnect 抛异常 {type(e).__name__}: {e}", flush=True)
+
+    # ---- 取证：定位新增 bin + 转 CSV ----
+    print("\n" + "=" * 60, flush=True)
+    print("取证结果（bin/log）", flush=True)
+    print("=" * 60, flush=True)
+
+    # 优先用 SDK 返回的 BLE 数据路径，其次用目录内新增 .bin 兜底
+    ble_path = None
+    try:
+        ble_path = sensor.getParam("DEBUG_BLE_DATA_PATH")
+    except Exception:
+        pass
+    if not (isinstance(ble_path, str) and ble_path.strip()):
+        try:
+            ble_path = sensor.getParam("DEBUG_BLE_DATA_PATH")
+        except Exception:
+            pass
+
+    time.sleep(0.5)
+    bins_after = _list_bins(out_dir)
+    new_bins = sorted(set(bins_after.keys()) - set(bins_before.keys()))
+    bin_path = ble_path if (isinstance(ble_path, str) and ble_path.strip()) else None
+    if not (bin_path and os.path.isfile(bin_path)):
+        bin_path = bins_after[new_bins[0]] if new_bins else None
+    have_bin = bool(bin_path) and os.path.isfile(bin_path)
+
+    print(f"[bin] 新增 bin: {new_bins if new_bins else '无'}", flush=True)
+    print(f"[bin] 路径: {bin_path!r}  存在={have_bin}", flush=True)
+
+    if have_bin:
+        try:
+            info = ctrl.getBinFileInfo(bin_path)
+        except Exception as e:
+            info = None
+            print(f"[bin] getBinFileInfo 抛异常 {type(e).__name__}: {e}", flush=True)
+        if isinstance(info, dict) and info:
+            print(f"[bin] device_name={info.get('device_name')}  replay_duration={info.get('replay_duration')}", flush=True)
+        try:
+            csv_path = ctrl.parseBinToCsv(bin_path)
+        except Exception as e:
+            csv_path = None
+            print(f"[CSV] parseBinToCsv 抛异常 {type(e).__name__}: {e}", flush=True)
+        csv_ok = isinstance(csv_path, str) and os.path.isfile(csv_path)
+        print(f"[CSV] parseBinToCsv -> {csv_path!r}  存在={csv_ok}", flush=True)
+    print(f"[log] 目录: {out_dir}（sdk 调试日志 + BLE 调试日志已写入）", flush=True)
 
     # ---- 汇总 ----
     print("\n" + "=" * 60, flush=True)

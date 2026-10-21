@@ -212,6 +212,8 @@ def main():
     # ---- 阶段 2：人工恢复供电，观察是否【不】自动重连 ----
     input("\n>>> [人工操作] 请【重新开启】待测设备 gForceUltra 电源（或移回范围），完成后按回车继续 ...")
 
+    input("\n>>> [暂停检查] 请确认待测设备是否被其它连接/程序【占用】（如被其它测试脚本或 BLE 客户端连走），确认后按回车继续观察 ...")
+
     print(f"\n[观察不自动重连] 观察窗口 {NO_RECONNECT_WINDOW}s ...", flush=True)
     reached_ready = False
     t0 = time.time()

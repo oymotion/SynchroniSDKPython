@@ -50,20 +50,19 @@ CAPABILITY_FIELDS = [
     "ConnectionIntervalMs", "PeripheralLatency", "SupervisionTimeoutMs", "MTUSize",
 ]
 
-# gForceUltra 预期：EMG/IMU/Acc/Gyro 类字段 >0
-# Euler/Quat/MagAngle 设备不支持，预期 =0 或 None
-# EEG/ECG/PPG/SPO2/BRTH 设备不支持，预期 =0 或 None
+# gForceUltra 预期：EMG/IMU/Acc/Gyro/Euler/Quat 类字段 >0（最新固件，能力对齐 gForceMax）
+# MagAngle/EEG/ECG/PPG/SPO2/BRTH 设备不支持，预期 =0 或 None
 GFORCE_EXPECTED_POSITIVE = [
     "EmgSampleRate", "EmgChannelCount",
     "ImuSampleRate", "ImuChannelCount",
     "AccSampleRate", "AccChannelCount",
     "GyroSampleRate", "GyroChannelCount",
+    "EulerSampleRate", "EulerChannelCount",
+    "QuatSampleRate", "QuatChannelCount",
     "ImpeSampleRate", "ImpeChannelCount",
 ]
 
 GFORCE_EXPECTED_ZERO = [
-    "EulerSampleRate", "EulerChannelCount",
-    "QuatSampleRate", "QuatChannelCount",
     "MagAngleSampleRate", "MagAngleChannelCount",
     "EegSampleRate", "EegChannelCount",
     "EcgSampleRate", "EcgChannelCount",
@@ -269,8 +268,8 @@ def main():
             if v <= 0:
                 print(f"[检查3] {f} = {v}（预期 >0）", flush=True)
                 positive_ok = False
-    record(results, "gForceUltra 预期字段（EMG/IMU/ACC/GYRO 等）>0", positive_ok,
-           "gForceUltra 的 EMG/IMU/Acc/Gyro 等字段 >0",
+    record(results, "gForceUltra 预期字段（EMG/IMU/ACC/GYRO/EULER/QUAT 等）>0", positive_ok,
+           "gForceUltra 的 EMG/IMU/Acc/Gyro/Euler/Quat 等字段 >0",
            "全部 >0" if positive_ok else "存在 ≤0")
 
     # 检查4：gForceUltra 预期 =0 的字段（EEG/ECG/PPG/SPO2/BRTH）

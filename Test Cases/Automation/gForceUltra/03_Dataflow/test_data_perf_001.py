@@ -8,7 +8,7 @@
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) setParam("NTF_EMG", "ON") 起 EMG 流（gForceUltra 起流会伴随 IMU 等其它流）
   3) startDataNotification 后采集窗口内，按 DataType 分别统计样本
-  4) 对每一路流：实际采样率与各自 getSampleRate() 标称比较，偏差 ≤ 容差（默认 ±0.1%）
+  4) 对每一路流：实际采样率与各自 getSampleRate() 标称比较，偏差 ≤ 容差（默认 ±0.5%，粗判）
 
 说明：
   实测采样率用"固定窗口计时"计算：从首批数据到达起，精确采集 PERF_COLLECT_SECONDS
@@ -44,9 +44,10 @@ import config
 import common
 from common import record, scan_and_match
 
-SAMPLE_RATE_TOLERANCE = 0.001  # 采样率容差 ±0.1%
+SAMPLE_RATE_TOLERANCE = 0.005  # 采样率容差 ±0.5%（粗判；采样率精判交给 30 分钟脚本 test_measure_sample_rate.py）
 MIN_SAMPLES_FOR_RATE = 100    # 计算采样率所需最小样本数（保证统计精度）
 PERF_COLLECT_SECONDS = 30     # 固定窗口采集时长（秒），用于实测采样率统计
+STABILIZE_SECONDS = 10        # 起流后稳定期（秒），丢弃起流初期不稳定样本（与 30 分钟脚本预热一致）
 IMPEDANCE_NOMINAL_HZ = 1.0    # 阻抗流固定采样率（SDK 不单独上报，实测 1Hz）
 
 
@@ -82,6 +83,12 @@ class RateCollector:
         self.last_ts = None      # 末批到达时间
         self.batches = 0
         # {data_type: {"delivered", "channels", "min_idx", "max_idx", "nominal_rate"}}
+        self.by_type = {}
+
+    def reset(self):
+        self.first_ts = None
+        self.last_ts = None
+        self.batches = 0
         self.by_type = {}
 
     def on_data(self, sensor, data):
@@ -239,6 +246,30 @@ def main():
         p_txt = f"抛异常 {type(e).__name__}: {e}"
     print(f"[起流] setParam('NTF_EMG', 'ON') -> {p_txt}", flush=True)
 
+    # 显式设置 IMU 采样率 200Hz，并关闭手势流 GEST（与 30 分钟专项脚本一致：
+    # 避免 getSampleRate() 标称与真实 ODR 不符、以及 GEST 与 EMG 采样冲突）。
+    print("\n[起流] SensorProfile.setParam('IMU_SAMPLE_RATE', '200') ...", flush=True)
+    try:
+        imu_ret = sensor.setParam("IMU_SAMPLE_RATE", "200")
+        imu_txt = f"返回 {imu_ret!r}"
+    except Exception as e:
+        imu_ret = None
+        imu_txt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[起流] setParam('IMU_SAMPLE_RATE', '200') -> {imu_txt}", flush=True)
+
+    print("[独占] SensorProfile.setParam('NTF_GEST', 'OFF') ...", flush=True)
+    try:
+        gest_ret = sensor.setParam("NTF_GEST", "OFF")
+        gest_txt = f"返回 {gest_ret!r}"
+    except Exception as e:
+        gest_ret = None
+        gest_txt = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[独占] setParam('NTF_GEST', 'OFF') -> {gest_txt}", flush=True)
+
+    # 静置等待设备异步生效（与 30 分钟专项脚本一致）
+    print("[等待] 静置 2s 等待采样率/开关生效 ...", flush=True)
+    time.sleep(2.0)
+
     collector = RateCollector()
     sensor.onDataCallback = collector.on_data
 
@@ -253,7 +284,7 @@ def main():
     record(results, "SensorProfile.startDataNotification 返回 True", sret is True,
            "startDataNotification() 返回 True", f"startDataNotification() -> {start_txt}")
 
-    # 采集窗口（固定窗口计时：从首批到达开始精确采集 PERF_COLLECT_SECONDS）
+    # 采集窗口：等首批 -> 预热丢弃起流初期数据 -> 清空 -> 从正式首批起固定窗口采集
     print("\n[采集] 等待首批数据到达 ...", flush=True)
     t_wait0 = time.time()
     while collector.first_ts is None and time.time() - t_wait0 < 10:
@@ -263,11 +294,28 @@ def main():
         print("[采集] 10s 内未收到任何数据", flush=True)
         window_duration = None
     else:
-        t_end = collector.first_ts + PERF_COLLECT_SECONDS
-        print(f"[采集] 首批已到达，固定窗口采集 {PERF_COLLECT_SECONDS}s ...", flush=True)
-        while time.time() < t_end:
+        # 预热：丢弃起流初期 STABILIZE_SECONDS 秒数据（与 30 分钟专项脚本预热一致）
+        print(f"[采集] 首批已到达，预热 {STABILIZE_SECONDS}s（丢弃起流初期数据）...", flush=True)
+        warmup_end = time.time() + STABILIZE_SECONDS
+        while time.time() < warmup_end:
             time.sleep(0.05)
-        window_duration = PERF_COLLECT_SECONDS
+
+        # 预热结束，清空统计，重新从正式采集首批到达起计时
+        collector.reset()
+        print("[采集] 预热结束，重新等待正式采集首批数据 ...", flush=True)
+        t_wait1 = time.time()
+        while collector.first_ts is None and time.time() - t_wait1 < 10:
+            time.sleep(0.05)
+
+        if collector.first_ts is None:
+            print("[采集] 预热后 10s 内未收到任何数据", flush=True)
+            window_duration = None
+        else:
+            t_end = collector.first_ts + PERF_COLLECT_SECONDS
+            print(f"[采集] 固定窗口采集 {PERF_COLLECT_SECONDS}s ...", flush=True)
+            while time.time() < t_end:
+                time.sleep(0.05)
+            window_duration = PERF_COLLECT_SECONDS
 
     # 停流
     try:

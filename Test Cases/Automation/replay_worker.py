@@ -55,6 +55,53 @@ def _make_sensor(controller, bin_path):
     return sensor, info, None
 
 
+def _wait_for(predicate, timeout, interval=0.1):
+    """轮询直到 predicate() 为真或超时；返回是否满足。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _wait_replay_idle(state, realtime, duration):
+    """数据已开始流动后，等回放自然结束（连续无新批判定结束）。"""
+    idle_window = 2.0 if realtime else 1.0
+    hard_timeout = (max(30.0, (duration + 5.0) * 2) if realtime
+                    else max(15.0, duration + 5.0))
+    deadline = time.time() + hard_timeout
+    last_batches = state["batches"]
+    last_change = time.time()
+    while time.time() < deadline:
+        cur = state["batches"]
+        if cur != last_batches:
+            last_batches = cur
+            last_change = time.time()
+        elif time.time() - last_change >= idle_window:
+            break
+        time.sleep(0.1)
+
+
+def _run_replay_async(controller, bin_path, sensor, realtime, timeout, replay_error):
+    """后台线程里调用 replayBinFile，捕获异常。
+
+    1.3.9 的 replayBinFile(block=True) 在回放 profile 尚未 startDataNotification 时，
+    会因 sensor_controller._async_wait_replay_done 里 `if not isDataTransfering: return`
+    而立即返回，回放引擎其实在原生层后台异步泵数据。故调用方不能依赖其阻塞语义，
+    必须在本函数返回后继续等 onData 回调流入再 terminate。
+    """
+    def _replay():
+        try:
+            controller.replayBinFile(bin_path, sensor, realtime=realtime, timeout=timeout)
+        except Exception as e:
+            replay_error[0] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=_replay, daemon=True)
+    t.start()
+    return t
+
+
 def run_summary(bin_path, realtime):
     """回放并统计：批数、per-DataType 分布、首/末 startTimeStamp 与首个 delay。"""
     controller = SensorControllerInstance
@@ -86,13 +133,34 @@ def run_summary(bin_path, realtime):
                 state["last_delay"] = d.getDelay()
 
     sensor.onDataCallback = on_data
+
+    duration = 0.0
+    if info is not None:
+        try:
+            duration = float(getattr(info, "DurationSec", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+    replay_error = [None]
     try:
         start = time.time()
-        profile = controller.replayBinFile(bin_path, sensor, realtime=realtime)
+        t = _run_replay_async(controller, bin_path, sensor, realtime, None, replay_error)
+
+        flowed = _wait_for(lambda: state["batches"] > 0, timeout=20.0)
+        if flowed:
+            _wait_replay_idle(state, realtime, duration)
+        elif not replay_error[0]:
+            replay_error[0] = "回放未产生任何数据（20s 内无 onData 回调）"
+
         elapsed = time.time() - start
-        if profile is None:
-            return {"ok": False, "error": "replayBinFile 返回 None", "elapsed_sec": elapsed, **state}
-        return {"ok": True, "elapsed_sec": elapsed, **state}
+        t.join(timeout=1)
+        ok = state["batches"] > 0
+        return {
+            "ok": ok,
+            "error": None if ok else replay_error[0],
+            "elapsed_sec": elapsed,
+            **state,
+        }
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", **state}
     finally:
@@ -106,7 +174,7 @@ def run_samples(bin_path):
     if sensor is None:
         return {"ok": False, "error": err}
 
-    state = {"fs": None, "channels": {}}
+    state = {"fs": None, "channels": {}, "batches": 0}
 
     def on_data(profile, data_list):
         items = data_list if isinstance(data_list, list) else [data_list]
@@ -114,6 +182,7 @@ def run_samples(bin_path):
             name = _dt_name(d)
             if "EMG" not in name.upper():
                 continue
+            state["batches"] += 1
             if state["fs"] is None:
                 state["fs"] = d.getSampleRate()
             n_ch = d.getChannelCount()
@@ -132,12 +201,29 @@ def run_samples(bin_path):
                         continue
 
     sensor.onDataCallback = on_data
+
+    duration = 0.0
+    if info is not None:
+        try:
+            duration = float(getattr(info, "DurationSec", 0) or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+    replay_error = [None]
     try:
-        profile = controller.replayBinFile(bin_path, sensor, realtime=False, timeout=120)
-        if profile is None:
-            return {"ok": False, "error": "replayBinFile 返回 None", "fs": state["fs"], "channels": {}}
+        t = _run_replay_async(controller, bin_path, sensor, False, 120, replay_error)
+
+        flowed = _wait_for(lambda: state["batches"] > 0, timeout=30.0)
+        if flowed:
+            _wait_replay_idle(state, realtime=False, duration=duration)
+        elif not replay_error[0]:
+            replay_error[0] = "回放未产生任何 EMG 数据（30s 内无 onData 回调）"
+
+        t.join(timeout=1)
+        ok = state["batches"] > 0 and bool(state["channels"])
         return {
-            "ok": True,
+            "ok": ok,
+            "error": None if ok else replay_error[0],
             "fs": state["fs"] or 500.0,
             "channels": {str(k): v for k, v in state["channels"].items()},
         }

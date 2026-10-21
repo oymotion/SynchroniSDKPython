@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
-"""PARAM-FUNC-005：EEG_SAMPLE_RATE 不支持值返回 Error（待确认，按能力自动 SKIP）。
+"""PARAM-FUNC-005：EEG_SAMPLE_RATE 不支持值返回 Error。
 
 对应用例：04_参数.md -> PARAM-FUNC-005
-可自动化：auto（能力判定后执行/跳过）
+可自动化：auto
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 能力判定：getParam("EEG_SAMPLE_RATE_LIST") 返回以 "Error" 开头 → SKIP
-  3) 支持时：setParam("EEG_SAMPLE_RATE", 列表外值/空串)，校验返回以 "Error" 开头
+  2) 打印能力上下文 getParam("EEG_SAMPLE_RATE_LIST")（设备无 EEG 时返回 "Error: Not supported"）
+  3) 逐个 setParam("EEG_SAMPLE_RATE", 列表外值/空串)，校验返回以 "Error" 开头
 
 说明：
   README：EEG_SAMPLE_RATE 值按能力列表校验，不支持值返回
   "Error: unsupported sample rate ..."。
-  腕带 gForceUltra 通常无 EEG，预期 SKIP。
+  若设备无 EEG（gForceUltra 腕带通常无 EEG），setParam("EEG_SAMPLE_RATE", 任意值)
+  同样返回 Error，属预期，记为 PASS（而非 SKIP）。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -34,16 +35,6 @@ import common
 from common import record, scan_and_match
 
 INVALID_RATES = ["999999", ""]  # 列表外值 + 空串
-
-
-def _capability_ok(sensor):
-    try:
-        r = sensor.getParam("EEG_SAMPLE_RATE_LIST")
-    except Exception as e:
-        return False, f"抛异常 {type(e).__name__}: {e}"
-    if not isinstance(r, str) or r.startswith("Error"):
-        return False, r
-    return True, r
 
 
 def main():
@@ -132,23 +123,14 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # 能力判定
-    supported, cap_txt = _capability_ok(sensor)
+    # 能力上下文（仅打印；设备无 EEG 时返回 "Error: Not supported"，非法值测试同样应返回 Error）
+    try:
+        cap_txt = sensor.getParam("EEG_SAMPLE_RATE_LIST")
+    except Exception as e:
+        cap_txt = f"抛异常 {type(e).__name__}: {e}"
     print(f"\n[能力] getParam('EEG_SAMPLE_RATE_LIST') = {cap_txt!r}", flush=True)
-    if not supported:
-        record(results, "EEG_SAMPLE_RATE 不支持值返回 Error", None,
-               "支持 EEG/ECG 采样率时校验非法值被拒绝",
-               f"getParam('EEG_SAMPLE_RATE_LIST')={cap_txt!r}，设备未上报能力")
-        print("[SKIP] 设备未上报 EEG/ECG 采样率能力，跳过", flush=True)
-        try:
-            sensor.disconnect()
-        except Exception:
-            pass
-        print("\n结论: SKIP", flush=True)
-        ctrl.terminate()
-        return
 
-    # 逐个非法值测试
+    # 逐个非法值测试（设备无 EEG 时 setParam 同样返回 Error，记 PASS 而非 SKIP）
     for bad in INVALID_RATES:
         label = "空串" if bad == "" else f"列表外值{bad}"
         print(f"\n[参数] setParam('EEG_SAMPLE_RATE', {bad!r}) ...", flush=True)

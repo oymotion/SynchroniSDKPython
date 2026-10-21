@@ -187,11 +187,13 @@ async def main_async():
 
     print(f"[异步多起流] asyncMultiStartDataNotification() -> {multi_start_ret!r}", flush=True)
 
-    is_dict_start = isinstance(multi_start_ret, dict)
-    if is_dict_start:
-        all_start_true = all(v is True for v in multi_start_ret.values())
-        record(results, "asyncMultiStartDataNotification 返回所有值皆为 True", all_start_true,
-               "所有 mac 对应值均为 True", f"返回 {multi_start_ret}")
+    is_list_start = isinstance(multi_start_ret, list) and len(multi_start_ret) == len(sensor_list)
+    if is_list_start:
+        all_start_true = all(isinstance(item, dict) and item.get("ok") is True for item in multi_start_ret)
+        record(results, "asyncMultiStartDataNotification 返回所有项 ok=True", all_start_true,
+               "所有项 ok 均为 True", f"返回 {multi_start_ret}")
+        for item in multi_start_ret:
+            print(f"[异步多起流] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
 
         for tag, sensor in sensors:
             transferring = sensor.isDataTransfering
@@ -209,14 +211,16 @@ async def main_async():
 
     print(f"[异步多停流] asyncMultiStopDataNotification() -> {multi_stop_ret!r}", flush=True)
 
-    is_dict_stop = isinstance(multi_stop_ret, dict)
-    record(results, "asyncMultiStopDataNotification 返回 dict", is_dict_stop,
-           "返回类型为 dict", f"返回 {type(multi_stop_ret).__name__}")
+    is_list_stop = isinstance(multi_stop_ret, list) and len(multi_stop_ret) == len(sensor_list)
+    record(results, "asyncMultiStopDataNotification 返回 list", is_list_stop,
+           "返回类型为 list 且长度等于设备数", f"返回 {type(multi_stop_ret).__name__}")
 
-    if is_dict_stop:
-        all_stop_true = all(v is True for v in multi_stop_ret.values())
-        record(results, "asyncMultiStopDataNotification 返回所有值皆为 True", all_stop_true,
-               "所有 mac 对应值均为 True", f"返回 {multi_stop_ret}")
+    if is_list_stop:
+        all_stop_true = all(isinstance(item, dict) and item.get("ok") is True for item in multi_stop_ret)
+        record(results, "asyncMultiStopDataNotification 返回所有项 ok=True", all_stop_true,
+               "所有项 ok 均为 True", f"返回 {multi_stop_ret}")
+        for item in multi_stop_ret:
+            print(f"[异步多停流] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
 
         # 检查每台设备 isDataTransfering==False
         for tag, sensor in sensors:

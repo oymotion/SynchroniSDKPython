@@ -17,14 +17,14 @@
   NTF_EMG                "NTF_EMG"           EmgChannelCount=8     5s
   NTF_GEST               "NTF_GEST"          EmgChannelCount=8     5s（DeviceInfo 无独立 GEST 标称值）
   NTF_IMPEDANCE          "NTF_IMPEDANCE"     ImpeChannelCount=8    25s（1Hz，需较长采集）
-  NTF_IMU                "NTF_IMU"           ImuChannelCount=13    5s（13 轴 IMU 聚合流）
+  NTF_IMU                "NTF_IMU"           ImuChannelCount=13    5s（按 acc/gyro/euler/quat 四路子流聚合）
 
 说明：
   - GEST/EMG 在传统设备互斥，逐个测完 setParam OFF，避免串扰。
   - IMPEDANCE 采样率 1Hz，packageSampleCount=20 约需 20s 凑满一批，故采集 25s。
-  - gForceUltra 最新固件（与 gForceMax 同源）的 13 轴 IMU 以 NTF_IMU(0x13) 聚合流投递
-    （acc3+gyro3+euler3+quat4），不再拆成 NTF_ACC/NTF_GYRO 二路独立投递；
-    无欧拉/四元数独立开关，统一由 "NTF_IMU" 打开，DeviceInfo 以 ImuChannelCount=13 描述能力，
+  - gForceUltra 最新固件（与 gForceMax 同源）的 13 轴 IMU 开关是 "NTF_IMU"，但数据
+    按 acc/gyro/euler/quat 四路子 DataType（NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION）
+    独立投递，没有独立的 NTF_IMU(0x13) 数据类型；DeviceInfo 以 ImuChannelCount=13 描述能力，
     通道布局细节见 DATA-FUNC-010。
 
 前置条件：
@@ -55,7 +55,8 @@ def _dt_name(dt):
 
 
 # (显示名, DataType, setParam key, ChannelCount 字段名, 动作提示, 采集秒数, 断言类型列表)
-# 断言类型列表非 None 时按这些类型聚合统计样本；gForceUltra 现为 NTF_IMU 单一聚合流，故为 None
+# 断言类型列表非 None 时按这些类型聚合统计样本；IMU 无独立 NTF_IMU 数据类型，
+# 数据按 acc/gyro/euler/quat 四路子流投递，故 IMU 的断言类型为这四路聚合。
 MODALITIES = [
     ("EMG", DataType.NTF_EMG, "NTF_EMG", "EmgChannelCount",
      "请用力握拳或绷紧被测部位肌肉，让 EMG 产生信号", 5, None),
@@ -64,7 +65,8 @@ MODALITIES = [
     ("IMPEDANCE", DataType.NTF_IMPEDANCE, "NTF_IMPEDANCE", "ImpeChannelCount",
      "请保持佩戴且电极接触良好，让阻抗测量产生信号", 25, None),
     ("IMU", DataType.NTF_IMU, "NTF_IMU", "ImuChannelCount",
-     "请晃动/旋转腕带，让 13 轴 IMU（acc+gyro+euler+quat）产生变化", 5, None),
+     "请晃动/旋转腕带，让 13 轴 IMU（acc+gyro+euler+quat）产生变化", 5,
+     [DataType.NTF_ACC, DataType.NTF_GYRO, DataType.NTF_EULER_DATA, DataType.NTF_QUATERNION]),
 ]
 
 # DeviceInfo 候选字段（来自 README L313-323 与 example），用于运行时 dump 验证真实字段名

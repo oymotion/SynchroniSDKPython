@@ -117,8 +117,8 @@ def main():
 
     # 只初始化第一台，第二台不初始化
     s1, s2 = sensors[0], sensors[1]
-    tid1 = matched[0][1]
-    tid2 = matched[1][1]
+    tid1 = matched[0][0]
+    tid2 = matched[1][0]
 
     print(f"\n[init] 只初始化 {tid1}，{tid2} 不初始化 ...", flush=True)
     try:
@@ -147,13 +147,16 @@ def main():
 
     ready_ok = False
     not_ready_ok = False
-    if isinstance(mret, dict):
-        mac1 = s1.BLEDevice.Address
-        mac2 = s2.BLEDevice.Address
-        ready_ok = (mret.get(mac1) is True and s1.isDataTransfering is True)
-        not_ready_ok = (mret.get(mac2) is not True)
-        print(f"[multiStart] {tid1}({mac1}): result={mret.get(mac1)}, isDataTransfering={s1.isDataTransfering}", flush=True)
-        print(f"[multiStart] {tid2}({mac2}): result={mret.get(mac2)}, isDataTransfering={s2.isDataTransfering}", flush=True)
+    if isinstance(mret, list) and len(mret) == len(sensors):
+        # SDK 返回顺序与传入 sensors 顺序一致：[s1(已 init), s2(未 init)]
+        item1 = mret[0] if isinstance(mret[0], dict) else {}
+        item2 = mret[1] if isinstance(mret[1], dict) else {}
+        ready_ok = (item1.get("ok") is True and s1.isDataTransfering is True)
+        not_ready_ok = (item2.get("ok") is not True)
+        for item in mret:
+            print(f"[multiStart] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
+        print(f"[multiStart] {tid1}({s1.BLEDevice.Address}): isDataTransfering={s1.isDataTransfering}", flush=True)
+        print(f"[multiStart] {tid2}({s2.BLEDevice.Address}): isDataTransfering={s2.isDataTransfering}", flush=True)
 
     record(results, f"已 Ready 设备({tid1})起流成功",
            ready_ok,

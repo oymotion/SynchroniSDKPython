@@ -7,7 +7,7 @@
 流程：
   1) scan -> 匹配两台目标设备 -> connect -> init
   2) multiStartDataNotification([s1, s2])
-  3) 检查返回 {mac: bool} 与两台上流状态
+  3) 检查返回 [{mac, ok, error}] 与两台上流状态
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -96,15 +96,19 @@ def main():
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
     all_started = False
-    if isinstance(mret, dict) and len(mret) == len(sensors):
-        all_started = all(v is True for v in mret.values())
+    if isinstance(mret, list) and len(mret) == len(sensors):
+        # SDK 返回 [{"mac": str, "ok": bool, "error": str}, ...]
+        all_ok = all(isinstance(item, dict) and item.get("ok") is True for item in mret)
+        all_transferring = all(s.isDataTransfering for s in sensors)
+        all_started = all_ok and all_transferring
+        for item in mret:
+            print(f"[multiStart] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
         for s in sensors:
-            mac = s.BLEDevice.Address
-            print(f"[multiStart] {mac}: result={mret.get(mac)}, isDataTransfering={s.isDataTransfering}", flush=True)
+            print(f"[multiStart] {s.BLEDevice.Address}: isDataTransfering={s.isDataTransfering}", flush=True)
 
     record(results, "multiStartDataNotification 两台均起流",
            all_started,
-           "两台 multiStart 返回均为 True，isDataTransfering==True",
+           "两台 multiStart 返回 ok=True 且 isDataTransfering==True",
            f"multiStart 返回 {mret}")
 
     # 停流

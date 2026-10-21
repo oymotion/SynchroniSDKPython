@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DATA-FUNC-010：NTF_IMU 聚合批通道布局（仅新 EMG 设备）。
+"""DATA-FUNC-010：NTF_IMU 拆分为四路独立子流（无聚合批）。
 
 对应用例：03_数据流.md -> DATA-FUNC-010
 可自动化：auto（能力判定后执行/跳过；设备上电、在范围内为运行前置）
@@ -8,17 +8,18 @@
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
   2) getDeviceInfo() 读 ImuChannelCount
   3) ImuChannelCount==0：记录"不支持，跳过"（SKIP，传统设备无聚合流）
-  4) ImuChannelCount>0：setParam("NTF_IMU","ON") 起聚合流，取第一个非空批次校验：
-     - getDataType()==NTF_IMU
-     - getChannelCount()==ImuChannelCount 且 len(channelSamples)==ImuChannelCount
-     - 固定布局 acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12 各分段存在且有数据
+  4) ImuChannelCount>0：setParam("NTF_IMU","ON") 起流，校验数据按四路独立子流投递：
+     - 无 NTF_IMU(0x13) 聚合数据类型（NTF_IMU 批次==0，属 SDK 实际行为）
+     - 收到四路子流 NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION，各样本数>0
+     - 各子流通道数 == 固定布局 acc=3/gyro=3/euler=3/quat=4
+     - 四路通道数合计 == ImuChannelCount
 
 说明：
-  NTF_IMU 聚合流是"新 EMG 设备"才有的能力，把 acc/gyro/euler/quat 四路合成一个
-  13 通道批（部分非 QAT6 设备仅 acc+gyro 6 通道）。布局固定：
-    通道 0-2=acc、3-5=gyro、6-8=euler、9-12=quat。
-  ImuChannelCount 由 DeviceInfo 上报，0 表示无聚合流（传统设备改用四路独立流）。
-  gForceUltra 实测 ImuChannelCount=13。
+  gForceUltra 最新固件（与 gForceMax 同源）的 13 轴 IMU 开关是 "NTF_IMU"，但数据
+  并不作为 NTF_IMU(0x13) 聚合批投递，而是拆成 acc/gyro/euler/quat 四路独立子
+  DataType（NTF_ACC/NTF_GYRO/NTF_EULER_DATA/NTF_QUATERNION）分别投递。
+  DeviceInfo 以 ImuChannelCount=13 描述能力；四路固定布局 acc=3/gyro=3/euler=3/quat=4，
+  合计 13。本用例把聚合能力"拆开"校验：验证四路独立子流各自的通道布局与合计一致。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -49,74 +50,69 @@ def _dt_name(dt):
         return str(dt)
 
 
-# NTF_IMU 聚合批固定布局：acc 0-2 / gyro 3-5 / euler 6-8 / quat 9-12
-IMU_LAYOUT = [
-    ("ACC",   0, 3),
-    ("GYRO",  3, 6),
-    ("EULER", 6, 9),
-    ("QUAT",  9, 13),
+# NTF_IMU 实际拆成四路独立子 DataType 投递（无 NTF_IMU 聚合数据类型）
+# (显示名, DataType, DeviceInfo 通道字段, 固定布局通道数)
+IMU_SUBSTREAMS = [
+    ("ACC",   DataType.NTF_ACC,         "AccChannelCount",  3),
+    ("GYRO",  DataType.NTF_GYRO,        "GyroChannelCount", 3),
+    ("EULER", DataType.NTF_EULER_DATA,  "EulerChannelCount", 3),
+    ("QUAT",  DataType.NTF_QUATERNION,  "QuatChannelCount", 4),
 ]
 
 
 class ImuCollector:
-    """收集 NTF_IMU 数据，保存第一个非空批次用于布局校验。"""
+    """按 DataType 收集四路独立子流，记录各自批次/样本/通道数。"""
 
     def __init__(self):
-        self.first_batch = None
-        self.batches = 0
-        self.total_samples = 0
+        self.by_type = {}  # {DataType: {'batches': n, 'samples': m, 'channels': c}}
 
     def on_data(self, sensor, data):
         items = data if isinstance(data, list) else [data]
         for d in items:
-            if _dt_name(d.getDataType()) != "NTF_IMU":
-                continue
-            self.batches += 1
+            dt = d.getDataType()
+            entry = self.by_type.setdefault(dt, {'batches': 0, 'samples': 0, 'channels': 0})
+            entry['batches'] += 1
             try:
-                n = d.getChannelCount() * d.getSampleCount()
+                ch = d.getChannelCount()
+                smp = d.getSampleCount()
             except Exception:
-                n = 0
-            self.total_samples += n
-            if self.first_batch is None and n > 0:
-                self.first_batch = d
+                ch = 0
+                smp = 0
+            entry['channels'] = ch
+            entry['samples'] += ch * smp
 
 
-def check_imu_layout(data, imu_channels, results):
-    """对一批 NTF_IMU 数据校验通道布局。"""
+def check_imu_substreams(collector, info, imu_channels, results):
+    """校验 NTF_IMU 拆成的四路独立子流布局。"""
 
     def add(name, ok, expect, actual):
         record(results, name, ok, expect, actual)
 
-    # 1. 数据类型
-    dt = data.getDataType()
-    dt_txt = _dt_name(dt)
-    add("收到 NTF_IMU 聚合数据", dt_txt == "NTF_IMU",
-        "getDataType()==NTF_IMU", f"getDataType()={dt_txt}")
+    by_type = collector.by_type
 
-    # 2. 元数据通道数 == ImuChannelCount
-    meta_ch = data.getChannelCount()
-    add("getChannelCount()==ImuChannelCount", meta_ch == imu_channels,
-        f"getChannelCount()=={imu_channels}", f"getChannelCount()={meta_ch}")
+    # 1. 无 NTF_IMU 聚合数据类型（SDK 实际行为：拆成四路独立流，而非 NTF_IMU 聚合批）
+    imu_batches = by_type.get(DataType.NTF_IMU, {}).get('batches', 0)
+    add("无 NTF_IMU 聚合数据类型（拆成四路独立子流）", imu_batches == 0,
+        "NTF_IMU(0x13) 不投递，数据按四路独立子流投递",
+        f"NTF_IMU 批次={imu_batches}")
 
-    # 3. 结构通道数 == ImuChannelCount（1.3.0 无 channelSamples，结构通道数即 getChannelCount）
-    n_ch = data.getChannelCount()
-    n_smp = data.getSampleCount()
-    add("结构通道数==ImuChannelCount", n_ch == imu_channels,
-        f"结构通道数=={imu_channels}", f"结构通道数={n_ch}")
+    # 2. 各四路子流收到数据且通道数 == 固定布局；四路通道合计 == ImuChannelCount
+    sum_channels = 0
+    for disp, dt, field, expected_ch in IMU_SUBSTREAMS:
+        entry = by_type.get(dt, {'batches': 0, 'samples': 0, 'channels': 0})
+        ch = entry['channels']
+        samples = entry['samples']
+        field_val = int(getattr(info, field, 0) or 0)
+        add(f"{disp} 子流收到数据（{_dt_name(dt)}）", samples > 0,
+            f"收到 {_dt_name(dt)} 数据（样本数>0）",
+            f"样本数={samples} 批次={entry['batches']}")
+        add(f"{disp} 子流通道数==固定布局 {expected_ch}", ch == expected_ch,
+            f"getChannelCount()=={expected_ch}",
+            f"getChannelCount()={ch}" + (f"（DeviceInfo.{field}={field_val}）" if field_val else ""))
+        sum_channels += ch
 
-    # 4. 各布局分段存在且有数据（按 ImuChannelCount 覆盖到的分段）
-    for seg_name, start, end in IMU_LAYOUT:
-        if imu_channels >= end:
-            seg_has = n_ch >= end
-            seg_samples = (end - start) * n_smp if seg_has else 0
-            add(f"{seg_name} 分段存在（通道 {start}-{end - 1}）且有数据",
-                seg_has and seg_samples > 0,
-                f"通道 {start}-{end - 1} 存在且样本数>0",
-                f"存在={seg_has} 分段样本数={seg_samples}")
-        else:
-            add(f"{seg_name} 分段（通道 {start}-{end - 1}）", None,
-                f"ImuChannelCount>={end} 时该分段应存在",
-                f"ImuChannelCount={imu_channels}，无该分段")
+    add("四路独立子流通道数合计==ImuChannelCount", sum_channels == imu_channels,
+        f"四路通道数合计=={imu_channels}", f"四路通道数合计={sum_channels}")
 
 
 def main():
@@ -234,12 +230,12 @@ def main():
         print(f"[info] 读取 ImuChannelCount 抛异常 {type(e).__name__}: {e}，按 0 处理", flush=True)
     print(f"\n[能力] DeviceInfo.ImuChannelCount = {imu_channels}", flush=True)
 
-    # 能力判定：0 = 传统设备，无聚合流，跳过
+    # 能力判定：0 = 传统设备，无 IMU 能力，跳过
     if imu_channels <= 0:
-        record(results, "NTF_IMU 聚合流能力判定", None,
-               "ImuChannelCount>0 时校验聚合布局",
-               "ImuChannelCount==0，设备不支持 NTF_IMU 聚合流（传统设备）")
-        print("[SKIP] ImuChannelCount==0，设备无 NTF_IMU 聚合流，跳过布局校验", flush=True)
+        record(results, "NTF_IMU 能力判定", None,
+               "ImuChannelCount>0 时校验四路独立子流布局",
+               "ImuChannelCount==0，设备不支持 IMU（传统设备）")
+        print("[SKIP] ImuChannelCount==0，设备无 IMU 能力，跳过布局校验", flush=True)
         try:
             sensor.disconnect()
         except Exception:
@@ -279,9 +275,10 @@ def main():
            "startDataNotification() 返回 True", f"startDataNotification() -> {start_txt}")
 
     # 采集窗口
-    print(f"\n[采集] 等待 {config.COLLECT_SECONDS}s 观察 NTF_IMU 回调 ...", flush=True)
+    print(f"\n[采集] 等待 {config.COLLECT_SECONDS}s 观察 NTF_IMU 拆分的四路子流回调 ...", flush=True)
     time.sleep(config.COLLECT_SECONDS)
-    print(f"[采集] 收到 NTF_IMU 批次={collector.batches} 总样本数(展开)={collector.total_samples}", flush=True)
+    got_types = {_dt_name(k): v['batches'] for k, v in collector.by_type.items()}
+    print(f"[采集] 收到类型批次={got_types}", flush=True)
 
     # 停流
     try:
@@ -293,14 +290,15 @@ def main():
     except Exception:
         pass
 
-    # 布局校验
-    if collector.first_batch is None:
-        print("[FAIL] 采集窗口内未收到非空 NTF_IMU 数据，无法校验布局", flush=True)
-        record(results, "收到 NTF_IMU 聚合数据", False,
-               "采集窗口内收到非空 NTF_IMU 批次",
-               f"NTF_IMU 批次={collector.batches} 非空批次=0")
+    # 布局校验（四路独立子流）
+    got_any = any(e['samples'] > 0 for e in collector.by_type.values())
+    if not got_any:
+        print("[FAIL] 采集窗口内未收到任何 NTF_IMU 相关子流数据，无法校验布局", flush=True)
+        record(results, "收到四路独立子流数据", False,
+               "采集窗口内收到四路独立子流数据",
+               f"收到类型={ {_dt_name(k): v['batches'] for k, v in collector.by_type.items()} }")
     else:
-        check_imu_layout(collector.first_batch, imu_channels, results)
+        check_imu_substreams(collector, info, imu_channels, results)
 
     # 清理
     try:

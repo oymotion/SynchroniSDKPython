@@ -65,7 +65,8 @@ def run_one_backend(ctrl, results, label):
         mret = None
         print(f"[multiStart] 抛异常 {type(e).__name__}: {e}", flush=True)
 
-    started = isinstance(mret, dict) and all(v is True for v in mret.values())
+    started = isinstance(mret, list) and len(mret) == len(sensors) and \
+        all(isinstance(item, dict) and item.get("ok") is True for item in mret)
     record(results, f"两后端对齐下发({label}) multiStart 成功",
            started,
            "multiStart 两台均返回 True",
@@ -171,7 +172,7 @@ except Exception as e:
     mret = None
     print(f"[multiStart] 抛异常 {{type(e).__name__}}: {{e}}", flush=True)
 
-started = isinstance(mret, dict) and all(v is True for v in mret.values())
+started = isinstance(mret, list) and all(isinstance(item, dict) and item.get("ok") is True for item in mret)
 if not started:
     disconnect_all(sensors)
     print(f"SUBPROCESS_RESULT=FAIL:multiStart失败:{{mret}}", flush=True)
