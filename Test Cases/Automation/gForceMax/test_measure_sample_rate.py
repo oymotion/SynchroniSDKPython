@@ -396,7 +396,7 @@ def _get_ble_path(sensor):
 
 
 def main():
-    sanity_log = common.setup_sanity_log(BASE_DIR)
+    sanity_log = common.setup_sanity_log(RESULT_DIR, subdir=None)
     if sanity_log:
         print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
 

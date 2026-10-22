@@ -153,20 +153,21 @@ def bin_info_to_dict(info):
     })
 
 
-def setup_sanity_log(base_dir, script_name=None):
-    """把脚本 stdout tee 到 SanityLogs/<script>_<timestamp>.log，同时保留终端输出。
+def setup_sanity_log(base_dir, script_name=None, subdir="SanityLogs"):
+    """把脚本 stdout tee 到 <base_dir>/<subdir>/<script>_<timestamp>.log，同时保留终端输出。
 
     用途：让「长稳 / 压力 / 采样率 / e2e」这类脚本的 print 输出落盘到固定目录，
     跑完能回看「到底跑没跑、结果如何」。仅落盘脚本自身的 print 输出，不改动
     SDK 的 setLogPath 日志目录。
 
     参数：
-        base_dir     : 脚本所在目录（SanityLogs 建在它下面）
+        base_dir     : 日志根目录（默认在其下建 SanityLogs 子目录）
         script_name  : 日志文件名前缀；默认取 sys.argv[0] 的 basename（去 .py）
+        subdir       : 子目录名；传 None/"" 时直接落在 base_dir 下
 
     返回：日志文件的绝对路径；创建失败返回 None（stdout 保持原样）。
     """
-    log_dir = os.path.join(base_dir, "SanityLogs")
+    log_dir = os.path.join(base_dir, subdir) if subdir else base_dir
     try:
         os.makedirs(log_dir, exist_ok=True)
     except OSError:
