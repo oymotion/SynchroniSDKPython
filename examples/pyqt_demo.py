@@ -6,6 +6,7 @@ Run (from the repo root, prebuilt lib/windows/x64/Debug/sensor.dll):
 
 Requires: pip install PyQt5 matplotlib numpy
 Optional: pip install scipy   (enables the Live Filter band selector)
+Optional: pip install pylsl   (enables the Start LSL button)
 """
 
 import sys
@@ -15,6 +16,7 @@ import subprocess
 import os
 import threading
 import collections
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +35,11 @@ try:
 except ImportError:
     scipy_signal = None    # Live Filter combo disabled, everything else works
 
+try:
+    import pylsl
+except ImportError:
+    pylsl = None
+
 from PyQt5 import QtWidgets, QtCore
 
 #sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bindings", "python"))
@@ -46,10 +53,127 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.30"
+DEMO_VERSION               = "0.1.42"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
+
+
+class LslStreamWorker:
+    MAX_QUEUE_BATCHES = 1000
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._queue = None
+        self._stop_event = None
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if pylsl is None:
+            raise RuntimeError("pylsl is not installed. Run: pip install pylsl")
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            work_queue = queue.Queue(maxsize=self.MAX_QUEUE_BATCHES)
+            stop_event = threading.Event()
+            self._queue = work_queue
+            self._stop_event = stop_event
+            self._thread = threading.Thread(
+                target=self._run, args=(work_queue, stop_event),
+                daemon=True, name="LSLStream")
+            self._thread.start()
+
+    def enqueue(self, addr: str, data: SensorData, clone_data: bool = False):
+        with self._lock:
+            work_queue = self._queue
+            running = self._thread is not None and self._thread.is_alive()
+        if not running or work_queue is None:
+            return
+        queued = data.clone() if clone_data else data
+        try:
+            work_queue.put_nowait((addr, queued))
+        except queue.Full:
+            try:
+                work_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                work_queue.put_nowait((addr, queued))
+            except queue.Full:
+                pass
+
+    def stop(self):
+        with self._lock:
+            thread = self._thread
+            stop_event = self._stop_event
+            self._thread = None
+            self._queue = None
+            self._stop_event = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+            if thread.is_alive():
+                print("[LSL] worker did not stop within 2 seconds")
+
+    def _run(self, work_queue, stop_event):
+        outlets = {}
+        while not stop_event.is_set():
+            try:
+                addr, data = work_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._push(outlets, addr, data)
+            except Exception as e:
+                print(f"[LSL] push error: {e}")
+
+    @staticmethod
+    def _outlet(outlets, addr, data):
+        data_type = data.dataType
+        type_name = data_type.name if isinstance(data_type, DataType) else str(data_type)
+        key = (addr, int(data_type))
+        outlet = outlets.get(key)
+        if outlet is not None:
+            return outlet
+        device_name = data.deviceName or addr
+        info = pylsl.StreamInfo(
+            f"{device_name}_{type_name}", type_name, data.channelCount,
+            max(0.0, float(data.sampleRate)), "float32", f"SensorSDK_{addr}_{type_name}")
+        channels = info.desc().append_child("channels")
+        labels = CHANNEL_LABELS.get(data_type, [])
+        units = LSL_CHANNEL_UNITS.get(data_type, "unitless")
+        for channel in range(data.channelCount):
+            label = (labels[channel].partition(" (")[0]
+                     if channel < len(labels) else f"ch{channel + 1}")
+            if isinstance(units, (tuple, list)):
+                unit = units[channel] if channel < len(units) else "unitless"
+            else:
+                unit = units
+            channel_info = channels.append_child("channel")
+            channel_info.append_child_value("label", label)
+            channel_info.append_child_value("unit", unit)
+        outlet = pylsl.StreamOutlet(info)
+        outlets[key] = outlet
+        return outlet
+
+    def _push(self, outlets, addr, data):
+        if not data.isDataValid():
+            return
+        array = data.as_numpy()
+        samples = array["data"].T.tolist()
+        timestamps = array["absTimeStampInSec"][0].astype(float).tolist()
+        if not timestamps or any(timestamp <= 0 for timestamp in timestamps):
+            now = pylsl.local_clock()
+            rate = float(data.sampleRate)
+            timestamps = [now - (len(samples) - 1 - index) / rate
+                          if rate > 0 else now for index in range(len(samples))]
+        self._outlet(outlets, addr, data).push_chunk(samples, timestamps)
 
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -59,10 +183,33 @@ matplotlib.rcParams['agg.path.chunksize'] = 10000
 
 
 CHANNEL_LABELS = {
-    DataType.NTF_ACC:        ["ACC-X", "ACC-Y", "ACC-Z"],
-    DataType.NTF_GYRO:       ["GYRO-X", "GYRO-Y", "GYRO-Z"],
-    DataType.NTF_EULER_DATA: ["Pitch(Y)", "Roll(X)", "Yaw(Z)"],
+    DataType.NTF_ACC:        ["ACC-X (g)", "ACC-Y (g)", "ACC-Z (g)"],
+    DataType.NTF_GYRO:       ["GYRO-X (dps)", "GYRO-Y (dps)", "GYRO-Z (dps)"],
+    DataType.NTF_EULER_DATA: ["Pitch(Y) (deg)", "Roll(X) (deg)", "Yaw(Z) (deg)"],
     DataType.NTF_QUATERNION: ["W", "X", "Y", "Z"],
+    DataType.NTF_MAG:        ["MAG-X (uT)", "MAG-Y (uT)", "MAG-Z (uT)"],
+}
+
+LSL_CHANNEL_UNITS = {
+    DataType.NTF_ACC:           "g",
+    DataType.NTF_GYRO:          "dps",
+    DataType.NTF_MAG:           "uT",
+    DataType.NTF_EULER_DATA:    "deg",
+    DataType.NTF_QUATERNION:    "unitless",
+    DataType.NTF_GEST:          "unitless",
+    DataType.NTF_EMG:           "uV",
+    DataType.NTF_ANGLE_DATA:    "deg",
+    DataType.NTF_EEG:           "uV",
+    DataType.NTF_ECG:           "uV",
+    DataType.NTF_IMPEDANCE:     "ohm",
+    DataType.NTF_IMU:           ("g", "g", "g", "dps", "dps", "dps",
+                                 "deg", "deg", "deg", "unitless", "unitless",
+                                 "unitless", "unitless"),
+    DataType.NTF_ADS:           "uV",
+    DataType.NTF_BRTH:          "uV",
+    DataType.NTF_IMPEDANCE_EXT: "ohm",
+    DataType.NTF_SPO2:          ("%", "bpm"),
+    DataType.NTF_PPG:           "count",
 }
 
 DATA_TYPE_NAMES = {
@@ -70,6 +217,7 @@ DATA_TYPE_NAMES = {
     DataType.NTF_GYRO:       "Gyroscope (GYRO)",
     DataType.NTF_EULER_DATA: "Euler Angle (Euler)",
     DataType.NTF_QUATERNION: "Quaternion (Quaternion)",
+    DataType.NTF_MAG:        "Magnetometer (MAG)",
 }
 
 # Live Filter band options: (display name, (low, high)), None = off
@@ -145,12 +293,12 @@ GESTURE_DEFAULT_TEXT = (
 
 # PPG device right-side plot config: (data type, channel, title, color)
 BIO_PLOT_CONFIG = [
-    (DataType.NTF_EEG,  0, "fp1",   plt.cm.tab10(0)),
-    (DataType.NTF_EEG,  1, "fp2",   plt.cm.tab10(1)),
+    (DataType.NTF_EEG,  0, "fp1 (uV)",   plt.cm.tab10(0)),
+    (DataType.NTF_EEG,  1, "fp2 (uV)",   plt.cm.tab10(1)),
     (DataType.NTF_PPG,  0, "red_led", plt.cm.tab10(2)),
     (DataType.NTF_PPG,  1, "ir_led",  plt.cm.tab10(3)),
-    (DataType.NTF_SPO2, 0, "spo2",    plt.cm.tab10(4)),
-    (DataType.NTF_SPO2, 1, "heart_rate", plt.cm.tab10(5)),
+    (DataType.NTF_SPO2, 0, "spo2 (%)",    plt.cm.tab10(4)),
+    (DataType.NTF_SPO2, 1, "heart_rate (bpm)", plt.cm.tab10(5)),
 ]
 
 EEG_AXIS_COUNT = 8
@@ -212,12 +360,12 @@ class DeviceDataState:
         self.brth_impedance: list = []
         self.brth_buffer_lock = QtCore.QMutex()
 
-        self.has_mag_angle = False
-        self.mag_angle_buffer = None
-        self.mag_angle_sample_index_buffer = None
-        self.mag_angle_buffer_index = 0
-        self.mag_angle_sample_rate = 0
-        self.mag_angle_buffer_lock = QtCore.QMutex()
+        self.has_angle = False
+        self.angle_buffer = None
+        self.angle_sample_index_buffer = None
+        self.angle_buffer_index = 0
+        self.angle_sample_rate = 0
+        self.angle_buffer_lock = QtCore.QMutex()
 
         self.has_emg = False
         self.emg_buffer = None
@@ -354,6 +502,7 @@ class DeviceDataState:
             (DataType.NTF_GYRO,       info.GyroSampleRate,  info.GyroChannelCount),
             (DataType.NTF_EULER_DATA, info.EulerSampleRate, info.EulerChannelCount),
             (DataType.NTF_QUATERNION, info.QuatSampleRate,  info.QuatChannelCount),
+            (DataType.NTF_MAG,        info.MagSampleRate,   info.MagChannelCount),
         ]
         for dt, sr, ch in configs:
             if sr > 0 and ch > 0:
@@ -388,31 +537,31 @@ class DeviceDataState:
             self.brth_sample_index_buffer = np.zeros((info.BrthChannelCount, buf_len), dtype=np.int64)
             self.brth_buffer_index = 0
 
-        self.has_mag_angle = info.MagAngleSampleRate > 0 and info.MagAngleChannelCount > 0
-        if self.has_mag_angle:
-            self.mag_angle_sample_rate = info.MagAngleSampleRate
-            buf_len = max(info.MagAngleSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.mag_angle_buffer = np.zeros((info.MagAngleChannelCount, buf_len))
-            self.mag_angle_sample_index_buffer = np.zeros((info.MagAngleChannelCount, buf_len), dtype=np.int64)
-            self.mag_angle_buffer_index = 0
+        self.has_angle = info.AngleSampleRate > 0 and info.AngleChannelCount > 0
+        if self.has_angle:
+            self.angle_sample_rate = info.AngleSampleRate
+            buf_len = max(info.AngleSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.angle_buffer = np.zeros((info.AngleChannelCount, buf_len))
+            self.angle_sample_index_buffer = np.zeros((info.AngleChannelCount, buf_len), dtype=np.int64)
+            self.angle_buffer_index = 0
 
         self.has_emg = info.EmgSampleRate > 0 and info.EmgChannelCount > 0
         if self.has_emg:
             self.emg_sample_rate = info.EmgSampleRate
-            # A mag-angle stream takes the last bio row from the EMG channels
-            self.emg_display_channels = min(info.EmgChannelCount, eeg_axis_count - int(self.has_mag_angle))
+            # An angle stream takes the last bio row from the EMG channels
+            self.emg_display_channels = min(info.EmgChannelCount, eeg_axis_count - int(self.has_angle))
             buf_len = max(info.EmgSampleRate * BIO_BUFFER_SECONDS, 1)
             self.emg_buffer = np.zeros((self.emg_display_channels, buf_len))
             self.emg_sample_index_buffer = np.zeros((self.emg_display_channels, buf_len), dtype=np.int64)
             self.emg_buffer_index = 0
             self.emg_impedance = [None] * self.emg_display_channels
 
-        # Bio display mode: PPG > EEG > EMG/MAG_ANGLE
+        # Bio display mode: PPG > EEG > EMG/ANGLE
         if info.PpgSampleRate > 0:
             self.bio_kind = "ppg"
         elif self.eeg_buffer is not None:
             self.bio_kind = "eeg"
-        elif self.emg_buffer is not None or self.has_mag_angle:
+        elif self.emg_buffer is not None or self.has_angle:
             self.bio_kind = "emg"
         else:
             self.bio_kind = None
@@ -432,7 +581,7 @@ class DeviceDataState:
                     self.bio_sample_rates[dt] = sr
                     self.bio_impedance[dt] = []
 
-        extra_axes = int(self.has_ecg) + int(self.has_brth) + int(self.has_mag_angle)
+        extra_axes = int(self.has_ecg) + int(self.has_brth) + int(self.has_angle)
         self.eeg_channels_per_page = eeg_axis_count - extra_axes
 
     def sync_bio_sample_rates(self, info: DeviceInfo) -> bool:
@@ -495,19 +644,19 @@ class DeviceDataState:
                 self.brth_buffer_lock.unlock()
             changed = True
 
-        if (info.MagAngleSampleRate > 0 and self.has_mag_angle
-                and self.mag_angle_buffer is not None
-                and self.mag_angle_sample_rate != info.MagAngleSampleRate):
-            ch = self.mag_angle_buffer.shape[0]
-            buf_len = max(info.MagAngleSampleRate * BIO_BUFFER_SECONDS, 1)
-            self.mag_angle_buffer_lock.lock()
+        if (info.AngleSampleRate > 0 and self.has_angle
+                and self.angle_buffer is not None
+                and self.angle_sample_rate != info.AngleSampleRate):
+            ch = self.angle_buffer.shape[0]
+            buf_len = max(info.AngleSampleRate * BIO_BUFFER_SECONDS, 1)
+            self.angle_buffer_lock.lock()
             try:
-                self.mag_angle_sample_rate = info.MagAngleSampleRate
-                self.mag_angle_buffer = np.zeros((ch, buf_len))
-                self.mag_angle_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
-                self.mag_angle_buffer_index = 0
+                self.angle_sample_rate = info.AngleSampleRate
+                self.angle_buffer = np.zeros((ch, buf_len))
+                self.angle_sample_index_buffer = np.zeros((ch, buf_len), dtype=np.int64)
+                self.angle_buffer_index = 0
             finally:
-                self.mag_angle_buffer_lock.unlock()
+                self.angle_buffer_lock.unlock()
             changed = True
 
         # PPG mode: EEG fp1/fp2 + PPG + SpO2 live in the 5 s bio buffers
@@ -729,25 +878,25 @@ class DeviceDataState:
                 self.brth_buffer_lock.unlock()
             return
 
-        if dt == DataType.NTF_MAG_ANGLE_DATA:
-            self.mag_angle_buffer_lock.lock()
+        if dt == DataType.NTF_ANGLE_DATA:
+            self.angle_buffer_lock.lock()
             try:
-                buf = self.mag_angle_buffer
-                idx_buf = self.mag_angle_sample_index_buffer
+                buf = self.angle_buffer
+                idx_buf = self.angle_sample_index_buffer
                 if buf is None or idx_buf is None:
                     return
                 arr = data.as_numpy()
                 n = min(data.sampleCount, buf.shape[1])
                 if n == 0:
                     return
-                write_start = self.mag_angle_buffer_index
+                write_start = self.angle_buffer_index
                 for ch_idx in range(min(arr.shape[0], buf.shape[0])):
                     vals = np.asarray(arr["data"][ch_idx], dtype=np.float32)
                     indices = np.asarray(arr["sampleIndex"][ch_idx], dtype=np.int64)
                     _ring_write(buf[ch_idx], idx_buf[ch_idx], write_start, vals[-n:], indices[-n:])
-                self.mag_angle_buffer_index = (write_start + n) % buf.shape[1]
+                self.angle_buffer_index = (write_start + n) % buf.shape[1]
             finally:
-                self.mag_angle_buffer_lock.unlock()
+                self.angle_buffer_lock.unlock()
             return
 
         # IMU ring buffers
@@ -786,7 +935,7 @@ class DeviceDataState:
         self.ecg_buffer_lock.lock()
         self.brth_buffer_lock.lock()
         self.emg_buffer_lock.lock()
-        self.mag_angle_buffer_lock.lock()
+        self.angle_buffer_lock.lock()
         try:
             if self.eeg_buffer is not None:
                 self.eeg_buffer.fill(0)
@@ -804,12 +953,12 @@ class DeviceDataState:
                 self.emg_buffer.fill(0)
                 self.emg_sample_index_buffer.fill(0)
                 self.emg_buffer_index = 0
-            if self.mag_angle_buffer is not None:
-                self.mag_angle_buffer.fill(0)
-                self.mag_angle_sample_index_buffer.fill(0)
-                self.mag_angle_buffer_index = 0
+            if self.angle_buffer is not None:
+                self.angle_buffer.fill(0)
+                self.angle_sample_index_buffer.fill(0)
+                self.angle_buffer_index = 0
         finally:
-            self.mag_angle_buffer_lock.unlock()
+            self.angle_buffer_lock.unlock()
             self.emg_buffer_lock.unlock()
             self.brth_buffer_lock.unlock()
             self.ecg_buffer_lock.unlock()
@@ -861,7 +1010,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
-        self.mag_angle_line = None
+        self.angle_line = None
         self.emg_lines = []
         self.bio_lines = []
         self._eeg_display_channels = 0
@@ -929,6 +1078,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._shown_backend = ""
         self._backend_query_pending = False
         self._backend_query_ms = 0.0
+        self._lsl_worker = LslStreamWorker()
 
         # Data queue: the data callback only enqueues (a clone when Use Clone
         # Data is checked, the borrowed batch otherwise), a worker thread
@@ -1032,6 +1182,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         _bold_font.setBold(True)
         self.btn_check_dongle.setFont(_bold_font)
 
+        self.btn_lsl = QtWidgets.QPushButton("Start LSL")
+        self.btn_lsl.clicked.connect(self._toggle_lsl)
+
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
 
@@ -1051,6 +1204,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             f"SDK: {self.sensor_controller.getVersion()} | Backend: --")
         sdk_header_layout.addWidget(self.sdk_label)
         sdk_header_layout.addStretch()
+        sdk_header_layout.addWidget(self.btn_lsl)
         sdk_header_layout.addWidget(self.btn_multi_sync)
         sdk_header_layout.addWidget(self.btn_multi_replay)
         sdk_header_layout.addWidget(self.btn_check_dongle)
@@ -1194,7 +1348,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             "NTF_PPG":  QtWidgets.QCheckBox("PPG"),
             "NTF_SPO2": QtWidgets.QCheckBox("SpO2"),
             "NTF_IMU":  QtWidgets.QCheckBox("IMU"),
-            "NTF_MAG_ANGLE": QtWidgets.QCheckBox("Angle"),
+            "NTF_ANGLE": QtWidgets.QCheckBox("Angle"),
         }
         for key, cb in self._ntf_checkboxes.items():
             cb.setChecked(True)
@@ -1484,12 +1638,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_auto_reconnect_toggled(self, checked: bool):
         self._auto_reconnect_enabled = bool(checked)
         self._app_log(f"User: auto reconnect {'ON' if checked else 'OFF'}")
-        for state in self.device_states.values():
-            state.sensor.autoReconnect = checked
+        for sensor in self.sensor_controller.getSensors():
+            sensor.autoReconnect = checked
 
     def _on_use_clone_data_toggled(self, checked: bool):
         self._use_clone_data = checked
         self._app_log(f"User: use clone data {'ON' if checked else 'OFF'}")
+
+    def _toggle_lsl(self):
+        if self._lsl_worker.is_running:
+            self._lsl_worker.stop()
+            self.btn_lsl.setText("Start LSL")
+            self.status_label.setText("LSL stopped")
+            self._app_log("User: LSL stopped")
+            return
+        try:
+            self._lsl_worker.start()
+        except Exception as e:
+            self.btn_lsl.setText("Start LSL")
+            self.status_label.setText(f"LSL start failed: {e}")
+            self._app_log(f"App: LSL start failed: {e}", "E")
+            QtWidgets.QMessageBox.warning(self, "Start LSL", str(e))
+            return
+        self.btn_lsl.setText("Stop LSL")
+        self.status_label.setText("LSL streaming")
+        self._app_log("User: LSL started")
 
     def _on_device_found(self, device_list: List[BLEDevice]):
         # Every batch is a full scan-round snapshot; merge it into the list in
@@ -1642,7 +1815,46 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         submit(self._connect_device, device,
                self.chk_auto_reconnect.isChecked(), True)
 
-    def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None):
+    def _auto_recovery_allowed(self, sensor: SensorProfile) -> bool:
+        if self._auto_reconnect_enabled and sensor.autoReconnect:
+            return True
+        sensor.autoReconnect = False
+        return False
+
+    def _abandon_auto_recovery(self, addr: str, sensor: SensorProfile, state: DeviceDataState):
+        sensor.autoReconnect = False
+        self._connecting_addrs.discard(addr)
+        device_state = sensor.deviceState
+        keep_state = (sensor.isReady or sensor.isDataTransfering
+                      or device_state == DeviceStateEx.Connected)
+        if keep_state:
+            state = self.device_states.get(addr) or state
+            self.device_states[addr] = state
+        elif device_state == DeviceStateEx.Disconnected:
+            self.device_states.pop(addr, None)
+
+        def restore_ui():
+            if keep_state:
+                self._update_device_item_text(addr, connected=True)
+                if self._selected_address() == addr:
+                    self.current_sensor = sensor
+                    self._refresh_display_for_state(state)
+                    if not state.status_parts and not state.status_text:
+                        self.status_label.setText("Connected (device)")
+            elif device_state == DeviceStateEx.Disconnected:
+                self._update_device_item_text(addr, connected=False)
+                if (self.current_sensor is not None
+                        and self.current_sensor.BLEDevice.Address == addr):
+                    self.current_sensor = None
+                if self._selected_address() == addr:
+                    self._refresh_display_for_state(None)
+                    self.status_label.setText("Disconnected (device)")
+            self._update_button_states()
+
+        self._ui(restore_ui)
+
+    def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None,
+                        is_auto_recovery: bool = False):
         if device is None:
             self._app_log("User: connect rejected (no device selected)", "W")
             self._ui(lambda: self.status_label.setText("Please select a device in the list first"))
@@ -1663,6 +1875,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if sensor is None:
             self._app_log(f"App: failed to create SensorProfile for {addr}", "E")
             self._ui(lambda: self.status_label.setText("Failed to create SensorProfile"))
+            return
+
+        state = DeviceDataState(sensor)
+        if is_auto_recovery and not self._auto_recovery_allowed(sensor):
+            self._abandon_auto_recovery(addr, sensor, state)
             return
 
         self._connecting_addrs.add(addr)
@@ -1689,8 +1906,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self._ui(lambda: self.status_label.setText(f"Failed to connect to {device.Name}"))
                 self._ui(self._update_button_states)
                 return
-
-        state = DeviceDataState(sensor)
 
         if not sensor.hasInited:
             ok = sensor.init(PACKAGE_COUNT,
@@ -1729,8 +1944,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ])
             if info.GestChannelCount > 0:
                 state.status_parts.append(("GEST", info.GestChannelCount, info.GestSampleRate, DataType.NTF_GEST))
-            if info.MagAngleChannelCount > 0:
-                state.status_parts.append(("Angle", info.MagAngleChannelCount, info.MagAngleSampleRate, DataType.NTF_MAG_ANGLE_DATA))
+            if info.MagChannelCount > 0:
+                state.status_parts.append(("Mag", info.MagChannelCount, info.MagSampleRate, DataType.NTF_MAG))
+            if info.AngleChannelCount > 0:
+                state.status_parts.append(("Angle", info.AngleChannelCount, info.AngleSampleRate, DataType.NTF_ANGLE_DATA))
             state.status_text = state.build_status_text()
 
         if not sensor.isDataTransfering:
@@ -1747,13 +1964,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_states[addr] = state
         self._ui(lambda: self._update_device_item_text(addr, connected=True))
 
+        power = -1
         try:
             power = sensor.getBatteryLevel()
-            if (power >= 0 and (state.last_power is None
-                                or abs(power - state.last_power) >= POWER_STABLE_BAND)):
-                state.last_power = power
         except Exception:
             pass
+        if (power >= 0 and (state.last_power is None
+                            or abs(power - state.last_power) >= POWER_STABLE_BAND)):
+            state.last_power = power
 
         if select_current is None:
             select_current = self._selected_address() == addr
@@ -2201,6 +2419,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if data is None or data.channelCount == 0 or data.sampleCount == 0:
                 continue
             state.note_data_received(data)
+            self._lsl_worker.enqueue(addr, data, use_clone)
             self._enqueue_data(addr, data.clone() if use_clone else data)
 
     def _dispatch_sensor_data(self, addr: str, data: SensorData):
@@ -2225,7 +2444,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         if (data.dataType in state.buffers
                 or data.dataType in (DataType.NTF_EEG, DataType.NTF_ECG, DataType.NTF_BRTH,
-                                     DataType.NTF_EMG, DataType.NTF_MAG_ANGLE_DATA)
+                                     DataType.NTF_EMG, DataType.NTF_ANGLE_DATA)
                 or (state.bio_buffers and data.dataType in state.bio_buffers)):
             self._append_sensor_data(addr, data)
         if data.dataType == DataType.NTF_QUATERNION:
@@ -2271,6 +2490,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         self._app_log("App: demo window closing")
         self.timer.stop()
+        self._lsl_worker.stop()
         self._data_worker_stop = True
         self._data_queue_event.set()
         self._data_worker.join(timeout=2)
@@ -2557,7 +2777,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         eeg_available = False
         ecg_available = False
         brth_available = False
-        mag_angle_available = False
+        angle_available = False
         eeg_buffer_copy = None
         eeg_idx_buf_copy = None
         eeg_buffer_index = 0
@@ -2567,21 +2787,21 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         brth_buffer_copy = None
         brth_idx_buf_copy = None
         brth_buffer_index = 0
-        mag_angle_buffer_copy = None
-        mag_angle_idx_buf_copy = None
-        mag_angle_buffer_index = 0
+        angle_buffer_copy = None
+        angle_idx_buf_copy = None
+        angle_buffer_index = 0
 
         if state is not None:
             state.eeg_buffer_lock.lock()
             state.ecg_buffer_lock.lock()
             state.brth_buffer_lock.lock()
-            state.mag_angle_buffer_lock.lock()
+            state.angle_buffer_lock.lock()
             try:
                 eeg_available = state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None
                 ecg_available = state.has_ecg and state.ecg_buffer is not None and state.ecg_sample_index_buffer is not None
                 brth_available = state.has_brth and state.brth_buffer is not None and state.brth_sample_index_buffer is not None
-                mag_angle_available = (state.has_mag_angle and state.mag_angle_buffer is not None
-                                       and state.mag_angle_sample_index_buffer is not None)
+                angle_available = (state.has_angle and state.angle_buffer is not None
+                                       and state.angle_sample_index_buffer is not None)
                 if eeg_available:
                     eeg_buffer_copy = state.eeg_buffer.copy()
                     eeg_idx_buf_copy = state.eeg_sample_index_buffer.copy()
@@ -2594,12 +2814,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     brth_buffer_copy = state.brth_buffer.copy()
                     brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
                     brth_buffer_index = state.brth_buffer_index
-                if mag_angle_available:
-                    mag_angle_buffer_copy = state.mag_angle_buffer.copy()
-                    mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
-                    mag_angle_buffer_index = state.mag_angle_buffer_index
+                if angle_available:
+                    angle_buffer_copy = state.angle_buffer.copy()
+                    angle_idx_buf_copy = state.angle_sample_index_buffer.copy()
+                    angle_buffer_index = state.angle_buffer_index
             finally:
-                state.mag_angle_buffer_lock.unlock()
+                state.angle_buffer_lock.unlock()
                 state.brth_buffer_lock.unlock()
                 state.ecg_buffer_lock.unlock()
                 state.eeg_buffer_lock.unlock()
@@ -2618,11 +2838,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
             self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
             self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
-            self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_ANGLE_DATA, None)
             self.eeg_lines = []
             self.ecg_line = None
             self.brth_line = None
-            self.mag_angle_line = None
+            self.angle_line = None
             self.emg_lines = []
             self.bio_lines = []
             self._eeg_display_channels = 0
@@ -2631,7 +2851,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
 
         bio_title = "EEG + ECG + BRTH Waveform"
-        if mag_angle_available:
+        if angle_available:
             bio_title = "EEG + ECG + BRTH + Angle Waveform"
         self.bio_title_label.setText(bio_title)
         self.emg_lines = []
@@ -2645,10 +2865,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self._last_plotted_sample_indices[DataType.NTF_BRTH] = int(brth_idx_buf_copy.max())
         else:
             self.brth_line = None
-        if mag_angle_available:
-            self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = int(mag_angle_idx_buf_copy.max())
+        if angle_available:
+            self._last_plotted_sample_indices[DataType.NTF_ANGLE_DATA] = int(angle_idx_buf_copy.max())
         else:
-            self.mag_angle_line = None
+            self.angle_line = None
 
         start_ch, end_ch = self._eeg_page_range()
         page_eeg_count = max(0, end_ch - start_ch)
@@ -2657,15 +2877,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # Extra rows are assigned from the bottom up: BRTH last, ECG above it, Angle above that
         brth_axis_index = EEG_AXIS_COUNT - 1 if brth_available else None
         ecg_axis_index = EEG_AXIS_COUNT - 1 - int(brth_available) if ecg_available else None
-        mag_angle_axis_index = (EEG_AXIS_COUNT - 1 - int(brth_available) - int(ecg_available)
-                                if mag_angle_available else None)
+        angle_axis_index = (EEG_AXIS_COUNT - 1 - int(brth_available) - int(ecg_available)
+                                if angle_available else None)
 
         # EEG channel rows and the ECG/Angle rows get the left FFT + right waveform split
         fft_rows = set(range(page_eeg_count))
         if ecg_axis_index is not None:
             fft_rows.add(ecg_axis_index)
-        if mag_angle_axis_index is not None:
-            fft_rows.add(mag_angle_axis_index)
+        if angle_axis_index is not None:
+            fft_rows.add(angle_axis_index)
         self._reset_eeg_axes(EEG_AXIS_COUNT, fft_rows)
         self.bio_fft_lines = [None] * len(self.axes_eeg)
 
@@ -2673,8 +2893,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, eeg_buffer_copy.shape[1])
         t_ecg = np.linspace(-BIO_BUFFER_SECONDS, 0, ecg_buffer_copy.shape[1]) if ecg_available else None
         t_brth = np.linspace(-BIO_BUFFER_SECONDS, 0, brth_buffer_copy.shape[1]) if brth_available else None
-        t_mag_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, mag_angle_buffer_copy.shape[1])
-                       if mag_angle_available else None)
+        t_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, angle_buffer_copy.shape[1])
+                       if angle_available else None)
 
         for ch, ax in enumerate(self.axes_eeg):
             ax.cla()
@@ -2687,7 +2907,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
-                ax.set_ylabel(f"EEG-{eeg_ch + 1}", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel(f"EEG-{eeg_ch + 1} (uV)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2698,7 +2918,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel(f"EEG-{eeg_ch + 1}", fontsize=8, color=color,
+                    fax.set_ylabel(f"EEG-{eeg_ch + 1} (uV)", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2710,7 +2930,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
-                ax.set_ylabel("ECG", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("ECG (uV)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2721,20 +2941,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("ECG", fontsize=8, color=color,
+                    fax.set_ylabel("ECG (uV)", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
-            elif ch == mag_angle_axis_index and mag_angle_available:
+            elif ch == angle_axis_index and angle_available:
                 color = plt.cm.tab10(8)
-                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
-                (line,) = ax.plot(t_mag_angle, y_data, color=color, linewidth=0.8)
-                self.mag_angle_line = line
+                y_data = np.roll(angle_buffer_copy[0], -angle_buffer_index)
+                (line,) = ax.plot(t_angle, y_data, color=color, linewidth=0.8)
+                self.angle_line = line
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
                 ax.set_ylim(0, 180)
-                ax.set_ylabel("Angle", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("Angle (deg)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2745,7 +2965,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("Angle", fontsize=8, color=color,
+                    fax.set_ylabel("Angle (deg)", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2757,7 +2977,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
-                ax.set_ylabel("BRTH", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("BRTH (uV)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2779,13 +2999,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         emg_idx_buf_copy = None
         emg_buffer_index = 0
         display_channels = 0
-        mag_angle_available = False
-        mag_angle_buffer_copy = None
-        mag_angle_idx_buf_copy = None
-        mag_angle_buffer_index = 0
+        angle_available = False
+        angle_buffer_copy = None
+        angle_idx_buf_copy = None
+        angle_buffer_index = 0
 
         state.emg_buffer_lock.lock()
-        state.mag_angle_buffer_lock.lock()
+        state.angle_buffer_lock.lock()
         try:
             emg_available = state.emg_buffer is not None and state.emg_sample_index_buffer is not None
             if emg_available:
@@ -2793,27 +3013,27 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 emg_idx_buf_copy = state.emg_sample_index_buffer.copy()
                 emg_buffer_index = state.emg_buffer_index
                 display_channels = state.emg_display_channels
-            mag_angle_available = (state.has_mag_angle and state.mag_angle_buffer is not None
-                                   and state.mag_angle_sample_index_buffer is not None)
-            if mag_angle_available:
-                mag_angle_buffer_copy = state.mag_angle_buffer.copy()
-                mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
-                mag_angle_buffer_index = state.mag_angle_buffer_index
+            angle_available = (state.has_angle and state.angle_buffer is not None
+                                   and state.angle_sample_index_buffer is not None)
+            if angle_available:
+                angle_buffer_copy = state.angle_buffer.copy()
+                angle_idx_buf_copy = state.angle_sample_index_buffer.copy()
+                angle_buffer_index = state.angle_buffer_index
         finally:
-            state.mag_angle_buffer_lock.unlock()
+            state.angle_buffer_lock.unlock()
             state.emg_buffer_lock.unlock()
 
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
-        self.mag_angle_line = None
+        self.angle_line = None
         self.bio_lines = []
         self._eeg_display_channels = 0
         self._last_plotted_sample_indices.pop(DataType.NTF_EEG, None)
         self._last_plotted_sample_indices.pop(DataType.NTF_ECG, None)
         self._last_plotted_sample_indices.pop(DataType.NTF_BRTH, None)
 
-        if not emg_available and not mag_angle_available:
+        if not emg_available and not angle_available:
             self._reset_eeg_axes(EEG_AXIS_COUNT, set())
             self.bio_fft_lines = []
             for ax in self.axes_eeg:
@@ -2823,34 +3043,34 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.axes_eeg[0].set_title("EMG (Device not supported or disabled)")
             self.canvas_eeg.draw_idle()
             self._last_plotted_sample_indices.pop(DataType.NTF_EMG, None)
-            self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
+            self._last_plotted_sample_indices.pop(DataType.NTF_ANGLE_DATA, None)
             self.emg_lines = []
             self._update_page_label()
             self._update_page_buttons()
             return
 
         self.bio_title_label.setText(
-            "EMG + Angle Waveform" if emg_available and mag_angle_available
+            "EMG + Angle Waveform" if emg_available and angle_available
             else ("EMG Waveform" if emg_available else "Angle Waveform"))
         if emg_available:
             self._last_plotted_sample_indices[DataType.NTF_EMG] = int(emg_idx_buf_copy.max())
-        if mag_angle_available:
-            self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = int(mag_angle_idx_buf_copy.max())
+        if angle_available:
+            self._last_plotted_sample_indices[DataType.NTF_ANGLE_DATA] = int(angle_idx_buf_copy.max())
 
         if display_channels == 0 and emg_available:
-            display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT - int(mag_angle_available))
+            display_channels = min(emg_buffer_copy.shape[0], EEG_AXIS_COUNT - int(angle_available))
 
         # EMG channel rows and the Angle row get the left FFT + right waveform split
         fft_rows = set(range(display_channels))
-        if mag_angle_available:
+        if angle_available:
             fft_rows.add(display_channels)
         self._reset_eeg_axes(EEG_AXIS_COUNT, fft_rows)
         self.bio_fft_lines = [None] * len(self.axes_eeg)
 
         self.emg_lines = []
         t = np.linspace(-BIO_BUFFER_SECONDS, 0, emg_buffer_copy.shape[1]) if emg_available else None
-        t_mag_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, mag_angle_buffer_copy.shape[1])
-                       if mag_angle_available else None)
+        t_angle = (np.linspace(-BIO_BUFFER_SECONDS, 0, angle_buffer_copy.shape[1])
+                       if angle_available else None)
         for ch, ax in enumerate(self.axes_eeg):
             ax.cla()
             if ch < display_channels:
@@ -2861,7 +3081,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
-                ax.set_ylabel(f"EMG-{ch + 1}", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel(f"EMG-{ch + 1} (uV)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2872,20 +3092,20 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel(f"EMG-{ch + 1}", fontsize=8, color=color,
+                    fax.set_ylabel(f"EMG-{ch + 1} (uV)", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
-            elif ch == display_channels and mag_angle_available:
+            elif ch == display_channels and angle_available:
                 color = plt.cm.tab10(8)
-                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
-                (line,) = ax.plot(t_mag_angle, y_data, color=color, linewidth=0.8)
-                self.mag_angle_line = line
+                y_data = np.roll(angle_buffer_copy[0], -angle_buffer_index)
+                (line,) = ax.plot(t_angle, y_data, color=color, linewidth=0.8)
+                self.angle_line = line
                 ax.tick_params(axis='both', labelsize=7)
                 ax.ticklabel_format(axis='y', style='plain', useOffset=False)
                 ax.set_xlim(-BIO_BUFFER_SECONDS, 0)
                 ax.set_ylim(0, 180)
-                ax.set_ylabel("Angle", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
+                ax.set_ylabel("Angle (deg)", fontsize=8, color=color, rotation=0, va='center', ha='left', labelpad=10)
                 ax.yaxis.set_label_position("right")
                 for spine in ax.spines.values():
                     spine.set_color(color)
@@ -2896,7 +3116,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("Angle", fontsize=8, color=color,
+                    fax.set_ylabel("Angle (deg)", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -2936,10 +3156,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.eeg_lines = []
         self.ecg_line = None
         self.brth_line = None
-        self.mag_angle_line = None
+        self.angle_line = None
         self.emg_lines = []
         self._eeg_display_channels = 0
-        self._last_plotted_sample_indices.pop(DataType.NTF_MAG_ANGLE_DATA, None)
+        self._last_plotted_sample_indices.pop(DataType.NTF_ANGLE_DATA, None)
 
         if not has_any_data:
             for ax in self.axes_eeg:
@@ -3274,13 +3494,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         brth_idx_buf_copy = None
         brth_impedance_copy = None
         brth_buffer_index = 0
-        mag_angle_buffer_copy = None
-        mag_angle_idx_buf_copy = None
-        mag_angle_buffer_index = 0
+        angle_buffer_copy = None
+        angle_idx_buf_copy = None
+        angle_buffer_index = 0
         state.eeg_buffer_lock.lock()
         state.ecg_buffer_lock.lock()
         state.brth_buffer_lock.lock()
-        state.mag_angle_buffer_lock.lock()
+        state.angle_buffer_lock.lock()
         try:
             if state.eeg_buffer is not None and state.eeg_sample_index_buffer is not None:
                 eeg_buffer_copy = state.eeg_buffer.copy()
@@ -3297,13 +3517,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 brth_idx_buf_copy = state.brth_sample_index_buffer.copy()
                 brth_impedance_copy = list(state.brth_impedance)
                 brth_buffer_index = state.brth_buffer_index
-            if (state.has_mag_angle and state.mag_angle_buffer is not None
-                    and state.mag_angle_sample_index_buffer is not None):
-                mag_angle_buffer_copy = state.mag_angle_buffer.copy()
-                mag_angle_idx_buf_copy = state.mag_angle_sample_index_buffer.copy()
-                mag_angle_buffer_index = state.mag_angle_buffer_index
+            if (state.has_angle and state.angle_buffer is not None
+                    and state.angle_sample_index_buffer is not None):
+                angle_buffer_copy = state.angle_buffer.copy()
+                angle_idx_buf_copy = state.angle_sample_index_buffer.copy()
+                angle_buffer_index = state.angle_buffer_index
         finally:
-            state.mag_angle_buffer_lock.unlock()
+            state.angle_buffer_lock.unlock()
             state.brth_buffer_lock.unlock()
             state.ecg_buffer_lock.unlock()
             state.eeg_buffer_lock.unlock()
@@ -3312,12 +3532,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         ecg_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) if state.has_ecg else None
         # Angle row matches the rebuild layout: after the EMG channel rows
         # in EMG mode, above ECG/BRTH in EEG mode (no row in PPG mode)
-        if not state.has_mag_angle or state.bio_kind == "ppg":
-            mag_angle_axis_index = None
+        if not state.has_angle or state.bio_kind == "ppg":
+            angle_axis_index = None
         elif state.bio_kind == "emg":
-            mag_angle_axis_index = len(self.emg_lines)
+            angle_axis_index = len(self.emg_lines)
         else:
-            mag_angle_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) - int(state.has_ecg)
+            angle_axis_index = len(self.axes_eeg) - 1 - int(state.has_brth) - int(state.has_ecg)
         start_ch, _ = self._eeg_page_range()
 
         if eeg_buffer_copy is not None and eeg_idx_buf_copy is not None and self.eeg_lines:
@@ -3352,14 +3572,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         else:
                             color = "red"
                         ax.set_ylabel(
-                            f"EEG-{eeg_ch + 1}\n{current_impedance:.2f} KOhm",
+                            f"EEG-{eeg_ch + 1} (uV)\n{current_impedance:.2f} KOhm",
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
                     else:
                         ax.set_ylabel(
-                            f"EEG-{eeg_ch + 1}",
+                            f"EEG-{eeg_ch + 1} (uV)",
                             fontsize=8, color=line.get_color(), rotation=0,
                             va='center', ha='left', labelpad=10
                         )
@@ -3385,15 +3605,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 ecg_axis_index,
                                 np.roll(ecg_buffer_copy[0], -ecg_buffer_index),
                                 sr_ecg))
-                    if (mag_angle_axis_index is not None and mag_angle_buffer_copy is not None
-                            and self.mag_angle_line is not None):
-                        sr_mag = (state.mag_angle_sample_rate
-                                  or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
-                        if sr_mag > 0:
+                    if (angle_axis_index is not None and angle_buffer_copy is not None
+                            and self.angle_line is not None):
+                        sr_angle = (state.angle_sample_rate
+                                  or state.nominal_rates.get(DataType.NTF_ANGLE_DATA) or 0)
+                        if sr_angle > 0:
                             row_specs.append((
-                                mag_angle_axis_index,
-                                np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index),
-                                sr_mag))
+                                angle_axis_index,
+                                np.roll(angle_buffer_copy[0], -angle_buffer_index),
+                                sr_angle))
                     if row_specs:
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(DataType.NTF_EEG, row_specs)
@@ -3446,14 +3666,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     else:
                         color = "red"
                     ax.set_ylabel(
-                        f"ECG\n{current_impedance:.2f} KOhm",
+                        f"ECG (uV)\n{current_impedance:.2f} KOhm",
                         fontsize=8, color=color, rotation=0,
                         va='center', ha='left', labelpad=10
                     )
                     ax.yaxis.set_label_position("right")
                 else:
                     ax.set_ylabel(
-                        "ECG",
+                        "ECG (uV)",
                         fontsize=8, color=self.ecg_line.get_color(), rotation=0,
                         va='center', ha='left', labelpad=10
                     )
@@ -3504,14 +3724,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         else:
                             color = "red"
                         ax.set_ylabel(
-                            f"EMG-{ch + 1}\n{current_impedance:.2f} KOhm",
+                            f"EMG-{ch + 1} (uV)\n{current_impedance:.2f} KOhm",
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
                         ax.yaxis.set_label_position("right")
                     else:
                         ax.set_ylabel(
-                            f"EMG-{ch + 1}",
+                            f"EMG-{ch + 1} (uV)",
                             fontsize=8, color=line.get_color(), rotation=0,
                             va='center', ha='left', labelpad=10
                         )
@@ -3527,14 +3747,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                             emg_buffer_copy[:len(self.emg_lines)],
                             -emg_buffer_index, axis=1)
                         row_specs = [(row, snapshot[row], sr) for row in range(snapshot.shape[0])]
-                    if self.mag_angle_line is not None and mag_angle_buffer_copy is not None:
-                        sr_mag = (state.mag_angle_sample_rate
-                                  or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
-                        if sr_mag > 0:
+                    if self.angle_line is not None and angle_buffer_copy is not None:
+                        sr_angle = (state.angle_sample_rate
+                                  or state.nominal_rates.get(DataType.NTF_ANGLE_DATA) or 0)
+                        if sr_angle > 0:
                             row_specs.append((
                                 len(self.emg_lines),
-                                np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index),
-                                sr_mag))
+                                np.roll(angle_buffer_copy[0], -angle_buffer_index),
+                                sr_angle))
                     if row_specs:
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(DataType.NTF_EMG, row_specs)
@@ -3542,33 +3762,33 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.canvas_eeg.draw_idle()
                 self._last_plotted_sample_indices[DataType.NTF_EMG] = current_last_idx
 
-        if (mag_angle_buffer_copy is not None and mag_angle_idx_buf_copy is not None
-                and self.mag_angle_line is not None and mag_angle_axis_index is not None):
-            current_last_idx = int(mag_angle_idx_buf_copy.max())
-            last_plotted_idx = self._last_plotted_sample_indices.get(DataType.NTF_MAG_ANGLE_DATA, -1)
+        if (angle_buffer_copy is not None and angle_idx_buf_copy is not None
+                and self.angle_line is not None and angle_axis_index is not None):
+            current_last_idx = int(angle_idx_buf_copy.max())
+            last_plotted_idx = self._last_plotted_sample_indices.get(DataType.NTF_ANGLE_DATA, -1)
             if current_last_idx != last_plotted_idx:
-                y_data = np.roll(mag_angle_buffer_copy[0], -mag_angle_buffer_index)
-                self.mag_angle_line.set_ydata(y_data)
-                ax = self.axes_eeg[mag_angle_axis_index]
+                y_data = np.roll(angle_buffer_copy[0], -angle_buffer_index)
+                self.angle_line.set_ydata(y_data)
+                ax = self.axes_eeg[angle_axis_index]
                 if not ax.get_visible():
                     ax.set_visible(True)
                 ax.set_ylim(0, 180)
                 self.canvas_eeg.draw_idle()
-                self._last_plotted_sample_indices[DataType.NTF_MAG_ANGLE_DATA] = current_last_idx
+                self._last_plotted_sample_indices[DataType.NTF_ANGLE_DATA] = current_last_idx
 
                 # Angle row FFT, submitted here when the EEG/EMG block above
                 # did not submit this round (its row specs already include this row)
                 now_fft = time.time()
                 if (not self._bio_fft_pending
                         and now_fft - self._bio_fft_last_submit >= FFT_UPDATE_INTERVAL):
-                    sr_mag = (state.mag_angle_sample_rate
-                              or state.nominal_rates.get(DataType.NTF_MAG_ANGLE_DATA) or 0)
-                    if (sr_mag > 0 and mag_angle_axis_index < len(self.bio_fft_lines)
-                            and self.bio_fft_lines[mag_angle_axis_index] is not None):
+                    sr_angle = (state.angle_sample_rate
+                              or state.nominal_rates.get(DataType.NTF_ANGLE_DATA) or 0)
+                    if (sr_angle > 0 and angle_axis_index < len(self.bio_fft_lines)
+                            and self.bio_fft_lines[angle_axis_index] is not None):
                         self._bio_fft_last_submit = now_fft
                         self._submit_bio_fft(
                             DataType.NTF_EMG if state.bio_kind == "emg" else DataType.NTF_EEG,
-                            [(mag_angle_axis_index, y_data, sr_mag)])
+                            [(angle_axis_index, y_data, sr_angle)])
 
         try:
             state.quaternion_lock.lock()
@@ -3628,6 +3848,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
     def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer):
+        if not self._auto_recovery_allowed(sensor):
+            answer(False)
+            return
         sensor.log(f"App: auto reconnect callback received, restore={restore}")
         self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
         submit(self._auto_reconnect_recovery, sensor.BLEDevice.Address, restore)
@@ -3639,8 +3862,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if sensor is None:
             self._app_log(f"App: auto reconnect recovery failed, unknown device: {addr}", "E")
             return
+        if not self._auto_recovery_allowed(sensor):
+            return
         device = sensor.BLEDevice
-        self._connect_device(device, self._auto_reconnect_enabled, select_current=True)
+        self._connect_device(device, self._auto_reconnect_enabled, select_current=True,
+                             is_auto_recovery=True)
         saved = dict(self._saved_params_by_addr.get(addr, {})) if restore else {}
         if saved and addr in self.device_states:
             sensor = self.device_states[addr].sensor
@@ -3893,7 +4119,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             "NTF_IMU":   max(info.AccChannelCount, info.GyroChannelCount) if info else 0,
             "NTF_BRTH":  info.BrthChannelCount if info else 0,
             "NTF_IMPEDANCE": info.ImpeChannelCount if info else 0,
-            "NTF_MAG_ANGLE": info.MagAngleChannelCount if info else 0,
+            "NTF_ANGLE": info.AngleChannelCount if info else 0,
         }
 
         ntf_states = {}
