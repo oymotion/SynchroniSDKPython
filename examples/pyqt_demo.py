@@ -6,6 +6,7 @@ Run (from the repo root, prebuilt lib/windows/x64/Debug/sensor.dll):
 
 Requires: pip install PyQt5 matplotlib numpy
 Optional: pip install scipy   (enables the Live Filter band selector)
+Optional: pip install pylsl   (enables the Start LSL button)
 """
 
 import sys
@@ -15,6 +16,7 @@ import subprocess
 import os
 import threading
 import collections
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +35,11 @@ try:
 except ImportError:
     scipy_signal = None    # Live Filter combo disabled, everything else works
 
+try:
+    import pylsl
+except ImportError:
+    pylsl = None
+
 from PyQt5 import QtWidgets, QtCore
 
 #sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bindings", "python"))
@@ -46,10 +53,127 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.34"
+DEMO_VERSION               = "0.1.42"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
+
+
+class LslStreamWorker:
+    MAX_QUEUE_BATCHES = 1000
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._queue = None
+        self._stop_event = None
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if pylsl is None:
+            raise RuntimeError("pylsl is not installed. Run: pip install pylsl")
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            work_queue = queue.Queue(maxsize=self.MAX_QUEUE_BATCHES)
+            stop_event = threading.Event()
+            self._queue = work_queue
+            self._stop_event = stop_event
+            self._thread = threading.Thread(
+                target=self._run, args=(work_queue, stop_event),
+                daemon=True, name="LSLStream")
+            self._thread.start()
+
+    def enqueue(self, addr: str, data: SensorData, clone_data: bool = False):
+        with self._lock:
+            work_queue = self._queue
+            running = self._thread is not None and self._thread.is_alive()
+        if not running or work_queue is None:
+            return
+        queued = data.clone() if clone_data else data
+        try:
+            work_queue.put_nowait((addr, queued))
+        except queue.Full:
+            try:
+                work_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                work_queue.put_nowait((addr, queued))
+            except queue.Full:
+                pass
+
+    def stop(self):
+        with self._lock:
+            thread = self._thread
+            stop_event = self._stop_event
+            self._thread = None
+            self._queue = None
+            self._stop_event = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+            if thread.is_alive():
+                print("[LSL] worker did not stop within 2 seconds")
+
+    def _run(self, work_queue, stop_event):
+        outlets = {}
+        while not stop_event.is_set():
+            try:
+                addr, data = work_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._push(outlets, addr, data)
+            except Exception as e:
+                print(f"[LSL] push error: {e}")
+
+    @staticmethod
+    def _outlet(outlets, addr, data):
+        data_type = data.dataType
+        type_name = data_type.name if isinstance(data_type, DataType) else str(data_type)
+        key = (addr, int(data_type))
+        outlet = outlets.get(key)
+        if outlet is not None:
+            return outlet
+        device_name = data.deviceName or addr
+        info = pylsl.StreamInfo(
+            f"{device_name}_{type_name}", type_name, data.channelCount,
+            max(0.0, float(data.sampleRate)), "float32", f"SensorSDK_{addr}_{type_name}")
+        channels = info.desc().append_child("channels")
+        labels = CHANNEL_LABELS.get(data_type, [])
+        units = LSL_CHANNEL_UNITS.get(data_type, "unitless")
+        for channel in range(data.channelCount):
+            label = (labels[channel].partition(" (")[0]
+                     if channel < len(labels) else f"ch{channel + 1}")
+            if isinstance(units, (tuple, list)):
+                unit = units[channel] if channel < len(units) else "unitless"
+            else:
+                unit = units
+            channel_info = channels.append_child("channel")
+            channel_info.append_child_value("label", label)
+            channel_info.append_child_value("unit", unit)
+        outlet = pylsl.StreamOutlet(info)
+        outlets[key] = outlet
+        return outlet
+
+    def _push(self, outlets, addr, data):
+        if not data.isDataValid():
+            return
+        array = data.as_numpy()
+        samples = array["data"].T.tolist()
+        timestamps = array["absTimeStampInSec"][0].astype(float).tolist()
+        if not timestamps or any(timestamp <= 0 for timestamp in timestamps):
+            now = pylsl.local_clock()
+            rate = float(data.sampleRate)
+            timestamps = [now - (len(samples) - 1 - index) / rate
+                          if rate > 0 else now for index in range(len(samples))]
+        self._outlet(outlets, addr, data).push_chunk(samples, timestamps)
 
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
@@ -64,6 +188,28 @@ CHANNEL_LABELS = {
     DataType.NTF_EULER_DATA: ["Pitch(Y) (deg)", "Roll(X) (deg)", "Yaw(Z) (deg)"],
     DataType.NTF_QUATERNION: ["W", "X", "Y", "Z"],
     DataType.NTF_MAG:        ["MAG-X (uT)", "MAG-Y (uT)", "MAG-Z (uT)"],
+}
+
+LSL_CHANNEL_UNITS = {
+    DataType.NTF_ACC:           "g",
+    DataType.NTF_GYRO:          "dps",
+    DataType.NTF_MAG:           "uT",
+    DataType.NTF_EULER_DATA:    "deg",
+    DataType.NTF_QUATERNION:    "unitless",
+    DataType.NTF_GEST:          "unitless",
+    DataType.NTF_EMG:           "uV",
+    DataType.NTF_ANGLE_DATA:    "deg",
+    DataType.NTF_EEG:           "uV",
+    DataType.NTF_ECG:           "uV",
+    DataType.NTF_IMPEDANCE:     "ohm",
+    DataType.NTF_IMU:           ("g", "g", "g", "dps", "dps", "dps",
+                                 "deg", "deg", "deg", "unitless", "unitless",
+                                 "unitless", "unitless"),
+    DataType.NTF_ADS:           "uV",
+    DataType.NTF_BRTH:          "uV",
+    DataType.NTF_IMPEDANCE_EXT: "ohm",
+    DataType.NTF_SPO2:          ("%", "bpm"),
+    DataType.NTF_PPG:           "count",
 }
 
 DATA_TYPE_NAMES = {
@@ -932,6 +1078,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._shown_backend = ""
         self._backend_query_pending = False
         self._backend_query_ms = 0.0
+        self._lsl_worker = LslStreamWorker()
 
         # Data queue: the data callback only enqueues (a clone when Use Clone
         # Data is checked, the borrowed batch otherwise), a worker thread
@@ -1035,6 +1182,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         _bold_font.setBold(True)
         self.btn_check_dongle.setFont(_bold_font)
 
+        self.btn_lsl = QtWidgets.QPushButton("Start LSL")
+        self.btn_lsl.clicked.connect(self._toggle_lsl)
+
         self.btn_replay = QtWidgets.QPushButton("Replay Bin File")
         self.btn_replay.clicked.connect(self._replay_bin_file)
 
@@ -1054,6 +1204,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             f"SDK: {self.sensor_controller.getVersion()} | Backend: --")
         sdk_header_layout.addWidget(self.sdk_label)
         sdk_header_layout.addStretch()
+        sdk_header_layout.addWidget(self.btn_lsl)
         sdk_header_layout.addWidget(self.btn_multi_sync)
         sdk_header_layout.addWidget(self.btn_multi_replay)
         sdk_header_layout.addWidget(self.btn_check_dongle)
@@ -1487,12 +1638,31 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_auto_reconnect_toggled(self, checked: bool):
         self._auto_reconnect_enabled = bool(checked)
         self._app_log(f"User: auto reconnect {'ON' if checked else 'OFF'}")
-        for state in self.device_states.values():
-            state.sensor.autoReconnect = checked
+        for sensor in self.sensor_controller.getSensors():
+            sensor.autoReconnect = checked
 
     def _on_use_clone_data_toggled(self, checked: bool):
         self._use_clone_data = checked
         self._app_log(f"User: use clone data {'ON' if checked else 'OFF'}")
+
+    def _toggle_lsl(self):
+        if self._lsl_worker.is_running:
+            self._lsl_worker.stop()
+            self.btn_lsl.setText("Start LSL")
+            self.status_label.setText("LSL stopped")
+            self._app_log("User: LSL stopped")
+            return
+        try:
+            self._lsl_worker.start()
+        except Exception as e:
+            self.btn_lsl.setText("Start LSL")
+            self.status_label.setText(f"LSL start failed: {e}")
+            self._app_log(f"App: LSL start failed: {e}", "E")
+            QtWidgets.QMessageBox.warning(self, "Start LSL", str(e))
+            return
+        self.btn_lsl.setText("Stop LSL")
+        self.status_label.setText("LSL streaming")
+        self._app_log("User: LSL started")
 
     def _on_device_found(self, device_list: List[BLEDevice]):
         # Every batch is a full scan-round snapshot; merge it into the list in
@@ -1645,7 +1815,46 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         submit(self._connect_device, device,
                self.chk_auto_reconnect.isChecked(), True)
 
-    def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None):
+    def _auto_recovery_allowed(self, sensor: SensorProfile) -> bool:
+        if self._auto_reconnect_enabled and sensor.autoReconnect:
+            return True
+        sensor.autoReconnect = False
+        return False
+
+    def _abandon_auto_recovery(self, addr: str, sensor: SensorProfile, state: DeviceDataState):
+        sensor.autoReconnect = False
+        self._connecting_addrs.discard(addr)
+        device_state = sensor.deviceState
+        keep_state = (sensor.isReady or sensor.isDataTransfering
+                      or device_state == DeviceStateEx.Connected)
+        if keep_state:
+            state = self.device_states.get(addr) or state
+            self.device_states[addr] = state
+        elif device_state == DeviceStateEx.Disconnected:
+            self.device_states.pop(addr, None)
+
+        def restore_ui():
+            if keep_state:
+                self._update_device_item_text(addr, connected=True)
+                if self._selected_address() == addr:
+                    self.current_sensor = sensor
+                    self._refresh_display_for_state(state)
+                    if not state.status_parts and not state.status_text:
+                        self.status_label.setText("Connected (device)")
+            elif device_state == DeviceStateEx.Disconnected:
+                self._update_device_item_text(addr, connected=False)
+                if (self.current_sensor is not None
+                        and self.current_sensor.BLEDevice.Address == addr):
+                    self.current_sensor = None
+                if self._selected_address() == addr:
+                    self._refresh_display_for_state(None)
+                    self.status_label.setText("Disconnected (device)")
+            self._update_button_states()
+
+        self._ui(restore_ui)
+
+    def _connect_device(self, device, auto_reconnect: bool, select_current: Optional[bool] = None,
+                        is_auto_recovery: bool = False):
         if device is None:
             self._app_log("User: connect rejected (no device selected)", "W")
             self._ui(lambda: self.status_label.setText("Please select a device in the list first"))
@@ -1666,6 +1875,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if sensor is None:
             self._app_log(f"App: failed to create SensorProfile for {addr}", "E")
             self._ui(lambda: self.status_label.setText("Failed to create SensorProfile"))
+            return
+
+        state = DeviceDataState(sensor)
+        if is_auto_recovery and not self._auto_recovery_allowed(sensor):
+            self._abandon_auto_recovery(addr, sensor, state)
             return
 
         self._connecting_addrs.add(addr)
@@ -1692,8 +1906,6 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self._ui(lambda: self.status_label.setText(f"Failed to connect to {device.Name}"))
                 self._ui(self._update_button_states)
                 return
-
-        state = DeviceDataState(sensor)
 
         if not sensor.hasInited:
             ok = sensor.init(PACKAGE_COUNT,
@@ -1752,13 +1964,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.device_states[addr] = state
         self._ui(lambda: self._update_device_item_text(addr, connected=True))
 
+        power = -1
         try:
             power = sensor.getBatteryLevel()
-            if (power >= 0 and (state.last_power is None
-                                or abs(power - state.last_power) >= POWER_STABLE_BAND)):
-                state.last_power = power
         except Exception:
             pass
+        if (power >= 0 and (state.last_power is None
+                            or abs(power - state.last_power) >= POWER_STABLE_BAND)):
+            state.last_power = power
 
         if select_current is None:
             select_current = self._selected_address() == addr
@@ -2206,6 +2419,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if data is None or data.channelCount == 0 or data.sampleCount == 0:
                 continue
             state.note_data_received(data)
+            self._lsl_worker.enqueue(addr, data, use_clone)
             self._enqueue_data(addr, data.clone() if use_clone else data)
 
     def _dispatch_sensor_data(self, addr: str, data: SensorData):
@@ -2276,6 +2490,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         self._app_log("App: demo window closing")
         self.timer.stop()
+        self._lsl_worker.stop()
         self._data_worker_stop = True
         self._data_queue_event.set()
         self._data_worker.join(timeout=2)
@@ -3633,6 +3848,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
 
     def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer):
+        if not self._auto_recovery_allowed(sensor):
+            answer(False)
+            return
         sensor.log(f"App: auto reconnect callback received, restore={restore}")
         self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
         submit(self._auto_reconnect_recovery, sensor.BLEDevice.Address, restore)
@@ -3644,8 +3862,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if sensor is None:
             self._app_log(f"App: auto reconnect recovery failed, unknown device: {addr}", "E")
             return
+        if not self._auto_recovery_allowed(sensor):
+            return
         device = sensor.BLEDevice
-        self._connect_device(device, self._auto_reconnect_enabled, select_current=True)
+        self._connect_device(device, self._auto_reconnect_enabled, select_current=True,
+                             is_auto_recovery=True)
         saved = dict(self._saved_params_by_addr.get(addr, {})) if restore else {}
         if saved and addr in self.device_states:
             sensor = self.device_states[addr].sensor
