@@ -366,6 +366,7 @@ def scan_and_match(ctrl, scan_ms=None, target_identity=None, retries=3, interval
         except Exception as e:
             devices = None
             print(f"[common] scan 抛异常（第 {attempt}/{retries} 次）: {type(e).__name__}: {e}", flush=True)
+        _log_devices(devices)
         target = match_target(devices, target_identity=target_identity)
         if target is not None:
             return target, devices

@@ -53,7 +53,7 @@ import config
 import common
 from common import scan_and_match
 
-MEASURE_SECONDS = 1800         # 每次会话正式采集时长（秒）= 30 分钟（长时间积分暴露采样时钟漂移）
+MEASURE_SECONDS = 3600         # 每次会话正式采集时长（秒）= 30 分钟（长时间积分暴露采样时钟漂移）
 SETTLE_SECONDS = 2.0           # setParam 后等待设备异步生效的静置时长
 WARMUP_SECONDS = 10.0          # 起流后预热时长（丢弃起流初期不稳定样本）
 READY_TIMEOUT = 15             # 连接后等待 Ready 超时（秒）
@@ -116,6 +116,7 @@ class RateCollector:
             if s is None:
                 s = {
                     "delivered": 0, "channel_count": 0,
+                    "lost_pkts": 0,  # SDK 包级丢包计数（getLostPackageCount 累加）
                     "first_ts": None, "last_ts": None,
                     "min_idx": None, "max_idx": None,
                     "min_abs_ts": None, "max_abs_ts": None,  # 设备端采样时刻（absTimeStampInSec），与 min/max_idx 对齐
@@ -134,6 +135,10 @@ class RateCollector:
                 s["first_ts"] = now
             s["last_ts"] = now
             s["delivered"] += n_ch * n_smp
+            try:
+                s["lost_pkts"] += d.getLostPackageCount()
+            except Exception:
+                pass
             if s["channel_count"] == 0:
                 s["channel_count"] = n_ch
             # 通道0 sampleIndex 记录全局首末（跨批单调递增，去重）；同时记录本批首末用于分段趋势
@@ -178,6 +183,7 @@ class RateCollector:
             return None
         merged = {
             "delivered": 0, "channel_count": 0,
+            "lost_pkts": 0,
             "first_ts": None, "last_ts": None,
             "min_idx": None, "max_idx": None,
             "min_abs_ts": None, "max_abs_ts": None,
@@ -186,6 +192,7 @@ class RateCollector:
         for s in subs:
             merged["delivered"] += s["delivered"]
             merged["channel_count"] += s["channel_count"]
+            merged["lost_pkts"] += s.get("lost_pkts", 0)
             if s["first_ts"] is not None and (merged["first_ts"] is None or s["first_ts"] < merged["first_ts"]):
                 merged["first_ts"] = s["first_ts"]
             if s["last_ts"] is not None and (merged["last_ts"] is None or s["last_ts"] > merged["last_ts"]):
@@ -222,6 +229,25 @@ class RateCollector:
                 and s["max_abs_ts"] > s["min_abs_ts"]):
             dur_abs = s["max_abs_ts"] - s["min_abs_ts"]
         return unique, dur_host, dur_abs, s["delivered"], s["channel_count"]
+
+    def lost_metrics(self, dts):
+        """返回 (lost_pkts, lost_samples, unique, recv_per_ch)；丢包统计。
+
+        lost_pkts     : SDK 包级丢包计数（getLostPackageCount 累加）。
+        lost_samples  : 样本级空洞 = unique - recv_per_ch（>0 表示 sampleIndex 有缺失/丢包）。
+        unique        : sampleIndex 首末跨度（max_idx - min_idx + 1，假设连续）。
+        recv_per_ch   : 实际收到每通道样本数 = delivered / channel_count。
+        """
+        s = self._merged_stats(dts)
+        if not s:
+            return 0, 0, 0, 0
+        unique = 0
+        if s["min_idx"] is not None and s["max_idx"] is not None:
+            unique = s["max_idx"] - s["min_idx"] + 1
+        ch = s.get("channel_count", 0)
+        recv_per_ch = (s["delivered"] / ch) if ch else 0
+        lost_samples = max(0, unique - recv_per_ch)
+        return s.get("lost_pkts", 0), lost_samples, unique, recv_per_ch
 
     def minute_rates(self, dts, t_start, t_end, window=60.0):
         """按 window 秒切分 timeline，返回每段采样率数组（unique / 窗口时长）。
@@ -396,6 +422,10 @@ def _get_ble_path(sensor):
 
 
 def main():
+    sanity_log = common.setup_sanity_log(RESULT_DIR, subdir=None)
+    if sanity_log:
+        print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
+
     target_identity = sys.argv[1].strip().upper() if len(sys.argv) > 1 else None
     rate_filter = sys.argv[2].strip() if len(sys.argv) > 2 else None
     ctrl = SensorControllerInstance
@@ -685,6 +715,11 @@ def main():
             ok = dev <= SAMPLE_RATE_TOLERANCE
             print(f"[结果] {it['label']} 期望={it['expected']}Hz, 实际≈{actual:.3f}Hz 偏差={dev:.3%} "
                   f"(唯一样本={unique} 投递样本={delivered} 通道={ch} 分母=host窗口={win_dur:.3f}s)", flush=True)
+            # 丢包检测：包级（SDK lostPackageCount）+ 样本空洞（unique vs 实收每通道）
+            lost_pkts, lost_samples, _u, recv_per_ch = collector.lost_metrics(dt_key)
+            lost_rate = (lost_samples / _u) if _u else 0.0
+            print(f"      [丢包] 包级={lost_pkts} 样本空洞={lost_samples:.0f} "
+                  f"(唯一样本={_u} 实收每通道={recv_per_ch:.0f} 样本丢失率={lost_rate:.3%})", flush=True)
             # 口径对比：host 到达时刻差（受 BLE 首尾延迟影响，可能偏高）与设备时间戳（固件自报，仅作参考）
             extra = []
             if dur_host > 0:

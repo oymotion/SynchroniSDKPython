@@ -26,8 +26,8 @@ MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 # ---- 当前目标设备（逗号分隔，脚本统一从 common.py 读）----
 #TARGET_IDENTITY = "B383"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
 #TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
-TARGET_IDENTITY = "9A91,9A9B" 
-#TARGET_IDENTITY = "A2A2"   
+#TARGET_IDENTITY = "9A91,9A9B" 
+TARGET_IDENTITY = "1D0E"   
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
@@ -95,6 +95,16 @@ DEVICES = [
     },
     {
         "name_prefix": "gForceUltra",
+        "mac": "BC:93:2A:3F:9F:96",
+        "identity": "9F96",
+    },
+    {
+        "name_prefix": "gForceUltra",
+        "mac": "BC:93:2A:3F:9F:E1",
+        "identity": "9FE1",
+    },
+    {
+        "name_prefix": "gForceUltra",
         "mac": "BC:93:2A:3F:80:E5",
         "identity": "80E5",
     },
@@ -153,6 +163,16 @@ DEVICES = [
         "mac": "BC:93:2A:3F:9A:9B",           
         "identity": "9A9B",
     },
+    {
+        "name_prefix": "OYFM7020",
+        "mac": "BC:93:2A:3F:80:CE", 
+        "identity": "80CE",
+    },
+    {
+        "name_prefix": "ORehabArm",
+        "mac": "A0:E6:F8:4C:1D:0E",              # TODO: 待探测后回填精确 MAC
+        "identity": "1D0E",
+    },
 ]
 
 # ---- 设备规格映射（name_prefix -> device_specs 下的文件名，不含 .py 后缀）----
@@ -167,4 +187,5 @@ MODEL_SPEC = {
     "OB": "ob6000c",   # 兜底：未知 OB 型号暂按 OB6000C
     "Cerelax": "cerelax_pro",
     "gForceMax": "gforce_max",
+    "RehabArm": "rehab_arm",
 }
