@@ -485,6 +485,8 @@ Use `def setParam(self, key: str, value: str) -> str` to set parameter of sensor
 
 The asynchronous variant is `asyncSetParam(self, key: str, value: str) -> str`.
 
+`setParam` / `getParam` and their asynchronous variants raise `IOError` on SDK errors and timeouts; successful calls return the result string.
+
 If the device is already streaming when you change an `NTF_*` key, the SDK stops and restarts the data notification so the new setting takes effect immediately. `FILTER_*` keys are applied by the firmware on the fly — no stream restart. The `*_SAMPLE_RATE` keys stop the stream before the setting command and always restore it afterwards, whether the setting succeeded or failed.
 
 Below is available key and value:
@@ -742,7 +744,7 @@ Row kinds (a bin without a config record yields `raw` rows only):
 
 - `raw` rows — one per data record: `timestamp` = ISO 8601 (local time), `raw_hex` = raw packet bytes as hex; remaining columns empty.
 - `cmd_send` / `cmd_recv` rows — one per command record: `raw_hex` = command bytes as hex, `data_type` = decoded command name (e.g. `NTF_DATA_START` / `GET_FEATURE_MAP:SUCCESS`); analysis-only, not fed into parsing.
-- `event` rows — one per BLE event record: `data_type` = event name (`connect` / `disconnect` / `stream_start` / `stream_stop`).
+- `event` rows — one per BLE event record: `data_type` = event name (`connect` / `disconnect` / `stream_start` / `stream_stop`), or a profile log record (`log:<LEVEL>:<tag>: <message>`).
 - `parsed` rows — one per parsed batch (`raw_hex` empty):
 
 | Column | Meaning |
@@ -762,6 +764,8 @@ Row kinds (a bin without a config record yields `raw` rows only):
 `setLogPath` sets the SDK log **directory** (it must be a directory). All default file outputs live in it: the controller log, the default per-profile logs (`DEBUG_LOG_PATH=True`) and the default bin exports (`DEBUG_BLE_DATA_PATH=True`).
 
 The **controller log** holds all common logs (scan, connection management, backend, and logs of profiles whose profile log is not enabled). It is created automatically when `setDebugEnabled(True)` is called, and closed on `setDebugEnabled(False)`. Each **profile log** (enabled per profile via `setParam("DEBUG_LOG_PATH", ...)`) contains only that profile's logs.
+
+When bin capture is enabled, profile log records are also stored in the bin as EVENT records with payload `log:<LEVEL>:<tag>: <message>`. `parseBinToCsv` writes them to `event` rows with the record timestamp; the bin format version is unchanged.
 
 ```python
 SensorControllerInstance.setDebugEnabled(True)
@@ -791,3 +795,49 @@ sensor.log("User toggled filter 50Hz", "I")
 ```
 
 `level` accepts `"D"` / `"I"` / `"W"` / `"E"` (case-insensitive, default `"I"`); `"D"` follows the `setDebugEnabled` switch, the other levels are always emitted. Entries are tagged `[App]` in the log files.
+
+## Changelog
+
+### 1.4.3
+
+- Impedance stream metadata and timestamps now use 1 Hz for both live data and replay, independent of the EXG sample rate.
+- Added parameter capability checks and clearer parameter errors.
+- Updated the GUI examples with optional LSL output, per-channel units and stream metadata. Automatic reconnects preserve each outlet's `source_id`, `uid` and `session_id`; other stream restarts create new outlets.
+
+### 1.4.2
+
+- Improved automatic reconnection and restoration of the previous streaming session.
+- `onAutoReconnect` now supports an asynchronous `answer(handled)` callback, allowing an application to finish recovery later or from another thread; the legacy two-argument callback remains accepted.
+- Added reconnect controls and recovery-flow updates to the demo applications.
+
+### 1.4.1
+
+- Added the three-axis magnetometer stream `NTF_MAG`, including decoded values and `MagChannelCount` / `MagSampleRate` device information.
+- Renamed the joint-angle stream and related API names from `MAG_ANGLE` to `ANGLE`; wire values are unchanged.
+- Added magnetometer plotting and spectrum support to the demo applications.
+
+### 1.4.0
+
+- Added aggregate `NTF_IMU` support for legacy devices and expanded IMU aggregation controls.
+- Parameter failures are reported directly by the parameter methods instead of also generating `onErrorCallback` events; synchronous and asynchronous Python parameter methods raise `IOError` on SDK errors and timeouts.
+
+### 1.3.8
+
+- `autoReconnect` can now read back the actual SDK setting instead of relying only on a locally assigned value.
+
+### 1.3.7
+
+- Added the controller `TRANSLATE_IMU` setting to select separate ACC/GYRO/EULER/QUAT streams or the aggregate `NTF_IMU` stream; demo applications expose this as a user control and default to aggregate IMU.
+
+### 1.3.6
+
+- Added controller `BIN_RECORDER_ENABLED`, allowing applications to disable new session bin captures without changing streaming behavior.
+
+### 1.3.2
+
+- Unified IMU notification control and added impedance notification control where supported by the device.
+
+
+### 1.3.0
+
+- Published wheels now require Python 3.10 or later, with one wheel per platform covering all supported Python versions.
