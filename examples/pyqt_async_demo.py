@@ -21,7 +21,7 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -55,20 +55,45 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.38"
+DEMO_VERSION               = "0.1.47"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
 
 
+def _get_param(sensor: SensorProfile, key: str) -> Tuple[str, str]:
+    try:
+        return sensor.getParam(key), ""
+    except IOError as exc:
+        return "", str(exc)
+
+
+async def _async_get_param(target, key: str) -> Tuple[str, str]:
+    try:
+        return await target.asyncGetParam(key), ""
+    except IOError as exc:
+        return "", str(exc)
+
+
+async def _async_set_param(target, key: str, value: str) -> Tuple[str, str]:
+    try:
+        return await target.asyncSetParam(key, value), ""
+    except IOError as exc:
+        return "", str(exc)
+
+
 class LslStreamWorker:
     MAX_QUEUE_BATCHES = 1000
 
-    def __init__(self):
+    def __init__(self, sensor):
+        self._sensor = sensor
         self._lock = threading.Lock()
         self._thread = None
         self._queue = None
         self._stop_event = None
+        self._session_tags = {}
+        self._reconnect_sessions = {}
+        self._reconnect_native_sessions = {}
 
     @property
     def is_running(self):
@@ -97,17 +122,34 @@ class LslStreamWorker:
         if not running or work_queue is None:
             return
         queued = data.clone() if clone_data else data
+        self._put(work_queue, (addr, queued, "data"))
+
+    def restart(self, addr: Optional[str] = None, reason: str = "unspecified"):
+        with self._lock:
+            work_queue = self._queue
+            running = self._thread is not None and self._thread.is_alive()
+        if not running or work_queue is None:
+            return
+        self._put(work_queue, (addr, None, reason))
+
+    @staticmethod
+    def _put(work_queue, item):
         try:
-            work_queue.put_nowait((addr, queued))
+            work_queue.put_nowait(item)
         except queue.Full:
             try:
                 work_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                work_queue.put_nowait((addr, queued))
+                work_queue.put_nowait(item)
             except queue.Full:
                 pass
+
+    def prepare_auto_reconnect(self):
+        with self._lock:
+            self._reconnect_sessions = dict(self._session_tags)
+            self._reconnect_native_sessions.clear()
 
     def stop(self):
         with self._lock:
@@ -116,6 +158,9 @@ class LslStreamWorker:
             self._thread = None
             self._queue = None
             self._stop_event = None
+            self._session_tags.clear()
+            self._reconnect_sessions.clear()
+            self._reconnect_native_sessions.clear()
         if stop_event is not None:
             stop_event.set()
         if thread is not None and thread.is_alive():
@@ -127,27 +172,91 @@ class LslStreamWorker:
         outlets = {}
         while not stop_event.is_set():
             try:
-                addr, data = work_queue.get(timeout=0.1)
+                addr, data, reason = work_queue.get(timeout=0.1)
             except queue.Empty:
+                continue
+            if data is None:
+                if reason == "live_transfer_OFF":
+                    continue
+                target = addr or self._sensor.BLEDevice.Address
+                keys = [key for key in outlets if addr is None or key[0] == addr]
+                with self._lock:
+                    remove_keys = [
+                        key for key in keys
+                        if key[1] not in self._reconnect_sessions
+                        or key[1] in self._reconnect_native_sessions]
+                    for key in remove_keys:
+                        self._reconnect_sessions.pop(key[1], None)
+                        self._reconnect_native_sessions.pop(key[1], None)
+                for key in remove_keys:
+                    outlets.pop(key, None)
+                self._sensor.log(
+                    f"LSL outlet reset: {target}, reason={reason}, "
+                    f"outlets={len(remove_keys)}, preserved={len(keys) - len(remove_keys)}")
                 continue
             try:
                 self._push(outlets, addr, data)
             except Exception as e:
                 print(f"[LSL] push error: {e}")
 
-    @staticmethod
-    def _outlet(outlets, addr, data):
+    def _filter_states(self):
+        result, error = _get_param(self._sensor, "FILTER")
+        if error or not result:
+            return []
+        items = str(result).split("|")
+        return [(items[index], items[index + 1])
+                for index in range(0, len(items) - 1, 2)]
+
+    def _outlet(self, outlets, addr, data):
         data_type = data.dataType
         type_name = data_type.name if isinstance(data_type, DataType) else str(data_type)
-        key = (addr, int(data_type))
+        type_key = int(data_type)
+        native_session_tag = int(data.startTimeStamp)
+        with self._lock:
+            reconnect_session_tag = self._reconnect_sessions.get(type_key)
+            if reconnect_session_tag is not None:
+                session_tag = reconnect_session_tag
+                if native_session_tag != reconnect_session_tag:
+                    self._reconnect_native_sessions[type_key] = native_session_tag
+            else:
+                session_tag = native_session_tag
+                self._reconnect_native_sessions.pop(type_key, None)
+            self._session_tags[type_key] = session_tag
+        key = (addr, type_key, session_tag)
         outlet = outlets.get(key)
         if outlet is not None:
             return outlet
         device_name = data.deviceName or addr
+        sample_rate = max(0.0, float(data.sampleRate))
         info = pylsl.StreamInfo(
             f"{device_name}_{type_name}", type_name, data.channelCount,
-            max(0.0, float(data.sampleRate)), "float32", f"SensorSDK_{addr}_{type_name}")
-        channels = info.desc().append_child("channels")
+            sample_rate, "float32",
+            f"SensorSDK_{addr}_{type_name}_{session_tag}")
+        desc = info.desc()
+        desc.append_child_value("source", "SensorSDK")
+        desc.append_child_value("demo_version", DEMO_VERSION)
+        device = desc.append_child("device")
+        device.append_child_value("name", device_name)
+        device.append_child_value("mac", data.deviceMac or addr)
+        device.append_child_value("data_type", type_name)
+        acquisition = desc.append_child("acquisition")
+        acquisition.append_child_value("sample_rate_hz", f"{sample_rate:g}")
+        acquisition.append_child_value("channel_mask", str(int(data.channelMask)))
+        acquisition.append_child_value("first_packet_delay_ms", str(int(data.delay)))
+        start_sec = float(data.startTimeSec)
+        if start_sec > 0:
+            acquisition.append_child_value("start_time", f"{start_sec:.9f}")
+            start_utc = (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start_sec))
+                         + f".{int(start_sec * 1000) % 1000:03d}Z")
+            acquisition.append_child_value("start_time_utc", start_utc)
+        filter_states = self._filter_states()
+        if filter_states:
+            filters = desc.append_child("filters")
+            enabled = [key for key, value in filter_states if value == "ON"]
+            filters.append_child_value("enabled", "|".join(enabled))
+            for filter_key, filter_value in filter_states:
+                filters.append_child_value(filter_key, filter_value)
+        channels = desc.append_child("channels")
         labels = CHANNEL_LABELS.get(data_type, [])
         units = LSL_CHANNEL_UNITS.get(data_type, "unitless")
         for channel in range(data.channelCount):
@@ -162,6 +271,9 @@ class LslStreamWorker:
             channel_info.append_child_value("unit", unit)
         outlet = pylsl.StreamOutlet(info)
         outlets[key] = outlet
+        self._sensor.log(
+            f"LSL outlet create: {addr}/{type_name}, session={session_tag}, "
+            f"rate={sample_rate:g}, channels={data.channelCount}, outlets={len(outlets)}")
         return outlet
 
     def _push(self, outlets, addr, data):
@@ -1081,7 +1193,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._shown_backend = ""
         self._backend_query_pending = False
         self._backend_query_ms = 0.0
-        self._lsl_worker = LslStreamWorker()
+        self._lsl_workers = {}
+        self._lsl_workers_lock = threading.Lock()
+        self._lsl_running = False
 
         # Data queue: the data callback only enqueues (a clone when Use Clone
         # Data is checked, the borrowed batch otherwise), a worker thread
@@ -1650,16 +1764,57 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._use_clone_data = checked
         self._app_log(f"User: use clone data {'ON' if checked else 'OFF'}")
 
+    def _lsl_worker_for(self, sensor: SensorProfile):
+        addr = sensor.BLEDevice.Address
+        with self._lsl_workers_lock:
+            worker = self._lsl_workers.get(addr)
+            if worker is None:
+                worker = LslStreamWorker(sensor)
+                self._lsl_workers[addr] = worker
+            if self._lsl_running:
+                worker.start()
+            return worker
+
+    def _restart_lsl(self, addr: Optional[str] = None, reason: str = "unspecified"):
+        with self._lsl_workers_lock:
+            if addr is None:
+                workers = list(self._lsl_workers.values())
+            else:
+                worker = self._lsl_workers.get(addr)
+                workers = [worker] if worker is not None else []
+        for worker in workers:
+            worker.restart(reason=reason)
+
+    def _remove_lsl_worker(self, addr: str):
+        with self._lsl_workers_lock:
+            worker = self._lsl_workers.pop(addr, None)
+        if worker is not None:
+            worker.stop()
+
+    def _stop_lsl_workers(self):
+        with self._lsl_workers_lock:
+            self._lsl_running = False
+            workers = list(self._lsl_workers.values())
+        for worker in workers:
+            worker.stop()
+
     def _toggle_lsl(self):
-        if self._lsl_worker.is_running:
-            self._lsl_worker.stop()
+        if self._lsl_running:
+            self._stop_lsl_workers()
             self.btn_lsl.setText("Start LSL")
             self.status_label.setText("LSL stopped")
             self._app_log("User: LSL stopped")
             return
         try:
-            self._lsl_worker.start()
+            if pylsl is None:
+                raise RuntimeError("pylsl is not installed. Run: pip install pylsl")
+            with self._lsl_workers_lock:
+                workers = list(self._lsl_workers.values())
+                for worker in workers:
+                    worker.start()
+                self._lsl_running = True
         except Exception as e:
+            self._stop_lsl_workers()
             self.btn_lsl.setText("Start LSL")
             self.status_label.setText(f"LSL start failed: {e}")
             self._app_log(f"App: LSL start failed: {e}", "E")
@@ -1885,6 +2040,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         device_name = device.Name
         if addr in self.device_states:
             return
+        if not is_auto_recovery:
+            self._remove_lsl_worker(addr)
 
         debug_log_enabled = self._debug_log_enabled
         data_debug_log_enabled = self._data_debug_log_enabled
@@ -1922,6 +2079,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.on_error_callback = self._on_error
         sensor.on_power_changed = self._on_power_changed
         sensor.on_device_info_update = self._on_device_info_update
+        sensor.on_data_transfer_state_change = self._on_live_transfer_state
         sensor.on_auto_reconnect = self._on_auto_reconnect
         sensor.autoReconnect = auto_reconnect
 
@@ -2004,15 +2162,25 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             state.last_power = power
 
         if debug_log_enabled:
-            await sensor.asyncSetParam("DEBUG_LOG_PATH", log_path)
-            current = await sensor.asyncGetParam("DEBUG_LOG_PATH")
-            if current and not str(current).startswith("Error"):
-                self._last_log_paths[addr] = current
+            _, error = await _async_set_param(sensor, "DEBUG_LOG_PATH", log_path)
+            if error:
+                print(f"[Debug Log] {addr}: {error}")
+            else:
+                current, error = await _async_get_param(sensor, "DEBUG_LOG_PATH")
+                if error:
+                    print(f"[Debug Log] {addr}: {error}")
+                elif current:
+                    self._last_log_paths[addr] = current
         if data_debug_log_enabled:
-            await sensor.asyncSetParam("DEBUG_BLE_DATA_PATH", data_path)
-            current = await sensor.asyncGetParam("DEBUG_BLE_DATA_PATH")
-            if current and not str(current).startswith("Error"):
-                self._last_data_log_paths[addr] = current
+            _, error = await _async_set_param(sensor, "DEBUG_BLE_DATA_PATH", data_path)
+            if error:
+                print(f"[Data Debug Log] {addr}: {error}")
+            else:
+                current, error = await _async_get_param(sensor, "DEBUG_BLE_DATA_PATH")
+                if error:
+                    print(f"[Data Debug Log] {addr}: {error}")
+                elif current:
+                    self._last_data_log_paths[addr] = current
 
         await self._refresh_control_states(sensor)
 
@@ -2268,6 +2436,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._set_replay_mode_ui(True)
 
     def _on_replay_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
+        self._restart_lsl(sensor.BLEDevice.Address,
+                          f"replay_transfer_{'ON' if is_transferring else 'OFF'}")
         if is_transferring:
             self._replay_active = True
         self._app_log(
@@ -2362,6 +2532,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if self._replay_sensor is not None and self._replay_sensor not in sensors:
             sensors.append(self._replay_sensor)
         for sensor in sensors:
+            self._remove_lsl_worker(sensor.BLEDevice.Address)
             self.device_states.pop(sensor.BLEDevice.Address, None)
             if self.current_sensor is sensor:
                 self.current_sensor = None
@@ -2446,7 +2617,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if data is None or data.channelCount == 0 or data.sampleCount == 0:
                 continue
             state.note_data_received(data)
-            self._lsl_worker.enqueue(addr, data, use_clone)
+            self._lsl_worker_for(sensor).enqueue(addr, data, use_clone)
             self._enqueue_data(addr, data.clone() if use_clone else data)
 
     def _dispatch_sensor_data(self, addr: str, data: SensorData):
@@ -2517,7 +2688,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def closeEvent(self, event):
         self._app_log("App: demo window closing")
         self.timer.stop()
-        self._lsl_worker.stop()
+        self._stop_lsl_workers()
         self._data_worker_stop = True
         self._data_queue_event.set()
         self._data_worker.join(timeout=2)
@@ -3844,14 +4015,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._submit_coroutine(self._refresh_sdk_label_async(), "backend query")
 
     async def _refresh_sdk_label_async(self):
-        try:
-            result = str(await self.sensor_controller.asyncGetParam("BACK_END"))
-        except Exception as e:
-            result = f"Error: {e}"
+        result, error = await _async_get_param(self.sensor_controller, "BACK_END")
+        if error:
+            print(f"[Backend] {error}")
 
         def apply():
             self._backend_query_pending = False
-            if not result or result.startswith("Error") or result == self._shown_backend:
+            if not result or result == self._shown_backend:
                 return
             self._shown_backend = result
             self.sdk_label.setText(
@@ -3871,7 +4041,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_state_changed(self, sensor: SensorProfile, state: DeviceStateEx):
         print(f"[State] {sensor.BLEDevice.Name}: {state}")
         if state == DeviceStateEx.Disconnected:
-            self.device_disconnected_sig.emit(sensor.BLEDevice.Address)
+            addr = sensor.BLEDevice.Address
+            if self._lsl_running and self._auto_reconnect_enabled:
+                with self._lsl_workers_lock:
+                    worker = self._lsl_workers.get(addr)
+                if worker is not None:
+                    worker.prepare_auto_reconnect()
+            self.device_disconnected_sig.emit(addr)
+
+    def _on_live_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
+        self._restart_lsl(sensor.BLEDevice.Address,
+                          f"live_transfer_{'ON' if is_transferring else 'OFF'}")
 
     def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer):
         if not self._auto_recovery_allowed(sensor):
@@ -3879,9 +4059,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         answer(True)
         sensor.log(f"App: auto reconnect callback received, restore={restore}")
-        self.auto_reconnect_sig.emit(sensor.BLEDevice.Address, restore)
+        addr = sensor.BLEDevice.Address
+        if self._lsl_running:
+            with self._lsl_workers_lock:
+                worker = self._lsl_workers.get(addr)
+            if worker is not None:
+                worker.prepare_auto_reconnect()
+        self.auto_reconnect_sig.emit(addr, restore)
         self._submit_coroutine(
-            self._auto_reconnect_recovery(sensor.BLEDevice.Address, restore),
+            self._auto_reconnect_recovery(addr, restore),
             "auto reconnect recovery")
         self._app_log("App: auto reconnect recovery submitted", sensor=sensor)
 
@@ -3899,9 +4085,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             device, auto_reconnect, select_current=True, is_auto_recovery=True)
         if saved and connected:
             for key, value in saved.items():
-                result = await sensor.asyncSetParam(key, value)
-                print(f"[AutoReconnect] restore setParam({key}, {value}) -> {result}")
-                sensor.log(f"App: restore setParam({key}, {value}) -> {result}")
+                result, error = await _async_set_param(sensor, key, value)
+                message = error or result
+                print(f"[AutoReconnect] restore setParam({key}, {value}) -> {message}")
+                sensor.log(f"App: restore setParam({key}, {value}) -> {message}")
             await self._refresh_control_states(sensor)
 
     def _press_connect_for_address(self, addr: str, restore: bool = True):
@@ -3911,13 +4098,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.device_list.setCurrentItem(item)
                 break
 
-    def _record_saved_param(self, sensor: SensorProfile, key: str, value: str, result: str):
-        if sensor is None or str(result).startswith("Error"):
-            return
-        self._saved_params_by_addr.setdefault(sensor.BLEDevice.Address, {})[key] = value
+    def _record_saved_param(self, sensor: SensorProfile, key: str, value: str):
+        if sensor is not None:
+            self._saved_params_by_addr.setdefault(sensor.BLEDevice.Address, {})[key] = value
 
     def _on_device_disconnected(self, addr: str):
         self._app_log(f"App: device disconnected, removed from UI: {addr}")
+        if not (self._lsl_running and self._auto_reconnect_enabled):
+            self._remove_lsl_worker(addr)
         state = self.device_states.pop(addr, None)
         self._update_device_item_text(addr, connected=False)
         if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
@@ -3978,6 +4166,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         print(f"[Link] {sensor.BLEDevice.Name}: "
               f"interval={info.ConnectionIntervalMs}ms latency={info.PeripheralLatency} "
               f"timeout={info.SupervisionTimeoutMs}ms mtu={info.MTUSize}")
+        self._restart_lsl(sensor.BLEDevice.Address, "DeviceInfoUpdate")
         self.device_info_sig.emit(sensor, info)
 
     @staticmethod
@@ -4057,11 +4246,17 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if self.current_sensor == sensor:
             self.power_label.setText(f"Power: {power}%")
 
-    def _check_set_param_result(self, key: str, result: str) -> bool:
-        if str(result).startswith("Error"):
-            QtWidgets.QMessageBox.warning(self, "Set Parameter Failed", f"Failed to set {key}:\n{result}")
-            return False
-        return True
+    async def _get_profile_param_async(self, sensor: SensorProfile, key: str) -> Tuple[str, str]:
+        result, error = await _async_get_param(sensor, key)
+        if error:
+            print(f"[Refresh] getParam({key}) failed: {error}")
+        else:
+            print(f"[Refresh] getParam({key}) -> {result}")
+        return result, error
+
+    def _show_param_error(self, key: str, error: str):
+        self._ui(lambda: QtWidgets.QMessageBox.warning(
+            self, "Set Parameter Failed", f"Failed to set {key}:\n{error}"))
 
     def _apply_sdk_debug_log(self):
         self._debug_log_generation += 1
@@ -4074,11 +4269,16 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             str(Path.home() / "Documents" / "sensorsdklog"),
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.sensor_controller.getVersion().replace('.', '_')}",
         )
-        await self.sensor_controller.asyncSetParam("LOG_PATH", log_dir)
+        _, error = await _async_set_param(self.sensor_controller, "LOG_PATH", log_dir)
+        if error:
+            print(f"[Debug Log] {error}")
+            return
         if generation != self._debug_log_generation:
             return
         print(f"[Debug Log] LOG_PATH -> {log_dir}")
-        await self.sensor_controller.asyncSetParam("DEBUG_ENABLED", "True")
+        _, error = await _async_set_param(self.sensor_controller, "DEBUG_ENABLED", "True")
+        if error:
+            print(f"[Debug Log] {error}")
 
     def _on_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -4095,7 +4295,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if enabled:
             await self._apply_sdk_debug_log_async(generation)
         else:
-            await self.sensor_controller.asyncSetParam("DEBUG_ENABLED", "False")
+            _, error = await _async_set_param(self.sensor_controller, "DEBUG_ENABLED", "False")
+            if error:
+                print(f"[Debug Log] {error}")
         if generation != self._debug_log_generation:
             return
         value = "True" if enabled else "False"
@@ -4103,21 +4305,24 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             if generation != self._debug_log_generation:
                 return
             if sensor.isReady and sensor.hasInited:
-                result = await sensor.asyncSetParam("DEBUG_LOG_PATH", value)
+                result, error = await _async_set_param(sensor, "DEBUG_LOG_PATH", value)
+                if error:
+                    print(f"[Debug Log] {sensor.BLEDevice.Address}: {error}")
+                    sensor.log(f"App: setParam(DEBUG_LOG_PATH, {value}) failed: {error}")
+                    self._show_param_error("DEBUG_LOG_PATH", error)
+                    continue
                 if generation != self._debug_log_generation:
                     return
                 print(f"[Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_LOG_PATH, {value}) -> {result}")
                 sensor.log(f"App: setParam(DEBUG_LOG_PATH, {value}) -> {result}")
-                self._ui(lambda r=result: self._check_set_param_result(
-                    "DEBUG_LOG_PATH", r))
 
     def _apply_dongle_debug(self):
         value = "True" if self._dongle_debug_enabled else "False"
         self._submit_coroutine(self._apply_dongle_debug_async(value), "dongle debug")
 
     async def _apply_dongle_debug_async(self, value: str):
-        result = await self.sensor_controller.asyncSetParam("BLE_TRACE_ENABLED", value)
-        print(f"[Dongle Debug] setParam(BLE_TRACE_ENABLED, {value}) -> {result}")
+        result, error = await _async_set_param(self.sensor_controller, "BLE_TRACE_ENABLED", value)
+        print(f"[Dongle Debug] setParam(BLE_TRACE_ENABLED, {value}) -> {error or result}")
 
     def _on_dongle_debug_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -4131,8 +4336,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._submit_coroutine(self._set_translate_imu_async(value), "translate IMU")
 
     async def _set_translate_imu_async(self, value: str):
-        result = await self.sensor_controller.asyncSetParam("TRANSLATE_IMU", value)
+        result, error = await _async_set_param(self.sensor_controller, "TRANSLATE_IMU", value)
+        if error:
+            self._app_log(f"App: setParam(TRANSLATE_IMU, {value}) failed: {error}")
+            return
         self._app_log(f"App: setParam(TRANSLATE_IMU, {value}) -> {result}")
+        self._restart_lsl(reason=f"TRANSLATE_IMU={value}")
 
     def _on_data_debug_log_toggled(self, state: int):
         enabled = (state == QtCore.Qt.Checked)
@@ -4146,11 +4355,14 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         value = "True" if enabled else "False"
         for sensor in sensors:
             if sensor.isReady and sensor.hasInited:
-                result = await sensor.asyncSetParam("DEBUG_BLE_DATA_PATH", value)
+                result, error = await _async_set_param(sensor, "DEBUG_BLE_DATA_PATH", value)
+                if error:
+                    print(f"[Data Debug Log] {sensor.BLEDevice.Address}: {error}")
+                    sensor.log(f"App: setParam(DEBUG_BLE_DATA_PATH, {value}) failed: {error}")
+                    self._show_param_error("DEBUG_BLE_DATA_PATH", error)
+                    continue
                 print(f"[Data Debug Log] setParam({sensor.BLEDevice.Address}, DEBUG_BLE_DATA_PATH, {value}) -> {result}")
                 sensor.log(f"App: setParam(DEBUG_BLE_DATA_PATH, {value}) -> {result}")
-                self._ui(lambda r=result: self._check_set_param_result(
-                    "DEBUG_BLE_DATA_PATH", r))
 
     def _on_ntf_toggled(self, key: str):
         sensor = self.current_sensor
@@ -4168,23 +4380,28 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
     async def _set_profile_param_async(self, sensor: SensorProfile, key: str,
                                        value: str, log_tag: str,
-                                       refresh_on_error: bool = False):
-        result = await sensor.asyncSetParam(key, value)
+                                       refresh_on_error: bool = False) -> Tuple[str, str]:
+        result, error = await _async_set_param(sensor, key, value)
+        if error:
+            print(f"[{log_tag}] setParam({key}, {value}) failed: {error}")
+            self._app_log(f"User: setParam({key}, {value}) failed: {error}", sensor=sensor)
+            self._show_param_error(key, error)
+            if refresh_on_error:
+                await self._refresh_control_states(sensor)
+            return "", error
         print(f"[{log_tag}] setParam({key}, {value}) -> {result}")
         self._app_log(f"User: setParam({key}, {value}) -> {result}", sensor=sensor)
-        self._record_saved_param(sensor, key, value, result)
-        failed = str(result).startswith("Error")
-        if failed:
-            self._ui(lambda: self._check_set_param_result(key, result))
-            if not refresh_on_error:
-                return
+        self._record_saved_param(sensor, key, value)
         await self._refresh_control_states(sensor)
-        if not failed:
-            def clear_current_data():
-                if self.current_sensor == sensor:
-                    self._clear_ui_data()
+        if key.startswith(("NTF_", "FILTER_")):
+            self._restart_lsl(sensor.BLEDevice.Address, f"{key}={value}")
 
-            self._ui(clear_current_data)
+        def clear_current_data():
+            if self.current_sensor == sensor:
+                self._clear_ui_data()
+
+        self._ui(clear_current_data)
+        return result, ""
 
     async def _refresh_control_states(self, sensor: SensorProfile):
         addr = sensor.BLEDevice.Address
@@ -4204,9 +4421,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         }
 
         ntf_states = {}
-        ntf_result = await sensor.asyncGetParam("NTF")
-        print(f"[Refresh] getParam(NTF) -> {ntf_result}")
-        if not str(ntf_result).startswith("Error"):
+        ntf_result, ntf_error = await self._get_profile_param_async(sensor, "NTF")
+        if not ntf_error:
             items = str(ntf_result).split("|")
             for i in range(0, len(items) - 1, 2):
                 key = items[i]
@@ -4215,9 +4431,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 ntf_states[key] = (count > 0, value == "ON" if count > 0 else False)
 
         filter_states = {}
-        filter_result = await sensor.asyncGetParam("FILTER")
-        print(f"[Refresh] getParam(FILTER) -> {filter_result}")
-        has_filter = bool(filter_result) and not str(filter_result).startswith("Error")
+        filter_result, filter_error = await self._get_profile_param_async(sensor, "FILTER")
+        has_filter = not filter_error and bool(filter_result)
         if has_filter:
             items = str(filter_result).split("|")
             parsed = {items[i]: items[i + 1] for i in range(0, len(items) - 1, 2)}
@@ -4228,9 +4443,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 filter_states[key] = (False, False)
 
         sample_rate_options = []
-        options_result = await sensor.asyncGetParam("EEG_SAMPLE_RATE_LIST")
-        print(f"[Refresh] getParam(EEG_SAMPLE_RATE_LIST) -> {options_result}")
-        if not str(options_result).startswith("Error"):
+        options_result, options_error = await self._get_profile_param_async(sensor, "EEG_SAMPLE_RATE_LIST")
+        if not options_error:
             for item in str(options_result).split("|"):
                 try:
                     sample_rate_options.append(int(item))
@@ -4238,9 +4452,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     pass
 
         current_sample_rate = 0
-        rate_result = await sensor.asyncGetParam("EEG_SAMPLE_RATE")
-        print(f"[Refresh] getParam(EEG_SAMPLE_RATE) -> {rate_result}")
-        if not str(rate_result).startswith("Error"):
+        rate_result, rate_error = await self._get_profile_param_async(sensor, "EEG_SAMPLE_RATE")
+        if not rate_error:
             try:
                 current_sample_rate = int(rate_result)
             except ValueError:
@@ -4248,9 +4461,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sample_rate_state = (sample_rate_options, current_sample_rate)
 
         emg_sample_rate_options = []
-        emg_options_result = await sensor.asyncGetParam("EMG_SAMPLE_RATE_LIST")
-        print(f"[Refresh] getParam(EMG_SAMPLE_RATE_LIST) -> {emg_options_result}")
-        if not str(emg_options_result).startswith("Error"):
+        emg_options_result, emg_options_error = await self._get_profile_param_async(sensor, "EMG_SAMPLE_RATE_LIST")
+        if not emg_options_error:
             for item in str(emg_options_result).split("|"):
                 try:
                     emg_sample_rate_options.append(int(item))
@@ -4258,9 +4470,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     pass
 
         current_emg_sample_rate = 0
-        emg_rate_result = await sensor.asyncGetParam("EMG_SAMPLE_RATE")
-        print(f"[Refresh] getParam(EMG_SAMPLE_RATE) -> {emg_rate_result}")
-        if not str(emg_rate_result).startswith("Error"):
+        emg_rate_result, emg_rate_error = await self._get_profile_param_async(sensor, "EMG_SAMPLE_RATE")
+        if not emg_rate_error:
             try:
                 current_emg_sample_rate = int(emg_rate_result)
             except ValueError:
@@ -4268,9 +4479,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         emg_sample_rate_state = (emg_sample_rate_options, current_emg_sample_rate)
 
         imu_sample_rate_options = []
-        imu_options_result = await sensor.asyncGetParam("IMU_SAMPLE_RATE_LIST")
-        print(f"[Refresh] getParam(IMU_SAMPLE_RATE_LIST) -> {imu_options_result}")
-        if not str(imu_options_result).startswith("Error"):
+        imu_options_result, imu_options_error = await self._get_profile_param_async(sensor, "IMU_SAMPLE_RATE_LIST")
+        if not imu_options_error:
             for item in str(imu_options_result).split("|"):
                 try:
                     imu_sample_rate_options.append(int(item))
@@ -4278,9 +4488,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     pass
 
         current_imu_sample_rate = 0
-        imu_rate_result = await sensor.asyncGetParam("IMU_SAMPLE_RATE")
-        print(f"[Refresh] getParam(IMU_SAMPLE_RATE) -> {imu_rate_result}")
-        if not str(imu_rate_result).startswith("Error"):
+        imu_rate_result, imu_rate_error = await self._get_profile_param_async(sensor, "IMU_SAMPLE_RATE")
+        if not imu_rate_error:
             try:
                 current_imu_sample_rate = int(imu_rate_result)
             except ValueError:
@@ -4288,9 +4497,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         imu_sample_rate_state = (imu_sample_rate_options, current_imu_sample_rate)
 
         ppg_sample_rate_options = []
-        ppg_options_result = await sensor.asyncGetParam("PPG_SAMPLE_RATE_LIST")
-        print(f"[Refresh] getParam(PPG_SAMPLE_RATE_LIST) -> {ppg_options_result}")
-        if not str(ppg_options_result).startswith("Error"):
+        ppg_options_result, ppg_options_error = await self._get_profile_param_async(sensor, "PPG_SAMPLE_RATE_LIST")
+        if not ppg_options_error:
             for item in str(ppg_options_result).split("|"):
                 try:
                     ppg_sample_rate_options.append(int(item))
@@ -4298,9 +4506,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     pass
 
         current_ppg_sample_rate = 0
-        ppg_rate_result = await sensor.asyncGetParam("PPG_SAMPLE_RATE")
-        print(f"[Refresh] getParam(PPG_SAMPLE_RATE) -> {ppg_rate_result}")
-        if not str(ppg_rate_result).startswith("Error"):
+        ppg_rate_result, ppg_rate_error = await self._get_profile_param_async(sensor, "PPG_SAMPLE_RATE")
+        if not ppg_rate_error:
             try:
                 current_ppg_sample_rate = int(ppg_rate_result)
             except ValueError:
