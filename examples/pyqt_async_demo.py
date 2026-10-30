@@ -55,7 +55,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.47"
+DEMO_VERSION               = "0.1.48"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -2770,7 +2770,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             (fft_line,) = self.ax_fft.plot([], [], label=line.get_label())
             self.fft_lines.append(fft_line)
         self.ax_fft.set_title(f"{DATA_TYPE_NAMES.get(dt, '')} Spectrum")
-        self.ax_fft.set_xlabel("Frequency (Hz)")
+        self.ax_fft.set_xlabel("Frequency")
         self.ax_fft.set_ylabel("Amplitude")
         if self.fft_lines:
             self.ax_fft.legend(loc="upper right")
@@ -3116,7 +3116,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel(f"EEG-{eeg_ch + 1} (uV)", fontsize=8, color=color,
+                    fax.set_ylabel(f"EEG-{eeg_ch + 1}", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -3139,7 +3139,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("ECG (uV)", fontsize=8, color=color,
+                    fax.set_ylabel("ECG", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -3163,7 +3163,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("Angle (deg)", fontsize=8, color=color,
+                    fax.set_ylabel("Angle", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -3186,7 +3186,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
         fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
         if fft_axes_used:
-            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
+            fft_axes_used[-1].set_xlabel("Frequency", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
@@ -3290,7 +3290,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel(f"EMG-{ch + 1} (uV)", fontsize=8, color=color,
+                    fax.set_ylabel(f"EMG-{ch + 1}", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -3314,7 +3314,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                     (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                     self.bio_fft_lines[ch] = fft_line
                     fax.tick_params(axis='both', labelsize=7)
-                    fax.set_ylabel("Angle (deg)", fontsize=8, color=color,
+                    fax.set_ylabel("Angle", fontsize=8, color=color,
                                    rotation=0, va='center', ha='right', labelpad=10)
                     for spine in fax.spines.values():
                         spine.set_color(color)
@@ -3324,7 +3324,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
         fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
         if fft_axes_used:
-            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
+            fft_axes_used[-1].set_xlabel("Frequency", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
@@ -3405,7 +3405,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 (fft_line,) = fax.plot([], [], color=color, linewidth=0.8)
                 self.bio_fft_lines[plot_idx] = fft_line
                 fax.tick_params(axis='both', labelsize=7)
-                fax.set_ylabel(title, fontsize=8, color=color,
+                fax.set_ylabel(title.partition(" (")[0], fontsize=8, color=color,
                                rotation=0, va='center', ha='right', labelpad=10)
                 for spine in fax.spines.values():
                     spine.set_color(color)
@@ -3413,7 +3413,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.axes_eeg[-1].set_xlabel("Time (s)", fontsize=8)
         fft_axes_used = [fax for fax in self.axes_bio_fft if fax is not None]
         if fft_axes_used:
-            fft_axes_used[-1].set_xlabel("Frequency (Hz)", fontsize=8)
+            fft_axes_used[-1].set_xlabel("Frequency", fontsize=8)
         self._update_page_label()
         self._update_page_buttons()
         self.canvas_eeg.draw_idle()
