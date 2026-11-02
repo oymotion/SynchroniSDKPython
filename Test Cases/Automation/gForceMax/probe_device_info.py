@@ -97,7 +97,7 @@ def dump_params(sensor):
             v = sensor.getParam(key)
         except Exception as e:
             v = f"<{type(e).__name__}: {e}>"
-        supported = not (isinstance(v, str) and v.startswith("Error"))
+        supported = not (isinstance(v, str) and (v.startswith("Error") or v.startswith("<")))
         lines.append(f"getParam({key!r}) = {v!r}  ->  {'支持' if supported else '不支持'}")
 
     lines.append("")
@@ -107,7 +107,7 @@ def dump_params(sensor):
             v = sensor.getParam(key)
         except Exception as e:
             v = f"<{type(e).__name__}: {e}>"
-        supported = not (isinstance(v, str) and v.startswith("Error"))
+        supported = not (isinstance(v, str) and (v.startswith("Error") or v.startswith("<")))
         lines.append(f"getParam({key!r}) = {v!r}  ->  {'支持' if supported else '不支持'}")
     return "\n".join(lines)
 

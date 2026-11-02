@@ -27,11 +27,17 @@ MIN_SAMPLES = 1                     # 判定"收到数据"的最小样本数
 #TARGET_IDENTITY = "B383"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
 #TARGET_IDENTITY = "6C6B,206F"            # 多设备如 "80F9,6C6B"（当前探测 OB6000A 206F）
 #TARGET_IDENTITY = "9A91,9A9B" 
-TARGET_IDENTITY = "1D0E"   
+TARGET_IDENTITY = "9FE1,9F96"   
 
 # ---- 设备列表（支持多台）----
 # 注意：所有目标设备 identity 必须在此列表中，否则 common.py 启动时报错。
 DEVICES = [
+    {
+        "name_prefix": "OB3000",
+        "mac": "",
+        "identity": "C2D5",
+    },
+    
     {
         "name_prefix": "OB6000C",
         "mac": "78:1C:9D:E4:6C:6B",
@@ -154,6 +160,11 @@ DEVICES = [
         "identity": "854A"
     },
     {
+        "name_prefix": "Cerelax-Pro",
+        "mac": "BC:93:2A:3F:84:F9",
+        "identity": "84F9"
+    },
+    {
         "name_prefix": "gForceMax",
         "mac": "BC:93:2A:3F:9A:91",           
         "identity": "9A91",
@@ -185,7 +196,8 @@ MODEL_SPEC = {
     "OB6000A": "ob6000a",
     "OB6000C": "ob6000c",
     "OB": "ob6000c",   # 兜底：未知 OB 型号暂按 OB6000C
-    "Cerelax": "cerelax_pro",
+    "Cerelax-Pro": "cerelax_pro",
     "gForceMax": "gforce_max",
     "RehabArm": "rehab_arm",
+    "OB3000": "ob3000",
 }

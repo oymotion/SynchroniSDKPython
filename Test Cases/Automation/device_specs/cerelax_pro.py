@@ -71,6 +71,9 @@ SPEC = {
         "IMU_SAMPLE_RATE": {
             "rates": ["50", "100", "200"], "default": "200",
             "stream": "NTF_IMU", "settable": True, "co_stream": "NTF_EEG",
+            # Cerelax Pro 无 NTF_IMU 独立数据类型：IMU 6 轴数据按 acc/gyro 两路 DataType 投递，
+            # 采样率统计需聚合这两路（与 DeviceInfo.ImuChannelCount=6 一致）。
+            "sub_streams": ["NTF_ACC", "NTF_GYRO"],
         },
         "PPG_SAMPLE_RATE": {
             "rates": ["50", "100", "200", "400"], "default": "50",

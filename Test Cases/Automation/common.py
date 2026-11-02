@@ -238,6 +238,28 @@ def _identity_of(name):
     return m.group(1).upper() if m else None
 
 
+def identity_of_device(device):
+    """Derive a device's identity, preferring the broadcast-name suffix, falling back to MAC.
+
+    - name suffix: 'gForceUltra(9FE1)' -> '9FE1' (via _identity_of)
+    - MAC fallback: look up device.Address in config.DEVICES and return that entry's identity.
+      This covers devices that broadcast a bare model name without a '(XXXX)' suffix
+      (e.g. gForceUltra), where the name alone carries no identity.
+
+    Returns the identity string, or None if it can't be derived.
+    """
+    ident = _identity_of(getattr(device, 'Name', '') or '')
+    if ident:
+        return ident
+    addr = (getattr(device, 'Address', '') or '').strip().upper()
+    if addr:
+        for cfg in config.DEVICES:
+            mac = (cfg.get("mac") or "").strip().upper()
+            if mac and mac == addr:
+                return (cfg.get("identity") or "").strip().upper() or None
+    return None
+
+
 def _find_config(identity):
     """Find the config.DEVICES entry for a given identity."""
     for c in config.DEVICES:

@@ -49,7 +49,7 @@ import config
 import common
 from common import scan_and_match
 
-MEASURE_SECONDS = 600          # 每次会话正式采集时长（秒）
+MEASURE_SECONDS = 1800          # 每次会话正式采集时长（秒）
 SETTLE_SECONDS = 2.0           # setParam 后等待设备异步生效的静置时长
 WARMUP_SECONDS = 10.0          # 起流后预热时长（丢弃起流初期不稳定样本）
 READY_TIMEOUT = 15             # 连接后等待 Ready 超时（秒）
@@ -148,14 +148,50 @@ class RateCollector:
             if batch_min is not None:
                 s["timeline"].append((now, batch_min, batch_max))
 
-    def result_for(self, dt):
+    def _merged_stats(self, dts):
+        """返回单个 DataType 或 DataType 列表合并后的统计 dict；无数据返回 None。
+
+        聚合语义（IMU 用）：多路子流共享同一采样时钟/样本索引，合并时对 sampleIndex 取
+        全局首末（unique 不重复计数），delivered/channel_count 求和，timeline 合并后按到达时刻排序。
+        """
+        if not isinstance(dts, (list, tuple)):
+            return self.stats.get(dts)
+        subs = [self.stats.get(dt) for dt in dts if self.stats.get(dt)]
+        if not subs:
+            return None
+        merged = {
+            "delivered": 0, "channel_count": 0,
+            "first_ts": None, "last_ts": None,
+            "min_idx": None, "max_idx": None,
+            "min_abs_ts": None, "max_abs_ts": None,
+            "timeline": [],
+        }
+        for s in subs:
+            merged["delivered"] += s["delivered"]
+            merged["channel_count"] += s["channel_count"]
+            if s["first_ts"] is not None and (merged["first_ts"] is None or s["first_ts"] < merged["first_ts"]):
+                merged["first_ts"] = s["first_ts"]
+            if s["last_ts"] is not None and (merged["last_ts"] is None or s["last_ts"] > merged["last_ts"]):
+                merged["last_ts"] = s["last_ts"]
+            if s["min_idx"] is not None and (merged["min_idx"] is None or s["min_idx"] < merged["min_idx"]):
+                merged["min_idx"] = s["min_idx"]
+                merged["min_abs_ts"] = s["min_abs_ts"]
+            if s["max_idx"] is not None and (merged["max_idx"] is None or s["max_idx"] > merged["max_idx"]):
+                merged["max_idx"] = s["max_idx"]
+                merged["max_abs_ts"] = s["max_abs_ts"]
+            merged["timeline"].extend(s["timeline"])
+        merged["timeline"].sort(key=lambda t: t[0])
+        return merged
+
+    def result_for(self, dts):
         """返回 (unique, dur_host, dur_abs, delivered, channel_count)；无数据返回 (0, 0.0, 0.0, 0, 0)。
 
+        dts : 单个 DataType，或 DataType 列表（聚合流）。
         dur_host : host 侧数据到达首末时刻差（last_ts - first_ts），受 BLE 传输/缓冲影响。
         dur_abs  : 设备端采样时刻差（max_abs_ts - min_abs_ts），与 sampleIndex 严格对齐；
                    当 absTimeStampInSec 未知（起流锚点未建立）时为 0。
         """
-        s = self.stats.get(dt)
+        s = self._merged_stats(dts)
         if not s:
             return 0, 0.0, 0.0, 0, 0
         unique = 0
@@ -170,14 +206,15 @@ class RateCollector:
             dur_abs = s["max_abs_ts"] - s["min_abs_ts"]
         return unique, dur_host, dur_abs, s["delivered"], s["channel_count"]
 
-    def minute_rates(self, dt, t_start, t_end, window=60.0):
+    def minute_rates(self, dts, t_start, t_end, window=60.0):
         """按 window 秒切分 timeline，返回每分钟采样率数组（unique / 窗口时长）。
 
         仅在采集结束后调用（timeline 在采集阶段只做轻量 append，不影响采样）。
         只统计 [t_start, t_end) 内的批，忽略 t_end 之后 stopDataNotification 前的尾巴批；
         分母用固定窗口时长（与全局 unique/dur 口径一致），无数据的分钟记为 0.0 暴露断流。
+        dts : 单个 DataType 或 DataType 列表（聚合流）。
         """
-        s = self.stats.get(dt)
+        s = self._merged_stats(dts)
         if not s or not s["timeline"]:
             return []
         tl = s["timeline"]
@@ -209,17 +246,47 @@ class RateCollector:
             k += 1
         return out
 
+    def drift_metrics(self, arr):
+        """从逐分钟采样率数组提取漂移指标（窗口固定 60s，斜率单位即 Hz/min）。
 
-def _mk(key, rate, stream):
+        arr : minute_rates() 的输出（每段一个速率，断流段为 0.0）。
+        返回 (slope, first, last, spread)；有效段不足 2 个时返回 None。
+        slope  : 最小二乘线性拟合斜率（Hz/min，负=采样时钟随时间变慢）。
+        first/last : 有效段首/末速率；spread = 有效段 max−min（短期抖动幅度）。
+        """
+        if not arr:
+            return None
+        pts = [(i, r) for i, r in enumerate(arr) if r > 0]
+        if len(pts) < 2:
+            return None
+        n = len(pts)
+        xm = sum(p[0] for p in pts) / n
+        ym = sum(p[1] for p in pts) / n
+        sxx = sum((p[0] - xm) ** 2 for p in pts)
+        sxy = sum((p[0] - xm) * (p[1] - ym) for p in pts)
+        slope = sxy / sxx if sxx > 0 else 0.0
+        first = pts[0][1]
+        last = pts[-1][1]
+        spread = max(p[1] for p in pts) - min(p[1] for p in pts)
+        return slope, first, last, spread
+
+
+def _mk(key, rate, stream, co_stream=None, sub_streams=None):
     dt_type = getattr(DataType, stream, None) if stream else None
     label_stream = stream or key
+    sub_dt_types = None
+    if sub_streams:
+        sub_dt_types = [getattr(DataType, s, None) for s in sub_streams]
+        sub_dt_types = [d for d in sub_dt_types if d is not None] or None
     return {
         "key": key,
         "rate": str(rate),
         "expected": float(rate),
         "stream": stream,
+        "co_stream": co_stream,   # 伴随流（随主流量打包投递）非 None
         "label": f"{label_stream}@{rate}",
         "dt_type": dt_type,
+        "sub_dt_types": sub_dt_types,  # 聚合流：无独立 DataType 时，按多路 DataType 聚合统计
     }
 
 
@@ -244,13 +311,15 @@ def _schedule(sample_rates):
             rates = entry.get("rates", [])
             if i < len(rates):
                 # 从最高档开始倒序对齐：第 i 会话取各流倒数第 i 档，满负荷优先暴露性能问题
-                items.append(_mk(key, rates[-(i + 1)], entry.get("stream")))
+                items.append(_mk(key, rates[-(i + 1)], entry.get("stream"),
+                                entry.get("co_stream"), entry.get("sub_streams")))
         sessions.append(items)
 
     fixed_items = []
     for key, entry in fixed:
         rates = entry.get("rates", ["1"])
-        it = _mk(key, rates[0], entry.get("stream"))
+        it = _mk(key, rates[0], entry.get("stream"),
+                 entry.get("co_stream"), entry.get("sub_streams"))
         it["fixed"] = True
         fixed_items.append(it)
 
@@ -278,7 +347,7 @@ def _get_ble_path(sensor):
 
 
 def main():
-    sanity_log = common.setup_sanity_log(BASE_DIR)
+    sanity_log = common.setup_sanity_log(RESULT_DIR, subdir=None)
     if sanity_log:
         print(f"[SanityLog] stdout 日志: {sanity_log}", flush=True)
 
@@ -504,7 +573,8 @@ def main():
         # 之前用 host 数据到达首末时刻差（last_ts - first_ts）做分母，会因首尾 BLE 传输/缓冲
         # 延迟不相等而系统性偏小，把采样率虚高约 0.03%，掩盖真实偏高（false pass）。
         for it in ok_targets:
-            unique, dur_host, dur_abs, delivered, ch = collector.result_for(it["dt_type"])
+            dt_key = it["sub_dt_types"] if it.get("sub_dt_types") else it["dt_type"]
+            unique, dur_host, dur_abs, delivered, ch = collector.result_for(dt_key)
             if unique <= 0:
                 summaries.append((it["label"], None, f"未收到 {it['stream']} 数据（唯一样本={unique}）"))
                 continue
@@ -524,9 +594,17 @@ def main():
             elif dur_host > 0:
                 print(f"      [口径] host到达时刻差={dur_host:.3f}s -> {unique / dur_host:.3f}Hz "
                       f"(设备 absTimeStampInSec 不可用)", flush=True)
-            minute_arr = collector.minute_rates(it["dt_type"], t_start, t_end)
+            minute_arr = collector.minute_rates(dt_key, t_start, t_end)
             if minute_arr:
                 print(f"      [每分钟采样率] {minute_arr}", flush=True)
+                drift = collector.drift_metrics(minute_arr)
+                if drift:
+                    slope, first, last, spread = drift
+                    drift_pct = (last - first) / it["expected"] * 100.0 if it["expected"] > 0 else float("nan")
+                    print(f"      [漂移] 斜率={slope:+.4f}Hz/min | 首尾={first:.3f}->{last:.3f}Hz"
+                          f"(Δ{last - first:+.3f}Hz, {drift_pct:+.3f}%) | 峰峰={spread:.3f}Hz", flush=True)
+                else:
+                    print("      [漂移] 有效段不足，无法计算", flush=True)
             summaries.append((it["label"], ok,
                               f"期望={it['expected']}Hz, 实际≈{actual:.3f}Hz 偏差={dev:.3%}（唯一样本={unique}）"))
 

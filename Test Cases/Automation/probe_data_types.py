@@ -56,15 +56,21 @@ class ProbeCollector:
         items = data if isinstance(data, list) else [data]
         for d in items:
             dt = d.getDataType()
-            entry = self.by_type.setdefault(dt, {'batches': 0, 'samples': 0})
+            entry = self.by_type.setdefault(dt, {'batches': 0, 'samples': 0, 'channels': 0, 'sample_rate': 0.0})
             entry['batches'] += 1
             # SDK 1.3.0 移除了 channelSamples，改用 getChannelCount/getSampleCount/getChannelSample
             try:
                 n_ch = d.getChannelCount()
                 n_smp = d.getSampleCount()
+                rate = d.getSampleRate()
             except Exception:
                 n_ch = n_smp = 0
+                rate = 0.0
             entry['samples'] += n_ch * n_smp
+            if entry['channels'] == 0 and n_ch:
+                entry['channels'] = n_ch
+            if entry['sample_rate'] == 0 and rate:
+                entry['sample_rate'] = rate
 
             # dump 样本字段名（仅一次）
             if not self.sample_fields and n_ch > 0 and n_smp > 0:
@@ -110,7 +116,8 @@ def _dump_collector(collector, label):
         print("  未收到任何数据", flush=True)
     else:
         for dt, entry in collector.by_type.items():
-            print(f"  DataType={_dt_name(dt)}  批次={entry['batches']}  样本数={entry['samples']}", flush=True)
+            print(f"  DataType={_dt_name(dt)}  批次={entry['batches']}  样本数={entry['samples']}  "
+                  f"通道数={entry['channels']}  采样率={entry['sample_rate']}", flush=True)
     if collector.sample_fields:
         print(f"  样本字段样例: {collector.sample_fields}", flush=True)
     if collector.impedance_values:
