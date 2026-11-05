@@ -1,4 +1,4 @@
-sensor-sdk >= 1.4.3
+sensor-sdk >= 1.4.4
 scipy
 matplotlib
 PyQt5
