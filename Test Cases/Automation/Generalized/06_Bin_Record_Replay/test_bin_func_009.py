@@ -368,7 +368,7 @@ def main():
         match = (live_pair == replay_pair)
         record(results, "回放还原 (startTimeStamp, delay) 与实收一致",
                match,
-               f"replay {replay_pair} == live {live_pair}",
+               "回放还原的 (startTimeStamp, delay) 应与实收完全一致",
                f"live={live_pair} replay={replay_pair} match={match}")
 
         ts_diff = abs(live_pair[0] - replay_pair[0]) if live_pair[0] is not None and replay_pair[0] is not None else None

@@ -8,6 +8,7 @@
   - 主机(电脑)：蓝牙已开启
   - 环境中 ≥2 台设备开机且在范围内
   - config.py 中 TARGET_IDENTITY 用逗号列出 ≥2 个 identity
+  - 蓝牙适配器：dongle 后端需 ≥2 个可用 dongle（1 个 dongle 只能同时连 1 台）；系统蓝牙（winrt/bluez/darwin）单适配器可多连接
 
 流程：
   1) 确认 ≥2 台设备开机 -> 按回车
@@ -56,6 +57,36 @@ def _load_spec(target):
         return None
 
 
+def _parse_usable_dongles(info):
+    """解析 checkSetupDongle 返回，提取可用 dongle 数量。
+
+    checkSetupDongle 返回形如：
+      - "OK: <usable>/<total>"   例如 "OK: 2/2"、"OK: 1/3"
+      - "OK"                     无 dongle，走系统蓝牙（无 ":"）
+      - "Error: ..."             失败/超时
+    返回 (usable, total)；无 dongle 或失败时返回 (None, None)。
+    """
+    if not isinstance(info, str) or not info.startswith("OK"):
+        return (None, None)
+    first_line = info.splitlines()[0] if info.splitlines() else info
+    if ":" not in first_line:
+        return (None, None)
+    count = first_line.split(":", 1)[1].strip()
+    usable_s = count.split("/", 1)[0].strip()
+    total_s = count.split("/", 1)[1].strip() if "/" in count else None
+    usable = None
+    total = None
+    try:
+        usable = int(usable_s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        total = int(total_s) if total_s is not None else None
+    except (ValueError, TypeError):
+        pass
+    return (usable, total)
+
+
 async def main_async():
     ctrl = SensorControllerInstance
 
@@ -80,6 +111,52 @@ async def main_async():
     print(f"\n[环境检查] SensorController.isEnable = {is_enable}", flush=True)
     if is_enable is not True:
         print("[跳过] 前置条件不满足：电脑蓝牙未开启。请先开启【电脑】蓝牙后重跑。", flush=True)
+        ctrl.terminate()
+        return
+
+    # ---- 预检：是否有足够蓝牙适配器同时连接 ≥2 台设备 ----
+    # dongle 后端：1 个可用 dongle ≈ 1 台设备同时连接；需 ≥2 个可用 dongle。
+    # 系统蓝牙（winrt/bluez/darwin）：单适配器可多连接，视为满足。
+    try:
+        backend = await ctrl.asyncGetParam("BACK_END")
+    except Exception as e:
+        backend = f"<error {type(e).__name__}: {e}>"
+    print(f"\n[适配器预检] 当前 BLE 后端 = {backend!r}", flush=True)
+
+    adapter_ok = True
+    adapter_txt = ""
+    if backend == "dongle":
+        try:
+            dongle_info = await ctrl.asyncCheckSetupDongle()
+        except Exception as e:
+            dongle_info = f"Error: {type(e).__name__}: {e}"
+        print(f"[适配器预检] asyncCheckSetupDongle() -> {dongle_info!r}", flush=True)
+        usable, total = _parse_usable_dongles(dongle_info)
+        if usable is None:
+            adapter_ok = False
+            adapter_txt = f"无法解析 dongle 数量（返回 {dongle_info!r}）"
+        elif usable < 2:
+            adapter_ok = False
+            adapter_txt = (f"dongle 后端仅 {usable} 个可用 dongle"
+                           + (f"（共 {total} 个）" if total is not None else "")
+                           + "，不足以同时连接 2 台设备")
+        else:
+            adapter_txt = f"dongle 后端可用 {usable} 个 dongle"
+            adapter_txt += (f"（共 {total} 个）" if total is not None else "") + "，满足多设备"
+    else:
+        adapter_txt = f"系统蓝牙后端（{backend}）单适配器可多连接，视为满足"
+
+    print(f"[适配器预检] {adapter_txt}", flush=True)
+    record(results, "蓝牙适配器满足同时连接 ≥2 台设备", True if adapter_ok else None,
+           "dongle ≥2 或系统蓝牙后端", adapter_txt)
+
+    if not adapter_ok:
+        print("\n" + "=" * 60, flush=True)
+        print("测试结果汇总", flush=True)
+        print("=" * 60, flush=True)
+        for rname, status, expect, actual in results:
+            print(f"  [SKIP] {rname}（{actual}）", flush=True)
+        print("\n结论: SKIP", flush=True)
         ctrl.terminate()
         return
 

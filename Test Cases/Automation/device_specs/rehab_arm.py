@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""RehabArm 康复臂设备规格（Spec）——单一事实来源。
+"""ORehabArm 康复臂设备规格（Spec）——单一事实来源。
 
 本文件是该型号「应该支持」的能力基线，测试用例据此硬断言：
 设备行为偏离 spec 即 FAIL（而非 SKIP / 自适应跳过）。
 
-同一型号（name_prefix == "RehabArm"）的多台设备共用本文件，
+同一型号（name_prefix == "ORehabArm"）的多台设备共用本文件，
 通过 config.MODEL_SPEC 映射、common.load_spec() 读取，无需逐次确认。
 
 数据来源（实测固化，2026-10-27，设备 1D0E，probe_device.py 三层探测）：
@@ -27,6 +27,13 @@ DeviceInfo 声明支持的能力（ChannelCount>0）：
   - NTF_MAG(0x03):        3 通道, 10.0 Hz   ← 磁力计
 
 关键判定口径：
+  - 角度流的 setParam/getParam 流开关 key 为 `NTF_ANGLE`（2026-11-03 实测，SDK 1.4.3：
+    setParam("NTF_ANGLE","OFF") 返回 OK，角度流停止且不影响 MAG/IMU）。
+    `NTF_ANGLE_DATA` 仅是 DataType 枚举名（用于 getDataType 匹配 / 本 spec 流键），
+    用作 setParam 返回 Not supported；README 的 `NTF_MAG_ANGLE` 已失效。
+    权威 key 列表取自 `getParam("NTF")`。
+  - 磁力计无独立 setParam 开关（`NTF_MAG` 返回 Not supported）；磁力计随 `NTF_IMU`
+    聚合开关起停（`setParam("NTF_IMU","OFF")`→OK，MAG 与 ACC/GYRO/EULER/QUAT 一起停）。
   - 无 NTF_IMU(0x13) 独立数据类型投递：IMU 数据按 acc/gyro/euler/quat 四路 DataType
     独立投递（与 gForceMax/gForceUltra 新固件一致），DeviceInfo.ImuChannelCount=13 是聚合声明。
   - 角度(1ch/250Hz) 与磁力计(3ch/10Hz) 为独立流，不并入 IMU 聚合（13 = 3+3+3+4）。
@@ -40,9 +47,9 @@ DeviceInfo 声明支持的能力（ChannelCount>0）：
 
 SPEC = {
     # ===== 身份 =====
-    "model": "RehabArm",
+    "model": "ORehabArm",
     "type": "康复臂/姿态追踪设备（3轴加速度 + 3轴陀螺仪 + 3轴欧拉角 + 4分量四元数 + 1通道角度 + 3轴磁力计）",
-    "name_prefix": "RehabArm",
+    "name_prefix": "ORehabArm",
 
     # ===== 数据流能力（DataType 级别，对应 DeviceInfo 的 ChannelCount 期望）=====
     # supported=True 表示该数据流应存在并产出数据；channels 为期望通道数。
@@ -93,7 +100,9 @@ SPEC = {
             "sub_streams": ["NTF_ACC", "NTF_GYRO", "NTF_EULER_DATA", "NTF_QUATERNION"],
         },
         "ANGLE_SAMPLE_RATE": {
-            # 角度固定 250Hz、不可设置（demo 中角度无采样率选择，已确认 settable=False）
+            # 角度固定 250Hz、不可设置（demo 中角度无采样率选择，已确认 settable=False）。
+            # 注意：本 key 是 spec 内部抽象，SDK 并没有 ANGLE_SAMPLE_RATE 这个 getParam/setParam
+            # 参数（1.4.3 实测返回 Not supported）；真实能力只由 DeviceInfo.AngleSampleRate 表达。
             "rates": ["250"], "default": "250",
             "stream": "NTF_ANGLE_DATA", "settable": False, "co_stream": None,
         },

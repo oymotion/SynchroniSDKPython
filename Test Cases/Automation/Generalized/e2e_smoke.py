@@ -75,6 +75,13 @@ def _get_ble_path(sensor):
     except Exception as e:
         return f"抛异常 {type(e).__name__}: {e}"
 
+def _safe(fn, default=None):
+    """安全调用无参函数，异常时返回 default（读 SensorData 字段不崩）。"""
+    try:
+        return fn()
+    except Exception:
+        return default
+
 class DataCounter:
     def __init__(self, primary_stream):
         self.primary_stream = primary_stream
@@ -82,6 +89,7 @@ class DataCounter:
         self.samples = 0
         self.dt_samples = {}      # DataType 名字 -> 累计样本数（n_ch * n_smp）
         self.first_primary_ts = None  # 首次收到主数据流数据的时刻（time.monotonic 秒）
+        self.meta = None          # 首个有效样本的元数据（sample_rate/start_ts/delay/... 一次记录）
         self.lock = threading.Lock()
 
     def __call__(self, sensor, data):
@@ -101,6 +109,20 @@ class DataCounter:
                         self.dt_samples[name] = self.dt_samples.get(name, 0) + n
                         if name == self.primary_stream and self.first_primary_ts is None:
                             self.first_primary_ts = time.monotonic()
+                        # 首个有效样本记录元数据（覆盖采样率/时序锚点/丢包等 API 可调用性）
+                        if self.meta is None:
+                            self.meta = {
+                                'sample_rate': _safe(it.getSampleRate),
+                                'start_ts': _safe(it.getStartTimeStamp),
+                                'delay': _safe(it.getDelay),
+                                'start_sec': _safe(it.getStartTimeSec),
+                                'device_mac': _safe(it.getDeviceMac),
+                                'channel_mask': _safe(it.getChannelMask),
+                                'is_valid': _safe(it.isDataValid),
+                                'raw0': _safe(lambda: it.getRawData(0, 0)),
+                                'data0': _safe(lambda: it.getData(0, 0)),
+                                'lost': _safe(it.getLostPackageCount),
+                            }
                 except Exception:
                     continue
 
@@ -172,6 +194,45 @@ def main():
         return
     record(results, "SensorController.isEnable 为 True", True, "isEnable == True", f"isEnable == {is_enable}")
 
+    # controller 级日志（写应用日志，验证 log 接口不抛异常）
+    try:
+        ctrl.log("e2e smoke: controller log", "I")
+        ctrl_log_ok = True
+    except Exception as e:
+        ctrl_log_ok = False
+        print(f"[log] SensorController.log 抛异常 {type(e).__name__}: {e}", flush=True)
+    record(results, "SensorController.log 写日志", ctrl_log_ok,
+           "ctrl.log(msg, 'I') 无异常", "无异常" if ctrl_log_ok else "抛异常")
+
+    # 扫描回调链路：startScan + onDeviceFoundCallback + hasDeviceFoundCallback + stopScan
+    found_names = []
+    def _on_found(device_list):
+        found_names.append([getattr(d, 'Name', '?') for d in (device_list or [])])
+    ctrl.onDeviceFoundCallback = _on_found
+    has_cb = ctrl.hasDeviceFoundCallback
+    print(f"\n[扫描回调] 注册后 hasDeviceFoundCallback = {has_cb}", flush=True)
+    record(results, "注册后 hasDeviceFoundCallback==True", has_cb is True,
+           "hasDeviceFoundCallback == True", f"hasDeviceFoundCallback == {has_cb}")
+    try:
+        sscan_ret = ctrl.startScan(3000)
+    except Exception as e:
+        sscan_ret = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[扫描回调] startScan(3000) -> {sscan_ret!r}", flush=True)
+    record(results, "SensorController.startScan 返回 True", sscan_ret is True,
+           "startScan 返回 True", f"startScan -> {sscan_ret!r}")
+    time.sleep(3.5)  # 等至少一个扫描周期触发回调
+    try:
+        ctrl.stopScan()
+        sscan_stop_ok = True
+    except Exception as e:
+        sscan_stop_ok = False
+        print(f"[扫描回调] stopScan 抛异常 {type(e).__name__}: {e}", flush=True)
+    record(results, "SensorController.stopScan 不抛异常", sscan_stop_ok,
+           "stopScan 不抛异常", "无异常" if sscan_stop_ok else "抛异常")
+    record(results, "onDeviceFoundCallback 触发（informational）", None,
+           "扫描周期内回调可选触发（已连接设备可能不重复推送）",
+           f"触发 {len(found_names)} 次 names={found_names}")
+
     # 扫描匹配
     if target_identity:
         print(f"\n[扫描] 目标 identity: {', '.join(target_identity)}（命令行指定）", flush=True)
@@ -217,6 +278,56 @@ def main():
         return
     record(results, "SensorController.requireSensor 返回 SensorProfile", isinstance(sensor, SensorProfile),
            "返回 SensorProfile", f"返回 {type(sensor).__name__}")
+
+    # getSensor(mac) 按 MAC 取 profile（与 requireSensor 交叉验证）
+    try:
+        sensor_by_mac = ctrl.getSensor(addr)
+    except Exception as e:
+        sensor_by_mac = None
+        print(f"[getSensor] SensorController.getSensor({addr}) 抛异常 {type(e).__name__}: {e}", flush=True)
+    record(results, "SensorController.getSensor(mac) 返回 SensorProfile", sensor_by_mac is not None,
+           "getSensor(mac) 返回非 None",
+           f"getSensor({addr}) -> {type(sensor_by_mac).__name__ if sensor_by_mac else 'None'}")
+
+    # profile 级日志
+    try:
+        sensor.log("e2e smoke: profile log", "W")
+        prof_log_ok = True
+    except Exception as e:
+        prof_log_ok = False
+        print(f"[log] SensorProfile.log 抛异常 {type(e).__name__}: {e}", flush=True)
+    record(results, "SensorProfile.log 写日志", prof_log_ok,
+           "sensor.log(msg, 'W') 无异常", "无异常" if prof_log_ok else "抛异常")
+
+    # autoReconnect 属性读写（不触发断链，仅验证读写一致）
+    try:
+        sensor.autoReconnect = True
+        ar_read = sensor.autoReconnect
+        ar_ok = (ar_read is True)
+    except Exception as e:
+        ar_read = f"抛异常 {type(e).__name__}: {e}"
+        ar_ok = False
+    print(f"[autoReconnect] 赋值 True 后读回 = {ar_read!r}", flush=True)
+    record(results, "autoReconnect 设为 True 后读回 True", ar_ok,
+           "autoReconnect == True", f"autoReconnect == {ar_read!r}")
+
+    # 注册回调：状态机 / 电量 / 设备信息更新（均 auto 触发，无需人工动作）
+    states = []
+    powers = []
+    info_updates = []
+
+    def _on_state(s, st):
+        states.append(str(st))
+
+    def _on_power(s, pct):
+        powers.append(pct)
+
+    def _on_info_update(s, info):
+        info_updates.append(getattr(info, 'ModelName', '?'))
+
+    sensor.onStateChanged = _on_state
+    sensor.onPowerChanged = _on_power
+    sensor.onDeviceInfoUpdate = _on_info_update
 
     # connect
     print("\n[连接] SensorProfile.connect() ...", flush=True)
@@ -267,12 +378,16 @@ def main():
         print(f"[设备信息] getDeviceInfo 抛异常 {type(e).__name__}: {e}", flush=True)
     info_ok = info is not None
     if info_ok:
-        model = getattr(info, 'ModelName', '?')
-        fw = getattr(info, 'FirmwareVersion', '?')
-        emg_ch = getattr(info, 'EmgChannelCount', '?')
-        emg_rate = getattr(info, 'EmgSampleRate', '?')
-        acc_ch = getattr(info, 'AccChannelCount', '?')
-        print(f"[设备信息] Model={model} FW={fw} EmgChannel={emg_ch} EmgRate={emg_rate} AccChannel={acc_ch}", flush=True)
+        # 基础字段 + 各 modality 的 ChannelCount/SampleRate（getattr 安全读，不存在的为 None）
+        info_fields = {}
+        for f in ("DeviceName", "ModelName", "HardwareVersion", "FirmwareVersion", "MTUSize",
+                  "EegChannelCount", "EegSampleRate", "EmgChannelCount", "EmgSampleRate",
+                  "AccChannelCount", "AccSampleRate", "GyroChannelCount", "GyroSampleRate",
+                  "ImuChannelCount", "ImuSampleRate", "PpgChannelCount", "PpgSampleRate",
+                  "EcgChannelCount", "EcgSampleRate", "ImpedanceChannelCount", "ImpedanceSampleRate",
+                  "MagChannelCount", "MagSampleRate", "EmgMaxSampleRate", "EegMaxSampleRate", "EcgMaxSampleRate"):
+            info_fields[f] = getattr(info, f, None)
+        print(f"[设备信息] {info_fields}", flush=True)
     record(results, "SensorProfile.getDeviceInfo 返回 DeviceInfo", info_ok,
            "init 后 getDeviceInfo() 返回非 None", f"返回 {type(info).__name__}" if info_ok else "返回 None")
 
@@ -354,6 +469,32 @@ def main():
     print(f"[电量] SensorProfile.getBatteryLevel() -> {battery}", flush=True)
     record(results, "SensorProfile.getBatteryLevel 返回有效值", isinstance(battery, int) and battery != -1,
            "getBatteryLevel() 返回 0~100 且不为 -1", f"getBatteryLevel -> {battery}")
+
+    # 采样字段（DataCounter 记录的元数据，验证 SensorData 各 API 可调用）
+    meta = counter.meta or {}
+    print(f"\n[采样字段] {meta}", flush=True)
+    record(results, "SensorData.getSampleRate 返回有效值",
+           isinstance(meta.get('sample_rate'), (int, float)) and (meta.get('sample_rate') or 0) > 0,
+           "getSampleRate() 返回 >0", f"sample_rate={meta.get('sample_rate')}")
+    record(results, "SensorData.getStartTimeStamp 返回有效值",
+           isinstance(meta.get('start_ts'), int) and (meta.get('start_ts') or 0) != 0,
+           "getStartTimeStamp() 返回非 0", f"start_ts={meta.get('start_ts')}")
+    record(results, "SensorData.isDataValid 返回 True", meta.get('is_valid') is True,
+           "isDataValid() == True", f"is_valid={meta.get('is_valid')}")
+    record(results, "SensorData.getRawData/getData 可调用",
+           meta.get('raw0') is not None and meta.get('data0') is not None,
+           "getRawData(0,0)/getData(0,0) 返回非 None", f"raw0={meta.get('raw0')} data0={meta.get('data0')}")
+
+    # 回调触发汇总（auto 触发；onStateChanged 硬断言，其余 informational）
+    print(f"\n[回调] onStateChanged 状态序列 = {states}", flush=True)
+    print(f"[回调] onPowerChanged 触发 {len(powers)} 次 values={powers}", flush=True)
+    print(f"[回调] onDeviceInfoUpdate 触发 {len(info_updates)} 次", flush=True)
+    record(results, "onStateChanged 触发（连接状态机）", len(states) > 0,
+           "连接过程触发 >=1 次 onStateChanged", f"状态序列={states}")
+    record(results, "onPowerChanged 触发（informational）", None,
+           "init powerRefreshInterval 周期内可选触发", f"触发 {len(powers)} 次 values={powers}")
+    record(results, "onDeviceInfoUpdate 触发（informational）", None,
+           "init 后 DeviceInfo 更新时可选触发", f"触发 {len(info_updates)} 次")
 
     # 停流
     try:

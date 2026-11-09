@@ -148,11 +148,19 @@ def main():
     ready_ok = False
     not_ready_ok = False
     if isinstance(mret, list) and len(mret) == len(sensors):
-        # SDK 返回顺序与传入 sensors 顺序一致：[s1(已 init), s2(未 init)]
-        item1 = mret[0] if isinstance(mret[0], dict) else {}
-        item2 = mret[1] if isinstance(mret[1], dict) else {}
-        ready_ok = (item1.get("ok") is True and s1.isDataTransfering is True)
-        not_ready_ok = (item2.get("ok") is not True)
+        # SDK 返回顺序不保证与传入 sensors 一致（可能按 MAC 排序），按 mac 匹配对应结果，
+        # 不能用 mret[0]/mret[1] 按位置对应 s1/s2。
+        def _result_for(sensor):
+            addr = (getattr(getattr(sensor, 'BLEDevice', None), 'Address', '') or '').upper()
+            for item in mret:
+                if isinstance(item, dict) and (item.get('mac') or '').upper() == addr:
+                    return item
+            return {}
+
+        r1 = _result_for(s1)
+        r2 = _result_for(s2)
+        ready_ok = (r1.get("ok") is True and s1.isDataTransfering is True)
+        not_ready_ok = (r2.get("ok") is not True)
         for item in mret:
             print(f"[multiStart] {item.get('mac')}: ok={item.get('ok')}, error={item.get('error')!r}", flush=True)
         print(f"[multiStart] {tid1}({s1.BLEDevice.Address}): isDataTransfering={s1.isDataTransfering}", flush=True)

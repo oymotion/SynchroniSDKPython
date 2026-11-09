@@ -220,12 +220,17 @@ def main():
     reconnected = _wait_until(
         lambda: sensor.deviceState == DeviceStateEx.Ready,
         RECONNECT_TIMEOUT, 0.5, "自动重连恢复 Ready")
-    print(f"[恢复] deviceState={sensor.deviceState} onAutoReconnect {len(reconnects)} 次 状态序列 {[str(s) for s in states]}", flush=True)
-
-    record(results, "onAutoReconnect 触发", len(reconnects) > 0,
-           "onAutoReconnect 触发", f"触发 {len(reconnects)} 次 restore={reconnects!r}")
     record(results, "恢复后重新 Ready", reconnected,
            "deviceState==Ready", f"state={sensor.deviceState}")
+
+    # onAutoReconnect 在恢复 Ready 后由 SDK 的自动重连轮询（约 1s 周期）触发，
+    # 不能 Ready 后立即读 reconnects，需显式等待回调（否则时序误报 false negative）。
+    callback_seen = _wait_until(
+        lambda: len(reconnects) > 0,
+        RECONNECT_TIMEOUT, 0.5, "onAutoReconnect 回调")
+    print(f"[恢复] deviceState={sensor.deviceState} onAutoReconnect {len(reconnects)} 次 状态序列 {[str(s) for s in states]}", flush=True)
+    record(results, "onAutoReconnect 触发", callback_seen,
+           "onAutoReconnect 触发", f"触发 {len(reconnects)} 次 restore={reconnects!r}")
 
     # 恢复起流：Ready 后 SDK 仍需时间重放 init/setParam/startDataNotification，
     # 故额外轮询等待 isDataTransfering 恢复为 True，而非立即读取

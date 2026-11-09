@@ -92,21 +92,36 @@ def main():
     print(f"[测试2] 路径类型: {'文件' if os.path.isfile(temp_file) else '目录' if os.path.isdir(temp_file) else '不存在'}", flush=True)
     print(f"[测试2] 文件原始大小: {size_before} bytes（sentinel 长度 {len(sentinel)}）", flush=True)
 
+    # setLogPath 是 void 包装：内部调用 setParam("LOG_PATH", path) 并丢弃返回值，
+    # 从不因「拒绝」抛异常。因此「被拒绝」只能通过副作用观察：
+    # 拒绝后 getParam("LOG_PATH") 不应变成该文件路径。
+    def _same_path(a, b):
+        try:
+            return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+        except Exception:
+            return a == b
+
+    try:
+        before_path = ctrl.getParam("LOG_PATH")
+    except Exception as e:
+        before_path = f"抛异常 {type(e).__name__}: {e}"
+    print(f"[测试2] setLogPath 前 LOG_PATH = {before_path!r}", flush=True)
+
     file_rejected = False
     file_rejected_txt = ""
-    ret = None
     try:
-        ret = ctrl.setLogPath(True, temp_file)
-        print(f"[测试2] setLogPath 返回值: {ret}", flush=True)
-        file_rejected = False
-        file_rejected_txt = f"setLogPath(True, 已存在文件) 返回 {ret}，未抛异常，路径: {temp_file}"
+        ctrl.setLogPath(True, temp_file)
+        after_path = ctrl.getParam("LOG_PATH")
+        file_rejected = not _same_path(after_path, temp_file)
+        file_rejected_txt = (f"setLogPath 后 LOG_PATH={after_path!r}（变更前={before_path!r}），"
+                             f"{'被拒绝' if file_rejected else '未拒绝（LOG_PATH 已指向该文件）'}")
     except Exception as e:
         file_rejected = True
-        file_rejected_txt = f"setLogPath 抛异常（预期行为）: {type(e).__name__}: {e}"
+        file_rejected_txt = f"setLogPath 抛异常（视为拒绝）: {type(e).__name__}: {e}"
 
     print(f"[测试2] {file_rejected_txt}", flush=True)
     record(results, "setLogPath 指向已存在文件被拒绝", file_rejected,
-           "setLogPath(True, 已存在文件) 抛异常或返回错误",
+           "setLogPath(True, 已存在文件) 后 LOG_PATH 不指向该文件",
            file_rejected_txt)
 
     # ---- 测试 2b：若未拒绝，进一步验证对已存在文件的实际影响 ----

@@ -2,14 +2,14 @@
 """PARAM-FUNC-006：getParam EEG_SAMPLE_RATE / EEG_SAMPLE_RATE_LIST（spec 驱动）。
 
 对应用例：04_参数.md -> PARAM-FUNC-006
-可自动化：auto（能力判定后执行/跳过）
+可自动化：auto（能力判定后执行正向/逆向断言）
 
 流程：
   1) scan -> requireSensor -> connect -> 到达 Ready -> init
-  2) 载入设备 spec；spec["sample_rates"].get("EEG_SAMPLE_RATE") 为 None
-     → 设备无 EEG_SAMPLE_RATE 参数，SKIP
-  3) 查询 getParam("EEG_SAMPLE_RATE")（应为数字字符串，且属于 spec rates）
-     与 getParam("EEG_SAMPLE_RATE_LIST")（应为非空 pipe 列表，且与 spec rates 一致）
+  2) 载入设备 spec，并读取 getParam("EEG_SAMPLE_RATE") 与
+     getParam("EEG_SAMPLE_RATE_LIST")（无能力时也分别读一次，走逆向）
+  3) 有 EEG_SAMPLE_RATE 参数 → 正向断言：返回数字字符串 + pipe 列表与 spec 一致
+     无 EEG_SAMPLE_RATE 参数 → 逆向断言：getParam 应被拒绝（返回 OSError / Error 开头）
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -41,6 +41,12 @@ def _load_spec(target):
     except Exception as e:
         print(f"[FAIL] 载入设备 spec 失败（identity={identity}）: {type(e).__name__}: {e}", flush=True)
         return None
+
+
+def _is_error(res):
+    """错误判定三态：字符串以 Error / 抛异常 / < 开头视为被拒绝（SDK 1.4.3 语义）。"""
+    return isinstance(res, str) and (
+        res.startswith("Error") or res.startswith("抛异常") or res.startswith("<"))
 
 
 def main():
@@ -137,25 +143,10 @@ def main():
     print(f"[init] SensorProfile.init() -> {init_txt}", flush=True)
     record(results, "SensorProfile.init 返回 True", iret is True, "init() 返回 True", f"init() -> {init_txt}")
 
-    # 能力判定（spec 驱动）：EEG_SAMPLE_RATE 参数存在才继续
+    # 能力判定（spec 驱动）
     sr = (spec.get("sample_rates") or {}).get("EEG_SAMPLE_RATE")
-    if sr is None:
-        record(results, "设备无 EEG_SAMPLE_RATE 参数", None,
-               "spec[\"sample_rates\"].get('EEG_SAMPLE_RATE') 存在",
-               f"EEG_SAMPLE_RATE spec={sr!r}，设备无该参数")
-        print("[SKIP] 设备无 EEG_SAMPLE_RATE 参数，跳过", flush=True)
-        try:
-            sensor.disconnect()
-        except Exception:
-            pass
-        print("\n结论: SKIP", flush=True)
-        ctrl.terminate()
-        return
 
-    spec_rates = sr["rates"]
-    print(f"[能力] EEG 支持采样率: {spec_rates}", flush=True)
-
-    # 读两个查询
+    # 统一读两个查询（无能力时也分别读一次单点查询，走逆向断言）
     try:
         list_txt = sensor.getParam("EEG_SAMPLE_RATE_LIST")
     except Exception as e:
@@ -167,24 +158,39 @@ def main():
     print(f"\n[查询] getParam('EEG_SAMPLE_RATE_LIST') = {list_txt!r}", flush=True)
     print(f"[查询] getParam('EEG_SAMPLE_RATE') = {rate_txt!r}", flush=True)
 
-    # RATE：应为数字字符串，且属于 spec 档位
-    ok_rate_digit = isinstance(rate_txt, str) and re.fullmatch(r"\d+", rate_txt) is not None
-    record(results, "getParam('EEG_SAMPLE_RATE') 返回数字字符串", ok_rate_digit,
-           "返回纯数字字符串（如 '250'）", f"getParam('EEG_SAMPLE_RATE')={rate_txt!r}")
+    if sr is None:
+        # 逆向用例：设备无 EEG_SAMPLE_RATE 参数，getParam 应被拒绝（返回 OSError / Error 开头）
+        record(results, "设备无 EEG_SAMPLE_RATE 参数（逆向）", True,
+               "spec['sample_rates'] 无 EEG_SAMPLE_RATE", f"EEG_SAMPLE_RATE spec={sr!r}")
+        record(results, "getParam('EEG_SAMPLE_RATE_LIST') 返回错误（OSError/Error）",
+               _is_error(list_txt), "返回 OSError / Error 开头",
+               f"getParam('EEG_SAMPLE_RATE_LIST')={list_txt!r}")
+        record(results, "getParam('EEG_SAMPLE_RATE') 返回错误（OSError/Error）",
+               _is_error(rate_txt), "返回 OSError / Error 开头",
+               f"getParam('EEG_SAMPLE_RATE')={rate_txt!r}")
+        print("[逆向] 设备无该参数，验证 getParam 被拒绝（返回 OSError/Error）", flush=True)
+    else:
+        spec_rates = sr["rates"]
+        print(f"[能力] EEG 支持采样率: {spec_rates}", flush=True)
 
-    ok_rate_in_rates = isinstance(rate_txt, str) and rate_txt in spec_rates
-    record(results, "getParam('EEG_SAMPLE_RATE') 值属于 spec 档位", ok_rate_in_rates,
-           f"值 ∈ {spec_rates}", f"getParam('EEG_SAMPLE_RATE')={rate_txt!r}")
+        # RATE：应为数字字符串，且属于 spec 档位
+        ok_rate_digit = isinstance(rate_txt, str) and re.fullmatch(r"\d+", rate_txt) is not None
+        record(results, "getParam('EEG_SAMPLE_RATE') 返回数字字符串", ok_rate_digit,
+               "返回纯数字字符串（如 '250'）", f"getParam('EEG_SAMPLE_RATE')={rate_txt!r}")
 
-    # LIST：应为非空 pipe 列表，且与 spec 档位一致
-    list_rates = [x.strip() for x in list_txt.split("|") if x.strip()] if isinstance(list_txt, str) else []
-    ok_list_nonempty = len(list_rates) > 0
-    record(results, "getParam('EEG_SAMPLE_RATE_LIST') 返回非空列表", ok_list_nonempty,
-           "返回 pipe 分隔的非空采样率列表", f"getParam('EEG_SAMPLE_RATE_LIST')={list_txt!r}")
+        ok_rate_in_rates = isinstance(rate_txt, str) and rate_txt in spec_rates
+        record(results, "getParam('EEG_SAMPLE_RATE') 值属于 spec 档位", ok_rate_in_rates,
+               f"值 ∈ {spec_rates}", f"getParam('EEG_SAMPLE_RATE')={rate_txt!r}")
 
-    ok_list_match = (sorted(list_rates) == sorted(spec_rates))
-    record(results, "getParam('EEG_SAMPLE_RATE_LIST') 与 spec 档位一致", ok_list_match,
-           f"pipe 列表 == {spec_rates}", f"列表={list_rates}")
+        # LIST：应为非空 pipe 列表，且与 spec 档位一致
+        list_rates = [x.strip() for x in list_txt.split("|") if x.strip()] if isinstance(list_txt, str) else []
+        ok_list_nonempty = len(list_rates) > 0
+        record(results, "getParam('EEG_SAMPLE_RATE_LIST') 返回非空列表", ok_list_nonempty,
+               "返回 pipe 分隔的非空采样率列表", f"getParam('EEG_SAMPLE_RATE_LIST')={list_txt!r}")
+
+        ok_list_match = (sorted(list_rates) == sorted(spec_rates))
+        record(results, "getParam('EEG_SAMPLE_RATE_LIST') 与 spec 档位一致", ok_list_match,
+               f"pipe 列表 == {spec_rates}", f"列表={list_rates}")
 
     try:
         sensor.disconnect()

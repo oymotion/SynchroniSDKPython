@@ -15,6 +15,10 @@
   - Ppg/Spo2/Eeg/Ecg/Brth/MagAngle ChannelCount = 0（不支持）
   - EMG_SAMPLE_RATE_LIST = 500|1000，上电默认 1000（EmgMaxSampleRate=1000）
   - IMU_SAMPLE_RATE_LIST = 50|100|200（三档）
+  - NTF_GEST 手势流固定 15.625Hz（实测 bin csv 采样率字段=15.625，ts 步进 64ms，
+    与 gForceMax 一致），无 GEST_SAMPLE_RATE 采样率参数（只有 NTF_GEST 开关）。
+    不放进 sample_rates：测 EMG 高采样率时需 setParam("NTF_GEST","OFF") 关闭手势流
+    （芯片算力已知限制，EMG 与 GEST 采样冲突），若进测量集合会在被关后测不到数据而误判 FAIL。
 
 关键差异（相对旧固件 V1.0.8）：
   - 无 NTF_GFORCE_ACC/GYRO/EULER/QUAT 独立开关（getParam 全部 Error: Not supported），
@@ -41,7 +45,7 @@ SPEC = {
     #   acc/gyro/euler/quat 能力见 imu_sub_channels，统一由 NTF_IMU 控制。
     "streams": {
         "NTF_EMG":          {"supported": True,  "channels": 8},   # 8 通道干电极肌电
-        "NTF_GEST":         {"supported": True,  "channels": 1},   # 手势 ID（单值流）
+        "NTF_GEST":         {"supported": True,  "channels": 1},   # 手势 ID（单值流，固定 15.625Hz，见 docstring）
         "NTF_GFORCE_ACC":   {"supported": False, "channels": 0},   # 无独立开关（acc 打包进 NTF_IMU）
         "NTF_GFORCE_GYRO":  {"supported": False, "channels": 0},   # 无独立开关（gyro 打包进 NTF_IMU）
         "NTF_GFORCE_EULER": {"supported": False, "channels": 0},   # 无独立开关（euler 打包进 NTF_IMU）
@@ -95,5 +99,9 @@ SPEC = {
             "rates": ["1"], "default": "1",
             "stream": "NTF_IMPEDANCE", "settable": False, "co_stream": "NTF_EMG",
         },
+        # 注意：NTF_GEST 手势流（固定 15.625Hz，无采样率参数）故意不放进 sample_rates。
+        # 原因：测 EMG 高采样率时需 setParam("NTF_GEST","OFF") 关闭手势流
+        # （芯片算力已知限制，EMG 与 GEST 采样冲突），若 GEST 进测量集合，
+        # 会在第 0 会话被关后测不到数据而误判 FAIL。采样率实测值见上方 docstring。
     },
 }

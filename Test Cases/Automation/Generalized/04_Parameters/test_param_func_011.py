@@ -18,6 +18,8 @@
   采样率参数键才有对应键可测，没有就不测。getParam 返回 str（不崩溃）是唯一硬
   断言；"Error 开头" 属于查询接口正确返回的合法形态，不判 FAIL。SDK 1.4.3 出错
   可能返回以 "<" 开头的字符串或抛异常，均视为不满足"不崩溃"。
+  例外：IMPEDANCE 这类「裸词」键（非 *_SAMPLE_RATE 形式）无独立 SDK 采样率参数，
+  1.4.3 起 getParam 明确返回 "Error: not supported"，作硬断言期待 Error。
 
 前置条件：
   - 主机(电脑)：蓝牙已开启
@@ -173,6 +175,19 @@ def main():
         v_list = _get(sensor, list_key)
         print(f"\n[getParam] {single_key} = {v_single!r}", flush=True)
         print(f"[getParam] {list_key} = {v_list!r}", flush=True)
+
+        # IMPEDANCE 这类「裸词」键（非 *_SAMPLE_RATE 形式）无独立 SDK 采样率参数，
+        # 1.4.3 起参数能力检查明确返回 "Error: not supported"，作硬断言期待 Error。
+        if not single_key.endswith("_SAMPLE_RATE"):
+            single_ok = isinstance(v_single, str) and v_single.startswith("Error")
+            list_ok = isinstance(v_list, str) and v_list.startswith("Error")
+            record(results, f"getParam('{single_key}') 期待 not supported", single_ok,
+                   f"getParam('{single_key}') 返回 Error（not supported）",
+                   f"{single_key}={v_single!r}")
+            record(results, f"getParam('{list_key}') 期待 not supported", list_ok,
+                   f"getParam('{list_key}') 返回 Error（not supported）",
+                   f"{list_key}={v_list!r}")
+            continue
 
         single_ok = isinstance(v_single, str) and not v_single.startswith("抛异常") and not v_single.startswith("<")
         list_ok = isinstance(v_list, str) and not v_list.startswith("抛异常") and not v_list.startswith("<")

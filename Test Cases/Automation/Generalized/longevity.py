@@ -13,6 +13,7 @@
 
 运行策略：
   - 连接后开启 setLogPath + setDebugEnabled(True) + DEBUG_LOG_PATH=True + DEBUG_BLE_DATA_PATH=True
+  - 采样率：EEG/EMG 主数据流设为最高档位（优先 EMG_SAMPLE_RATE / EEG_SAMPLE_RATE）；若有 NTF_GEST 流则先关闭
   - startDataNotification 持续起流，周期打印电量/数据吞吐/运行时长
   - 退出条件（满足其一即停）：
       1) 运行时长 >= MIN_DURATION_SECONDS（默认 5 小时）
@@ -386,23 +387,39 @@ def main():
     addr = getattr(target, 'Address', '?')
     print(f"[扫描] 目标设备: {name} {addr}", flush=True)
 
-    # 加载 spec，确定主数据流（sample_rates 中第一个 settable=True 的条目）
+    # 加载 spec，确定主数据流采样率参数（优先 EEG/EMG 主生理信号流）
     spec = _load_spec(target)
     sample_rates = spec.get("sample_rates") or {}
     primary_key = None
     primary_default = None
     primary_rates = None
-    for key, entry in sample_rates.items():
-        if entry.get("settable", True):
-            primary_key = key
+    # 优先 EMG/EEG 采样率参数（主生理信号流，长稳应跑最高采样率）
+    for pref_key in ("EMG_SAMPLE_RATE", "EEG_SAMPLE_RATE"):
+        entry = sample_rates.get(pref_key)
+        if entry and entry.get("settable", True) and entry.get("rates"):
+            primary_key = pref_key
             primary_default = entry.get("default")
             primary_rates = entry.get("rates") or []
             break
-    if not primary_key or not primary_default:
-        print("[FAIL] spec 的 sample_rates 中无 settable 主数据流（或缺少 default），无法继续", flush=True)
+    # 兜底：第一个 settable=True 且含 rates 的条目
+    if not primary_key:
+        for key, entry in sample_rates.items():
+            if entry.get("settable", True) and entry.get("rates"):
+                primary_key = key
+                primary_default = entry.get("default")
+                primary_rates = entry.get("rates") or []
+                break
+    if not primary_key or not primary_rates:
+        print("[FAIL] spec 的 sample_rates 中无可用的 settable 主数据流（或缺少 rates），无法继续", flush=True)
         _teardown(ctrl, sensor, log_dir, bins_before)
         return
-    print(f"[spec] 模型={spec.get('model')} 主数据流采样率参数={primary_key} 默认={primary_default} 档位={primary_rates}", flush=True)
+    # EEG/EMG 主数据流应跑最高采样率档位（而非默认档），明确锁定避免依赖上电默认值
+    try:
+        primary_rate = max(primary_rates, key=lambda r: int(r))
+    except (TypeError, ValueError):
+        primary_rate = primary_rates[-1]
+    print(f"[spec] 模型={spec.get('model')} 主数据流采样率参数={primary_key} "
+          f"档位={primary_rates} 使用最高档={primary_rate}（默认档={primary_default}）", flush=True)
 
     # requireSensor
     sensor = ctrl.requireSensor(target)
@@ -472,12 +489,12 @@ def main():
         _teardown(ctrl, sensor, log_dir, bins_before)
         return
 
-    # 显式设置主数据流采样率为 spec 默认档（明确锁定，避免依赖上电默认值）
+    # 显式设置主数据流采样率为最高档位（EEG/EMG 主生理信号应跑最高采样率，明确锁定，避免依赖上电默认值）
     try:
-        primary_ret = sensor.setParam(primary_key, primary_default)
-        print(f"[采样率] setParam('{primary_key}', '{primary_default}') -> {primary_ret!r}", flush=True)
+        primary_ret = sensor.setParam(primary_key, primary_rate)
+        print(f"[采样率] setParam('{primary_key}', '{primary_rate}') -> {primary_ret!r}", flush=True)
     except Exception as e:
-        print(f"[采样率] setParam('{primary_key}', '{primary_default}') 抛异常 {type(e).__name__}: {e}", flush=True)
+        print(f"[采样率] setParam('{primary_key}', '{primary_rate}') 抛异常 {type(e).__name__}: {e}", flush=True)
 
     # 关闭 GEST 手势流（仅当 spec 声明该流支持时）
     if (spec.get("streams") or {}).get("NTF_GEST", {}).get("supported"):

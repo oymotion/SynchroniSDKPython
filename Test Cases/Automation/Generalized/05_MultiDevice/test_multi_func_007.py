@@ -7,7 +7,7 @@
 流程：
   1) scan -> 匹配两台目标设备 -> connect -> init
   2) 第一台单独 startDataNotification 起流
-  3) multiStartDataNotification([s1, s2])
+  3) multiStartDataNotification([s1, s2], timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
   4) 验证 s1 先停后起，s2 起流，无异常
 
 前置条件：
@@ -161,8 +161,11 @@ def main():
     s2.onDataCallback = _noop
 
     print(f"\n[multiStart] 对已起流的 {tid1} 和未起流的 {tid2} 执行 multiStart ...", flush=True)
+    # 本用例测 restart 语义（先停后起），不是同步精度（那是 MULTI-FUNC-004）。
+    # 关键：timeout 默认 0.0 会触发「按型号自动选参」覆盖 maxDelayDispersionMs，故必须显式 timeout=60.0。
+    # 异构设备（如 OB6000A + OB6000C，ModelName 均为 'OB6000'）首包时差天然超容差，带校验会误挡 restart。
     try:
-        mret = ctrl.multiStartDataNotification(sensors)
+        mret = ctrl.multiStartDataNotification(sensors, timeout=60.0, maxDelayDispersionMs=-1, maxAttempts=5)
         print(f"[multiStart] 返回: {mret}", flush=True)
     except Exception as e:
         mret = None
