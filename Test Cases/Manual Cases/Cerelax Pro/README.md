@@ -11,7 +11,7 @@
 | 类型归属 | 头环 / EEG 设备 |
 | 核心能力 | NTF_EEG（2 通道脑电）、NTF_PPG、NTF_IMU、NTF_IMPEDANCE（电极接触检测） |
 | 采样率 | EEG `250`（唯一）；IMU `50\|100\|200`；PPG `50\|100\|200\|400` |
-| SDK 版本 | 1.3.0 |
+| SDK 版本 | 1.4.3 |
 
 ## 能力假设（连接后用 getDeviceInfo() 确认）
 
@@ -39,7 +39,8 @@
 
 ## 环境与前置条件
 
-- Python 3.10~3.14，`sensor-sdk==1.3.0`（`pip install --upgrade sensor-sdk`）。
+- Python 3.10~3.14，`sensor-sdk==1.4.3`（`pip install --upgrade sensor-sdk`）。
+- SDK 1.4.3 关键变更（相对 1.3.x，影响用例预期）：`setParam`/`getParam` 出错时**抛 `IOError`**（不再返回 `"Error: ..."` 字符串）；阻抗流 `NTF_IMPEDANCE` 固定 1Hz。参数类用例的「返回 Error」预期需按「抛 `IOError` / 返回 `<IOError: ...>`」重新判定。
 - 蓝牙开启（bleak 后端）或 dongle 已绑定（bumble 后端，`checkSetupDongle()` 返回 `OK`）。
 - 设备上电、在扫描范围内。
 - 每个脚本结束调用 `SensorControllerInstance.terminate()`；Ctrl+C 异常路径也需调用。

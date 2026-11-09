@@ -9,7 +9,7 @@
 | 设备型号 | gForceUltra（腕带） |
 | 广播名前缀 | `gForceUltra` |
 | 类型归属 | OYM 命名设备 / 传统 OYMotion 设备（非“新 EMG 设备”） |
-| SDK 版本 | 1.3.0 |
+| SDK 版本 | 1.3.9 |
 
 ## 能力假设（连接后用 getDeviceInfo() 确认）
 
