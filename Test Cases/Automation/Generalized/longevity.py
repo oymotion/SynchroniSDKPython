@@ -22,7 +22,8 @@
          但会先进入 RECONNECT_GRACE_SECONDS 宽限期等待自动重连，超时未恢复才退出
       4) 数据停滞：连续 STALL_CHECK_CYCLES 个周期 batches 无增长
   - 数据质量告警（仅告警/计数，不触发退出）：
-      * 样本增量波动>5% 且丢包数增加（计入最终报告「严重丢包」次数）
+      * 样本增量波动>5% 且出现新的 LOST SAMPLE 事件（计入最终报告「严重丢样本」次数）
+      * 丢样本以 SDK LOST SAMPLE 通知为权威来源（弃用 getLostPackageCount 求和，其累计值求和会平方级虚高）
       * 基准期（第3/4/5周期）样本增量波动 >2%
   - 结束时 stopDataNotification + disconnect，导出 bin，并校验 bin 文件存在
   - 支持 Ctrl+C 中断，同样走收尾流程
@@ -162,7 +163,6 @@ class DataCounter:
         self.batches = 0
         self.samples = 0
         self.calls = 0          # onDataCallback 被调用的次数（诊断：区分"没回调"还是"空回调"）
-        self.lost = 0           # getLostPackageCount 累计丢包数（SDK 报告的序号 gap，待 bin 复核）
         self.lock = threading.Lock()
 
     def __call__(self, sensor, data):
@@ -180,17 +180,105 @@ class DataCounter:
                 if n_ch <= 0 or n_smp <= 0:
                     continue
                 self.samples += n_ch * n_smp
-                # 累加 SDK 报告的丢包数（序号 gap），仅统计 >0 的整数值
-                try:
-                    lp = it.getLostPackageCount()
-                    if isinstance(lp, int) and lp > 0:
-                        self.lost += lp
-                except Exception:
-                    pass
 
     def snapshot(self):
         with self.lock:
-            return self.batches, self.samples, self.calls, self.lost
+            return self.batches, self.samples, self.calls
+
+
+class LostSampleTracker:
+    """以 SDK 的 LOST SAMPLE 通知为丢包权威来源（弃用 getLostPackageCount 求和）。
+
+    SDK 在 BLE 包序号跳号时通过 onError 回调发 reason="MSG|LOST SAMPLE|MAC|...|TYPE|...|"。
+    关键字段：
+      TYPE      DataType 十进制值（8=EMG, 18=IMPEDANCE, 19=IMU, 16=EEG, ...）
+      PERCENT   该流丢样本率（%），= TOTAL / COUNTER，是权威口径
+      TOTAL     该流累计丢样本数（累计值，取最新即可，不能跨事件求和）
+      COUNTER   该流累计收到样本数
+    同一 TYPE 的 TOTAL 为累计值，本类只保存最新值，不做求和，避免重复累加。
+    """
+    _TYPE_NAMES = {
+        1: "ACC", 2: "GYRO", 4: "EULER", 5: "QUAT", 7: "GEST",
+        8: "EMG", 16: "EEG", 17: "ECG", 18: "IMPEDANCE", 19: "IMU",
+        20: "ADS", 21: "BRTH", 22: "IMP_EXT", 23: "SPO2", 24: "PPG",
+    }
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = 0            # LOST SAMPLE 事件总数
+        self.by_type = {}          # TYPE(int) -> {"percent","total","counter","mac"}
+        self.last_reason = None    # 最近一条原始 reason（诊断）
+        self.peak_percent = None   # 历史峰值丢样本率(%)，只升不降
+        self.peak_wall_time = None # 峰值出现时刻(time.time() 墙钟)
+        self.peak_type = None      # 峰值对应的流类型(int)
+
+    @staticmethod
+    def parse(reason):
+        """解析 reason；非 LOST SAMPLE 返回 None，否则返回字段 dict（key 大写）。"""
+        if not isinstance(reason, str):
+            return None
+        parts = [p.strip() for p in reason.split("|")]
+        if len(parts) < 2 or parts[0].upper() != "MSG" or parts[1].upper() != "LOST SAMPLE":
+            return None
+        kv = {}
+        i = 2
+        while i + 1 < len(parts):
+            kv[parts[i].upper()] = parts[i + 1]
+            i += 2
+        return kv
+
+    def feed(self, reason):
+        """喂入一条 onError 的 reason；若是 LOST SAMPLE 则解析并记录，返回 True。"""
+        kv = self.parse(reason)
+        if kv is None:
+            return False
+        with self.lock:
+            self.events += 1
+            self.last_reason = reason
+            def _int(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+            def _float(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+            t = _int(kv.get("TYPE", ""))
+            stat = {
+                "percent": _float(kv.get("PERCENT", "")),
+                "total": _int(kv.get("TOTAL", "")),
+                "counter": _int(kv.get("COUNTER", "")),
+                "mac": kv.get("MAC", "?"),
+            }
+            if t is not None:
+                self.by_type[t] = stat
+            pct = stat["percent"]
+            if isinstance(pct, (int, float)) and (
+                    self.peak_percent is None or pct > self.peak_percent):
+                self.peak_percent = pct
+                self.peak_wall_time = time.time()
+                self.peak_type = t
+            return True
+
+    def snapshot(self):
+        with self.lock:
+            return self.events, dict(self.by_type), self.last_reason
+
+    def worst_percent(self):
+        """返回历史峰值丢样本率(%)，只升不降；无有效数据返回 None。"""
+        with self.lock:
+            return self.peak_percent
+
+    def peak_info(self):
+        """返回 (峰值丢样本率%, 峰值墙钟时间, 峰值流类型)；无峰值返回 (None, None, None)。"""
+        with self.lock:
+            return self.peak_percent, self.peak_wall_time, self.peak_type
+
+    def type_name(self, t):
+        return self._TYPE_NAMES.get(t, f"TYPE_{t}")
+
 
 def _teardown(ctrl, sensor, log_dir, bins_before, stream_seconds=None):
     """统一收尾：尝试停流/断开、导出并校验 bin、打印 log 目录，并清理资源。
@@ -531,8 +619,15 @@ def main():
 
     sensor.onPowerChanged = on_power_changed
 
-    # 错误回调：设备断连/异常时立即打印 + 写 SDK 错误日志（不等下一轮 60s 轮询）
+    # 丢样本追踪器：以 SDK LOST SAMPLE 通知为丢包权威来源（弃用 getLostPackageCount 求和）
+    lost_tracker = LostSampleTracker()
+
+    # 错误回调：区分「丢样本通知」与「真正断连/异常」
+    #   - LOST SAMPLE 只是 BLE 序号跳号的丢样本告警，交给 lost_tracker 统计，不按错误级刷屏
+    #   - 其它 reason 才是设备断连/异常，立即打印 + 写 SDK 错误日志
     def on_error(sensor, reason):
+        if lost_tracker.feed(reason):
+            return
         name = getattr(getattr(sensor, 'BLEDevice', None), 'Name', '?')
         addr = getattr(getattr(sensor, 'BLEDevice', None), 'Address', '?')
         msg = f"设备异常/断连: {name} {addr} reason={reason}"
@@ -568,10 +663,10 @@ def main():
     power_unknown_warned = False  # 电量 -1 是否已写错误日志
     baseline_samples = None  # 样本增量基准（第 3/4/5 个周期均值确定）
     prev_samples = 0         # 上一周期累计样本数
-    prev_lost = 0            # 上一周期累计丢包数
+    prev_lost_events = 0     # 上一周期累计 LOST SAMPLE 事件数
     cycle_index = 0          # 周期计数（第 1/2 周期为启动期跳过，第 3/4/5 周期定基准，第 6 周期起校验）
     baseline_window = []     # 用于计算基准的样本增量（第 3/4/5 个周期）
-    drop_loss_cycles = 0     # 累计「样本增量波动>5% 且丢包数增加」的周期数（即最终报告的「严重丢包」次数，仅计数不退出）
+    drop_loss_cycles = 0     # 累计「样本增量波动>5% 且出现新的丢样本事件」的周期数（即最终报告的「严重丢包」次数，仅计数不退出）
     drop_started_at = None   # 数据流/设备状态异常的起始时刻（进入宽限期等待自动重连）
 
     def _fmt_hms(sec):
@@ -648,7 +743,9 @@ def main():
                     time.sleep(GRACE_POLL_INTERVAL)
                     continue
 
-            batches, samples, calls, lost = counter.snapshot()
+            batches, samples, calls = counter.snapshot()
+            lost_events, lost_by_type, _ = lost_tracker.snapshot()
+            lost_worst = lost_tracker.worst_percent()
 
             # ---- 样本增量 ±1% 校验（第 1/2 周期跳过，第 3/4/5 周期均值定基准，第 6 周期起校验）----
             delta_samples = samples - prev_samples
@@ -684,25 +781,32 @@ def main():
                     except Exception as e:
                         print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
 
-            # ---- 丢包检测（SDK getLostPackageCount 累计值，新增时告警，待 bin 复核）----
-            delta_lost = lost - prev_lost
-            prev_lost = lost
-            if delta_lost > 0:
-                warn = f"检测到丢包: 本周期新增 {delta_lost} 包（累计 {lost} 包）"
+            # ---- 丢样本检测（以 SDK LOST SAMPLE 事件为权威来源，弃用 getLostPackageCount 求和）----
+            delta_lost_events = lost_events - prev_lost_events
+            prev_lost_events = lost_events
+            if delta_lost_events > 0:
+                summaries = []
+                for t, s in sorted(lost_by_type.items()):
+                    pct = s.get("percent")
+                    pct_s = f"{pct:.4f}%" if isinstance(pct, (int, float)) else "?"
+                    summaries.append(f"{lost_tracker.type_name(t)}:{pct_s}(累计丢{s.get('total')})")
+                warn = (f"检测到丢样本: 本周期新增 {delta_lost_events} 次 LOST SAMPLE 事件"
+                        f"（累计 {lost_events} 次）; 各流丢样本率 -> "
+                        + (", ".join(summaries) if summaries else "无"))
                 print(f"[告警] {warn}", flush=True)
                 try:
                     ctrl.log(f"[Longevity] {warn}", "W")
                 except Exception as e:
                     print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
 
-            # ---- 告警统计：样本大幅波动(>5%) 且丢包数增加（仅告警计数，不退出，供最终报告）----
-            if sample_ratio is not None and sample_ratio > SAMPLE_DROP_TOLERANCE and delta_lost > 0:
+            # ---- 告警统计：样本大幅波动(>5%) 且出现新的丢样本事件（仅告警计数，不退出，供最终报告）----
+            if sample_ratio is not None and sample_ratio > SAMPLE_DROP_TOLERANCE and delta_lost_events > 0:
                 drop_loss_cycles += 1
-                print(f"[告警] 样本大幅波动且丢包增加: 波动 {sample_ratio:.2%}(>{SAMPLE_DROP_TOLERANCE:.0%})、"
-                      f"新增丢包 {delta_lost}，累计 {drop_loss_cycles} 次", flush=True)
+                print(f"[告警] 样本大幅波动且出现丢样本: 波动 {sample_ratio:.2%}(>{SAMPLE_DROP_TOLERANCE:.0%})、"
+                      f"本周期新增 LOST SAMPLE {delta_lost_events} 次，累计 {drop_loss_cycles} 次", flush=True)
                 try:
-                    ctrl.log(f"[Longevity] 样本大幅波动且丢包增加: 波动 {sample_ratio:.2%}、"
-                             f"新增丢包 {delta_lost}，累计 {drop_loss_cycles} 次", "W")
+                    ctrl.log(f"[Longevity] 样本大幅波动且出现丢样本: 波动 {sample_ratio:.2%}、"
+                             f"本周期新增 LOST SAMPLE {delta_lost_events} 次，累计 {drop_loss_cycles} 次", "W")
                 except Exception as e:
                     print(f"[告警] ctrl.log 抛异常 {type(e).__name__}: {e}", flush=True)
 
@@ -717,7 +821,9 @@ def main():
                 stall_cycles = 0
             last_batches = batches
 
-            print(f"[状态][pid={os.getpid()}] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本  回调={calls}次  丢包={lost}包", flush=True)
+            lost_worst_s = f"{lost_worst:.4f}%" if isinstance(lost_worst, (int, float)) else "N/A"
+            print(f"[状态][pid={os.getpid()}] {_fmt_hms(elapsed)}  电量={power}%  数据={batches}批/{samples}样本  "
+                  f"回调={calls}次  LOST_SAMPLE事件={lost_events}次  最差丢样本率={lost_worst_s}", flush=True)
             time.sleep(CHECK_INTERVAL)
     except KeyboardInterrupt:
         exit_reason = "用户手动中断（Ctrl+C）"
@@ -741,7 +847,22 @@ def main():
             print(f"    - {_ev}", flush=True)
     else:
         print(f"  自动重连: 0 次", flush=True)
-    print(f"  严重丢包: {drop_loss_cycles} 次（样本增量波动>5% 且本周期新增丢包）", flush=True)
+    print(f"  严重丢样本: {drop_loss_cycles} 次（样本增量波动>5% 且本周期出现 LOST SAMPLE 事件）", flush=True)
+    lost_events, lost_by_type, _ = lost_tracker.snapshot()
+    lost_worst = lost_tracker.worst_percent()
+    if lost_events:
+        lost_worst_s = f"{lost_worst:.4f}%" if isinstance(lost_worst, (int, float)) else "N/A"
+        print(f"  丢样本统计: 共 {lost_events} 次 LOST SAMPLE 事件，最差丢样本率 {lost_worst_s}", flush=True)
+        _pp, _pw, _pt = lost_tracker.peak_info()
+        if _pw is not None:
+            _peak_elapsed = max(0.0, _pw - start_time)
+            print(f"    峰值丢样本率 {_pp:.4f}% 出现在 {_fmt_hms(_peak_elapsed)}（流: {lost_tracker.type_name(_pt)}）", flush=True)
+        for t, s in sorted(lost_by_type.items()):
+            pct = s.get("percent")
+            pct_s = f"{pct:.4f}%" if isinstance(pct, (int, float)) else "?"
+            print(f"    - {lost_tracker.type_name(t)}: 丢样本率 {pct_s}，累计丢 {s.get('total')} 样本", flush=True)
+    else:
+        print(f"  丢样本统计: 0 次 LOST SAMPLE 事件（无丢样本）", flush=True)
     if have_bin:
         print(f"  bin 有效性: {'有效' if bin_valid else '无效'}", flush=True)
         if bin_complete is None:
@@ -761,7 +882,7 @@ def main():
         verdict = "PASS"
     print("\n结论: " + verdict, flush=True)
     if have_bin:
-        print(f"[复核] 丢包可再用 bin_rate_check.py 独立复核 package index gap: {bin_path}", flush=True)
+        print(f"[复核] 丢样本可再用 bin 的 package index gap 独立复核: {bin_path}", flush=True)
 
 if __name__ == "__main__":
     main()

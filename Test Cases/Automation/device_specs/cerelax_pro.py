@@ -13,7 +13,7 @@
   - ImpeChannelCount = 2；AccChannelCount = 3；GyroChannelCount = 3
   - ImuChannelCount = 6（= acc 3 + gyro 3，6 轴聚合，无磁力计）
   - Emg/Ecg/Brth/MagAngle/Euler/Quat ChannelCount = 0（不支持）
-  - EEG_SAMPLE_RATE_LIST = 250|500|1000，当前/默认 1000
+  - EEG_SAMPLE_RATE_LIST = 250|500|1000，当前/默认 500
   - IMU_SAMPLE_RATE_LIST = 50|100|200，当前/默认 200
   - PPG_SAMPLE_RATE_LIST = 50|100|200|400，当前/默认 50
   - 采样率 key 均可 getParam/setParam（见 examples/SynchroniSDKPython_DemoNewMulti.py）
@@ -65,7 +65,7 @@ SPEC = {
     #   co_stream : 伴随流（IMU / 阻抗需与 EEG 同起才有数据），None 表示无；PPG 为独立流
     "sample_rates": {
         "EEG_SAMPLE_RATE": {
-            "rates": ["250", "500", "1000"], "default": "1000",
+            "rates": ["250", "500", "1000"], "default": "500",
             "stream": "NTF_EEG", "settable": True, "co_stream": None,
         },
         "IMU_SAMPLE_RATE": {

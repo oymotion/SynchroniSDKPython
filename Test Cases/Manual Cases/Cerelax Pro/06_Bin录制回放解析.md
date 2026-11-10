@@ -1,7 +1,7 @@
 # Cerelax Bin 录制/回放/解析用例（BIN-*）
 
 ### BIN-FUNC-001 连接后自动生成 .bin
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：验证 bin 自动录制。
 - **流程与逻辑**：连接起流，检查是否生成 `{DeviceName}_{MAC}_{时间戳}.bin`。
 - **预期结果**：生成 bin 文件。
@@ -11,7 +11,7 @@
 - **测试结果**：待测试
 
 ### BIN-FUNC-002 getBinFileInfo 返回字段
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：验证 bin 信息。
 - **流程与逻辑**：对有效 bin 调 `getBinFileInfo`。
 - **预期结果**：返回 `BinFileInfo` 对象（无效时返回 None），字段为 PascalCase 属性：`Mac/DeviceName/ChipType/IsUniversalStream/FeatureMap/DeviceInfo/SensorDatas/DurationSec`；另含新增字段 `ConfigVersion/IsNewEmg/IsContainQat6/PpgModel/NotifyDataFlag/Valid/FirstDataTsMs/LastDataTsMs`。
@@ -21,7 +21,7 @@
 - **测试结果**：待测试
 
 ### BIN-FUNC-003 getBinFileInfo 无效输入返回 None
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：验证逆向。
 - **流程与逻辑**：对不存在/无 config 的 bin 调 `getBinFileInfo`。
 - **预期结果**：返回 None。
@@ -31,7 +31,7 @@
 - **测试结果**：待测试
 
 ### BIN-FUNC-004 回放 realtime=True 按原始节奏
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：验证实时回放。
 - **流程与逻辑**：`replayBinFile(path, sensor, realtime=True)`，统计 `onDataCallback` 批数；比对回放是否产生数据、包含 live 的 DataType、startTimeStamp 非 None。
 - **预期结果**：回放产生数据，DataType 覆盖 live 类型，startTimeStamp 非 None；回放耗时与录制时长同量级。精确批数可能因 bin 解析器分组方式不同而存在差异，仅作参考。
@@ -101,7 +101,7 @@
 - **测试结果**：待测试
 
 ### BIN-ROB-001 磁盘不足时跳过/停止录制
-- **优先级**：P2
+- **优先级**：P1
 - **测试目的**：验证写盘异常处理。
 - **流程与逻辑**：模拟磁盘 <100MB 或写盘错误，观察是否跳过/停止且不影响实时流。
 - **预期结果**：不崩溃，实时流继续。
@@ -114,7 +114,7 @@
 - **优先级**：P1
 - **测试目的**：验证空/None/无效文件路径入参。
 - **流程与逻辑**：`getBinFileInfo("")`、`getBinFileInfo(None)`；`replayBinFile("")`/`replayBinFile(None)`/`replayBinFile(不存在路径)`；`parseBinToCsv("")`/`parseBinToCsv(None)`/`parseBinToCsv(非 bin 文件)`。
-- **预期结果**：返回 None/False 或被拒绝，不崩溃、不抛异常。（注意：1.3.9 下 `getBinFileInfo(None)` 会抛 `AttributeError`，待确认记 SDK 边界 bug 或调整本条预期）
+- **预期结果**：返回 None/False 或被拒绝，不崩溃、不抛异常。（注意：`getBinFileInfo(None)` 会抛 `AttributeError` 的边界 bug 在 1.4.3 下待复测，确认是否记 SDK 缺陷或调整本条预期）
 - **有效性说明**：文件接口容错，防止无效路径崩溃。
 - **可自动化**：auto
 - **人工介入**：无
@@ -131,7 +131,7 @@
 - **测试结果**：待测试
 
 ### BIN-FUNC-010 bin 逐帧分析：各 DataType package counts 与 live 交叉验证
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：对录制的 bin 做原始帧逐类统计，定位"某 DataType 无数据"是固件未发送还是 SDK 未解析/未录制。
 - **流程与逻辑**：`DEBUG_BLE_DATA_PATH=True` 起流录制 → 断开后用 [bin_rate_check.py](../../../../../Bin%20Analysis/bin_rate_check.py)（方法见 [BIN_ANALYSIS.md](../../../../../Bin%20Analysis/BIN_ANALYSIS.md)）解析 bin → 统计每类 DataType 的原始帧数（package counts）→ 与 live `onDataCallback` 实际收到的 DataType 集合做交叉验证。
 - **预期结果**：`getDeviceInfo()` 中 `ChannelCount>0` 的模态，其对应 DataType 在 bin 中原始帧数 > 0；live 收到的 DataType 集合 ⊆ bin 记录的 DataType 集合（bin 为 BLE 包层全量，可包含 live 未交付的类型）；若某 `ChannelCount>0` 模态 bin 中帧数为 0，判定为"固件未发送"而非 SDK 解析问题。
@@ -141,7 +141,7 @@
 - **测试结果**：待测试
 
 ### BIN-FUNC-011 multiReplayBinFile 多文件同步回放
-- **优先级**：P0
+- **优先级**：P1
 - **测试目的**：验证 0.9.7 新增的 `multiReplayBinFile` 多 bin 文件按共享时钟对齐同步回放。
 - **流程与逻辑**：准备 ≥2 个不同 MAC 的有效 bin 文件；`multiReplayBinFile(file_paths, sensors, realtime=True)`（`sensors` 必填，与 `file_paths` 等长）；统计各成员 `onDataCallback` 批数与 DataType。
 - **预期结果**：返回列表长度等于输入文件数，每个成员返回对应 `SensorProfile`（或 None 表示该成员失败）；各成员均产生回放数据；DataType 覆盖各自 live 类型；全组以最早首条数据记录为 t=0，保留录制时的相对偏移（各成员 `startTimeStamp` 相对关系与录制时一致）。
