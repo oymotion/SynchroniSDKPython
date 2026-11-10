@@ -53,7 +53,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.55"
+DEMO_VERSION               = "0.1.74"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -381,6 +381,15 @@ def _ring_write(buf_row, idx_row, write_index, vals, indices):
         idx_row[:n - first] = indices[first:]
 
 
+def _bio_side_text(title, impedance, saturation, impedance_enabled):
+    if not impedance_enabled or not isinstance(impedance, (int, float)):
+        return title
+    details = f"{impedance / 1000.0:.2f} KOhm"
+    if isinstance(saturation, (int, float)):
+        details = f"{saturation:.0f}% | {details}"
+    return f"{title}\n{details}"
+
+
 GESTURE_DEFAULT_TEXT = (
     "Gesture:\n"
     "  gesture: -- (0-8)\n"
@@ -440,6 +449,7 @@ class DeviceDataState:
         self.eeg_page_index = 0
         self.eeg_channels_per_page = 8
         self.eeg_impedance: list = []
+        self.eeg_saturation: list = []
         self.eeg_buffer_lock = QtCore.QMutex()
 
         self.has_ecg = False
@@ -448,6 +458,7 @@ class DeviceDataState:
         self.ecg_buffer_index = 0
         self.ecg_sample_rate = 0
         self.ecg_impedance: list = []
+        self.ecg_saturation: list = []
         self.ecg_buffer_lock = QtCore.QMutex()
 
         self.has_brth = False
@@ -472,6 +483,7 @@ class DeviceDataState:
         self.emg_sample_rate = 0
         self.emg_display_channels = 0
         self.emg_impedance: list = []
+        self.emg_saturation: list = []
         self.emg_buffer_lock = QtCore.QMutex()
 
         # PPG-mode bio buffers (EEG fp1/fp2 + PPG + SpO2)
@@ -480,6 +492,7 @@ class DeviceDataState:
         self.bio_buffer_indices: dict = {}
         self.bio_sample_rates: dict = {}
         self.bio_impedance: dict = {}
+        self.bio_saturation: dict = {}
         self.bio_buffer_lock = QtCore.QMutex()
 
         # Live Filter state
@@ -871,6 +884,10 @@ class DeviceDataState:
                         while len(imp) <= ch_idx:
                             imp.append(0)
                         imp[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                        sat = self.bio_saturation.setdefault(dt, [])
+                        while len(sat) <= ch_idx:
+                            sat.append(0)
+                        sat[ch_idx] = float(arr["saturation"][ch_idx, -1])
                 self.bio_buffer_indices[dt] = (buf_idx + n) % buf.shape[1]
             finally:
                 self.bio_buffer_lock.unlock()
@@ -896,6 +913,9 @@ class DeviceDataState:
                     while len(self.emg_impedance) <= ch_idx:
                         self.emg_impedance.append(None)
                     self.emg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                    while len(self.emg_saturation) <= ch_idx:
+                        self.emg_saturation.append(None)
+                    self.emg_saturation[ch_idx] = float(arr["saturation"][ch_idx, -1])
                 self.emg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.emg_buffer_lock.unlock()
@@ -921,6 +941,9 @@ class DeviceDataState:
                     while len(self.eeg_impedance) <= ch_idx:
                         self.eeg_impedance.append(0)
                     self.eeg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                    while len(self.eeg_saturation) <= ch_idx:
+                        self.eeg_saturation.append(0)
+                    self.eeg_saturation[ch_idx] = float(arr["saturation"][ch_idx, -1])
                 self.eeg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.eeg_buffer_lock.unlock()
@@ -946,6 +969,9 @@ class DeviceDataState:
                     while len(self.ecg_impedance) <= ch_idx:
                         self.ecg_impedance.append(0)
                     self.ecg_impedance[ch_idx] = float(arr["impedance"][ch_idx, -1])
+                    while len(self.ecg_saturation) <= ch_idx:
+                        self.ecg_saturation.append(0)
+                    self.ecg_saturation[ch_idx] = float(arr["saturation"][ch_idx, -1])
                 self.ecg_buffer_index = (write_start + n) % buf.shape[1]
             finally:
                 self.ecg_buffer_lock.unlock()
@@ -1094,6 +1120,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.current_sensor: SensorProfile = None
         self.device_states: dict = {}               # Address -> DeviceDataState
         self._connecting_addrs: set = set()         # Address with an in-flight connect
+        self._disconnecting_addrs: set = set()
+        self._initing_addrs: set = set()
+        self._data_switching_addrs: set = set()
+        self._button_state_last_refresh = 0.0
         self.sensor_controller = SensorController()
 
         self.active_data_type = DataType.NTF_ACC
@@ -1192,6 +1222,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._data_worker = threading.Thread(
             target=self._drain_data_queue, daemon=True, name="DataQueueDrain")
         self._data_worker.start()
+        self._scan_error_hold_until = 0.0
 
         self._init_ui()
 
@@ -1220,6 +1251,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.dongle_check_sig.connect(self._on_dongle_check_result)
 
         self.sensor_controller.on_sensor_scan_result = self._on_device_found
+        self.sensor_controller.on_scan_state_change = self._on_scan_state_change
 
     # -- UI --------------------------------------------------------------------
 
@@ -1262,12 +1294,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self.btn_stop_scan.setEnabled(False)
 
         self.btn_connect = QtWidgets.QPushButton("Connect")
-        self.btn_connect.clicked.connect(self._connect_selected_device)
+        self.btn_connect.clicked.connect(self._toggle_connection)
         self.btn_connect.setEnabled(False)
 
-        self.btn_disconnect = QtWidgets.QPushButton("Disconnect")
-        self.btn_disconnect.clicked.connect(self._disconnect_selected_device)
-        self.btn_disconnect.setEnabled(False)
+        self.btn_data = QtWidgets.QPushButton("Start Data Streaming")
+        self.btn_data.clicked.connect(self._toggle_data)
+        self.btn_data.setEnabled(False)
 
         self.btn_multi_sync = QtWidgets.QPushButton("Multi Start")
         self.btn_multi_sync.clicked.connect(self._multi_sync)
@@ -1314,7 +1346,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         button_layout.addWidget(self.btn_scan)
         button_layout.addWidget(self.btn_stop_scan)
         button_layout.addWidget(self.btn_connect)
-        button_layout.addWidget(self.btn_disconnect)
+        button_layout.addWidget(self.btn_data)
         button_layout.addStretch()
 
         replay_button_layout = QtWidgets.QVBoxLayout()
@@ -1397,6 +1429,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         display_layout.addLayout(status_layout, stretch=1)
         controls_layout.addLayout(display_layout)
 
+        self.scan_status_label = QtWidgets.QLabel("Scan: stopped")
+        self.scan_status_label.setStyleSheet("color: #666666")
+        controls_layout.addWidget(self.scan_status_label)
         self.status_label = QtWidgets.QLabel("Not Connected")
         controls_layout.addWidget(self.status_label)
         self.rate_label = QtWidgets.QLabel("")
@@ -1587,19 +1622,64 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _start_scan(self):
         if not self.sensor_controller.isEnable:
             self._app_log("User: start scan rejected (Bluetooth disabled)", "W")
+            self._set_scan_status(False, "Bluetooth disabled")
             self.status_label.setText("Please enable Bluetooth first")
             return
         self._app_log("User: start scan")
-        if not self.sensor_controller.isScanning:
-            self.sensor_controller.startScan(SCAN_DEVICE_PERIOD_IN_MS)
-        self.btn_scan.setEnabled(False)
-        self.btn_stop_scan.setEnabled(True)
+        was_scanning = self.sensor_controller.isScanning
+        started = True
+        if not was_scanning:
+            started = self.sensor_controller.startScan(SCAN_DEVICE_PERIOD_IN_MS)
+        self._app_log(f"App: startScan result: {started}, was_scanning={was_scanning}")
+        self.btn_scan.setEnabled(not started)
+        self.btn_stop_scan.setEnabled(started)
+        if started and not was_scanning:
+            self._set_scan_status(True, "")
 
     def _stop_scan(self):
         self._app_log("Stop scan")
-        self.sensor_controller.stopScan()
+        stopped = self.sensor_controller.stopScan()
+        self._app_log(f"App: stopScan result: {stopped}")
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
+        self._set_scan_status(False, "")
+
+    def _on_scan_state_change(self, is_scanning: bool, error_msg: str):
+        def update():
+            scan_intent = self.sensor_controller.isScanning
+            self._app_log(f"Scan event: is_scanning={is_scanning}, error={error_msg or '-'}, intent={scan_intent}", "D")
+            now = time.monotonic()
+            if error_msg:
+                self._scan_error_hold_until = now + 5.0
+            elif not is_scanning:
+                self._scan_error_hold_until = 0.0
+            if not error_msg and is_scanning and now < self._scan_error_hold_until:
+                return
+            self.btn_scan.setEnabled(not scan_intent)
+            self.btn_stop_scan.setEnabled(scan_intent)
+            if not is_scanning and not error_msg and scan_intent:
+                self.scan_status_label.setText("Scan: paused (waiting to resume)")
+                self.scan_status_label.setStyleSheet("color: #cc7a00")
+            else:
+                self._set_scan_status(is_scanning, error_msg)
+            if error_msg:
+                self._app_log(f"Scan state: {error_msg}", "W")
+        self._ui(update)
+
+    def _set_scan_status(self, is_scanning: bool, error_msg: str):
+        if is_scanning:
+            if error_msg:
+                self.scan_status_label.setText(f"Scan: active with errors: {error_msg}")
+                self.scan_status_label.setStyleSheet("color: #cc7a00")
+            else:
+                self.scan_status_label.setText("Scan: scanning")
+                self.scan_status_label.setStyleSheet("color: #16823b")
+        elif error_msg:
+            self.scan_status_label.setText(f"Scan: error: {error_msg}")
+            self.scan_status_label.setStyleSheet("color: #c62828")
+        else:
+            self.scan_status_label.setText("Scan: stopped")
+            self.scan_status_label.setStyleSheet("color: #666666")
 
     def _check_setup_dongle(self):
         self._app_log("User: check setup dongle")
@@ -1823,11 +1903,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._evict_stale_devices(present)
 
     def _evict_stale_devices(self, present):
-        # Rows absent from four consecutive scan rounds are dropped; connected
-        # devices and replay rows are exempt.
+        # Rows absent from four consecutive scan rounds are dropped; connected,
+        # connecting, auto-reconnecting and replay rows are exempt.
         evicted = []
         for x in list(self.discovered_devices):
-            if x.Address in present or x.Address in self.device_states:
+            if (x.Address in present or x.Address in self.device_states
+                    or x.Address in self._connecting_addrs):
+                continue
+            sensor = self.sensor_controller.getSensor(x.Address)
+            if sensor is not None and sensor.isAutoReconnecting:
                 continue
             missed = self._scan_missed_rounds.get(x.Address, 0) + 1
             self._scan_missed_rounds[x.Address] = missed
@@ -1914,14 +1998,51 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         addr = self._selected_address()
         connected = addr is not None and addr in self.device_states
         connecting = addr is not None and addr in self._connecting_addrs
-        self.btn_connect.setEnabled(addr is not None and not connected and not connecting)
-        self.btn_disconnect.setEnabled(connected)
-        streaming = any(state.sensor.isDataTransfering
-                        for state in self.device_states.values())
-        self.btn_multi_sync.setText("Multi Stop" if streaming else "Multi Start")
+        switching = addr is not None and addr in self._data_switching_addrs
+        sensor = self.device_states[addr].sensor if connected else None
+        if sensor is None and addr is not None:
+            sensor = self.sensor_controller.getSensor(addr)
+        reconnecting = sensor is not None and sensor.isAutoReconnecting
+        if reconnecting:
+            self.btn_connect.setText("Abort Auto Reconnect")
+        else:
+            self.btn_connect.setText("Disconnect" if connected else "Connect")
+        self.btn_connect.setEnabled(addr is not None and not connecting and not switching)
+        streaming = sensor is not None and sensor.isDataTransfering
+        self.btn_data.setText("Stop Data Streaming" if streaming else "Start Data Streaming")
+        self.btn_data.setEnabled(connected and not switching)
+        for i in range(self.device_list.count()):
+            text = self.device_list.item(i).text()
+            if "Address: " not in text:
+                continue
+            item_addr = text.split("Address: ")[1].strip()
+            item_connected = item_addr in self.device_states
+            item_sensor = self.device_states[item_addr].sensor if item_connected else None
+            if item_sensor is None:
+                item_sensor = self.sensor_controller.getSensor(item_addr)
+            item_streaming = item_sensor is not None and item_sensor.isDataTransfering
+            if item_addr in self._disconnecting_addrs:
+                prefix = "[Disconnecting...] "
+            elif item_addr in self._initing_addrs:
+                prefix = "[Initing] "
+            elif item_sensor is not None and item_sensor.isAutoReconnecting:
+                prefix = "[AutoReconnecting] "
+            elif item_addr in self._connecting_addrs:
+                prefix = "[Connecting...] "
+            elif item_connected and item_streaming:
+                prefix = "[Streaming] "
+            elif item_connected:
+                prefix = "[Connected] "
+            else:
+                prefix = ""
+            self._set_device_item_prefix(item_addr, prefix)
+        any_streaming = any(state.sensor.isDataTransfering
+                            for state in self.device_states.values())
+        self.btn_multi_sync.setText("Multi Stop" if any_streaming else "Multi Start")
         self.btn_multi_sync.setEnabled(len(self.device_states) >= 1)
 
-    _DEVICE_ITEM_PREFIXES = ("[Connected] ", "[Connecting...] ", "[Disconnecting...] ")
+    _DEVICE_ITEM_PREFIXES = ("[Connected] ", "[Connecting...] ", "[Disconnecting...] ",
+                             "[AutoReconnecting] ", "[Streaming] ", "[Initing] ")
 
     def _set_device_item_prefix(self, addr: str, prefix: str):
         for i in range(self.device_list.count()):
@@ -1948,6 +2069,44 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             fn()
         else:
             self.ui_call_sig.emit(fn)
+
+    def _toggle_connection(self):
+        addr = self._selected_address()
+        sensor = self.sensor_controller.getSensor(addr) if addr is not None else None
+        if sensor is not None and sensor.isAutoReconnecting:
+            self._abort_auto_reconnect(sensor)
+        elif addr is not None and addr in self.device_states:
+            self._disconnect_selected_device()
+        else:
+            self._connect_selected_device()
+
+    def _abort_auto_reconnect(self, sensor: SensorProfile):
+        addr = sensor.BLEDevice.Address
+        self._app_log(f"User: abort auto reconnect {addr}", sensor=sensor)
+        self.btn_connect.setEnabled(False)
+        self.btn_data.setEnabled(False)
+        self.status_label.setText("Aborting auto reconnect...")
+        submit(self._abort_auto_reconnect_worker, sensor)
+
+    def _abort_auto_reconnect_worker(self, sensor: SensorProfile):
+        addr = sensor.BLEDevice.Address
+        error = ""
+        try:
+            ok = sensor.disconnect()
+        except Exception as exc:
+            ok = False
+            error = str(exc)
+        if not ok:
+            self._app_log(f"App: failed to abort auto reconnect on {addr}"
+                          + (f": {error}" if error else ""), "E", sensor)
+
+        def finish():
+            if self.current_sensor == sensor or self._selected_address() == addr:
+                self.status_label.setText("Auto reconnect aborted" if ok
+                                          else "Failed to abort auto reconnect")
+            self._update_button_states()
+
+        self._ui(finish)
 
     def _connect_selected_device(self):
         device = self._selected_list_device()
@@ -2036,13 +2195,18 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         sensor.on_device_info_update = self._on_device_info_update
         sensor.on_data_transfer_state_change = self._on_live_transfer_state
         sensor.on_auto_reconnect = self._on_auto_reconnect
+        sensor.onAutoReconnectingStateChange = self._on_auto_reconnecting_state_change
         sensor.autoReconnect = auto_reconnect
 
         self._ui(lambda: self.status_label.setText(f"Connecting: {device.Name} ..."))
         self._ui(lambda: self.btn_connect.setEnabled(False))
+        self._app_log(
+            f"App: BLE connect begin: {addr}, scanning={self.sensor_controller.isScanning}, "
+            f"enabled={self.sensor_controller.isEnable}, autoReconnect={auto_reconnect}", sensor=sensor)
 
         if not sensor.isReady:
             ok = sensor.connect()
+            self._app_log(f"App: BLE connect result: {addr} -> {ok}", "I" if ok else "E", sensor)
             if not ok:
                 self._app_log(f"App: failed to connect to {device.Name} ({addr})", "E", sensor)
                 self._connecting_addrs.discard(addr)
@@ -2052,8 +2216,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 return
 
         if not sensor.hasInited:
+            self._initing_addrs.add(addr)
+            self._ui(lambda a=addr: self._set_device_item_prefix(a, "[Initing] "))
             ok = sensor.init(PACKAGE_COUNT,
                              POWER_REFRESH_PERIOD_IN_MS)
+            self._app_log(f"App: init result: {addr} -> {ok}", "I" if ok else "E", sensor)
+            self._initing_addrs.discard(addr)
             if not ok:
                 self._app_log(f"App: failed to initialize {device.Name} ({addr})", "E", sensor)
                 self._connecting_addrs.discard(addr)
@@ -2096,6 +2264,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
         if not sensor.isDataTransfering:
             ok = sensor.startDataNotification()
+            self._app_log(f"App: startDataNotification result: {addr} -> {ok}", "I" if ok else "E", sensor)
             if not ok:
                 self._app_log(f"App: failed to start data stream on {addr}", "E", sensor)
                 self._connecting_addrs.discard(addr)
@@ -2153,8 +2322,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
             return
         addr = sensor.BLEDevice.Address
         self._app_log(f"User: disconnect {addr}", sensor=sensor)
+        self._disconnecting_addrs.add(addr)
         self._set_device_item_prefix(addr, "[Disconnecting...] ")
-        self.btn_disconnect.setEnabled(False)
+        self.btn_data.setEnabled(False)
         self.btn_connect.setEnabled(False)
         for cb in self._ntf_checkboxes.values():
             cb.setEnabled(False)
@@ -2165,6 +2335,44 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         # _on_device_disconnected 清掉列表前缀并恢复按钮状态
         submit(sensor.disconnect)
 
+    def _toggle_data(self):
+        sensor = self.current_sensor
+        if sensor is None:
+            return
+        addr = sensor.BLEDevice.Address
+        if addr in self._data_switching_addrs:
+            return
+        start = not sensor.isDataTransfering
+        self._data_switching_addrs.add(addr)
+        self.btn_data.setEnabled(False)
+        self.btn_connect.setEnabled(False)
+        self.status_label.setText("Starting data stream..." if start else "Stopping data stream...")
+        self._app_log(f"User: {'start' if start else 'stop'} data {addr}", sensor=sensor)
+        submit(self._set_data_transfer, sensor, start)
+
+    def _set_data_transfer(self, sensor: SensorProfile, start: bool):
+        addr = sensor.BLEDevice.Address
+        error = ""
+        try:
+            ok = sensor.startDataNotification() if start else sensor.stopDataNotification()
+        except Exception as exc:
+            ok = False
+            error = str(exc)
+        self._data_switching_addrs.discard(addr)
+        if not ok:
+            self._app_log(f"App: failed to {'start' if start else 'stop'} data stream on {addr}"
+                          + (f": {error}" if error else ""), "E", sensor)
+
+        def finish():
+            if self.current_sensor == sensor:
+                if ok:
+                    self.status_label.setText("Data stream started" if start else "Data stream stopped")
+                else:
+                    self.status_label.setText(f"Failed to {'start' if start else 'stop'} data stream")
+            self._update_button_states()
+
+        self._ui(finish)
+
     # -- Bin replay ----------------------------------------------------------------
 
     def _set_replay_mode_ui(self, replaying: bool):
@@ -2173,7 +2381,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 self.sensor_controller.stopScan()
             self.btn_stop_scan.setEnabled(False)
             self.btn_connect.setEnabled(False)
-            self.btn_disconnect.setEnabled(False)
+            self.btn_data.setEnabled(False)
             self.btn_multi_sync.setEnabled(False)
             self.btn_multi_replay.setEnabled(False)
         else:
@@ -3466,11 +3674,15 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._poll_fft_results()
         self._refresh_sdk_label()
 
+        now = time.time()
+        if now - self._button_state_last_refresh >= 0.2:
+            self._button_state_last_refresh = now
+            self._update_button_states()
+
         state = self._current_state()
         if state is None:
             return
 
-        now = time.time()
         if now - self._rate_last_refresh >= 1.0:
             self._rate_last_refresh = now
             state.refresh_actual_rates(now)
@@ -3538,6 +3750,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 bio_buffers_copy = {}
                 bio_idx_buffers_copy = {}
                 bio_impedance_copy = {}
+                bio_saturation_copy = {}
                 for dt in (DataType.NTF_EEG, DataType.NTF_PPG, DataType.NTF_SPO2):
                     buf = state.bio_buffers.get(dt)
                     idx_buf = state.bio_sample_index_buffers.get(dt)
@@ -3547,6 +3760,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         bio_idx_buffers_copy[dt] = idx_buf.copy()
                         if dt in state.bio_impedance:
                             bio_impedance_copy[dt] = state.bio_impedance[dt][:]
+                        if dt in state.bio_saturation:
+                            bio_saturation_copy[dt] = state.bio_saturation[dt][:]
             finally:
                 state.bio_buffer_lock.unlock()
 
@@ -3580,6 +3795,8 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
 
                         if dt == DataType.NTF_EEG:
                             imp_list = bio_impedance_copy.get(dt, [])
+                            sat_list = bio_saturation_copy.get(dt, [])
+                            saturation = sat_list[ch_idx] if ch_idx < len(sat_list) else None
                             if state.impedance_enabled and ch_idx < len(imp_list) and isinstance(imp_list[ch_idx], (int, float)):
                                 current_impedance = imp_list[ch_idx] / 1000.0
                                 if current_impedance <= 500:
@@ -3589,7 +3806,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                                 else:
                                     imp_color = "red"
                                 ax.set_ylabel(
-                                    f"{title}\n{current_impedance:.2f} KOhm",
+                                    _bio_side_text(title, imp_list[ch_idx], saturation, state.impedance_enabled),
                                     fontsize=8, color=imp_color, rotation=0,
                                     va='center', ha='left', labelpad=10
                                 )
@@ -3636,10 +3853,12 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         eeg_buffer_copy = None
         eeg_idx_buf_copy = None
         eeg_impedance_copy = None
+        eeg_saturation_copy = None
         eeg_buffer_index = 0
         ecg_buffer_copy = None
         ecg_idx_buf_copy = None
         ecg_impedance_copy = None
+        ecg_saturation_copy = None
         ecg_buffer_index = 0
         brth_buffer_copy = None
         brth_idx_buf_copy = None
@@ -3657,11 +3876,13 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 eeg_buffer_copy = state.eeg_buffer.copy()
                 eeg_idx_buf_copy = state.eeg_sample_index_buffer.copy()
                 eeg_impedance_copy = list(state.eeg_impedance)
+                eeg_saturation_copy = list(state.eeg_saturation)
                 eeg_buffer_index = state.eeg_buffer_index
             if state.has_ecg and state.ecg_buffer is not None and state.ecg_sample_index_buffer is not None:
                 ecg_buffer_copy = state.ecg_buffer.copy()
                 ecg_idx_buf_copy = state.ecg_sample_index_buffer.copy()
                 ecg_impedance_copy = list(state.ecg_impedance)
+                ecg_saturation_copy = list(state.ecg_saturation)
                 ecg_buffer_index = state.ecg_buffer_index
             if state.has_brth and state.brth_buffer is not None and state.brth_sample_index_buffer is not None:
                 brth_buffer_copy = state.brth_buffer.copy()
@@ -3722,8 +3943,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                             color = "orange"
                         else:
                             color = "red"
+                        saturation = (eeg_saturation_copy[eeg_ch]
+                                      if eeg_ch < len(eeg_saturation_copy) else None)
                         ax.set_ylabel(
-                            f"EEG-{eeg_ch + 1} (uV)\n{current_impedance:.2f} KOhm",
+                            _bio_side_text(f"EEG-{eeg_ch + 1} (uV)", eeg_impedance_copy[eeg_ch],
+                                           saturation, state.impedance_enabled),
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
@@ -3816,8 +4040,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                         color = "orange"
                     else:
                         color = "red"
+                    saturation = ecg_saturation_copy[0] if ecg_saturation_copy else None
                     ax.set_ylabel(
-                        f"ECG (uV)\n{current_impedance:.2f} KOhm",
+                        _bio_side_text("ECG (uV)", ecg_impedance_copy[0],
+                                       saturation, state.impedance_enabled),
                         fontsize=8, color=color, rotation=0,
                         va='center', ha='left', labelpad=10
                     )
@@ -3835,6 +4061,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         emg_buffer_copy = None
         emg_idx_buf_copy = None
         emg_impedance_copy = None
+        emg_saturation_copy = None
         emg_buffer_index = 0
         state.emg_buffer_lock.lock()
         try:
@@ -3842,6 +4069,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                 emg_buffer_copy = state.emg_buffer.copy()
                 emg_idx_buf_copy = state.emg_sample_index_buffer.copy()
                 emg_impedance_copy = list(state.emg_impedance)
+                emg_saturation_copy = list(state.emg_saturation)
                 emg_buffer_index = state.emg_buffer_index
         finally:
             state.emg_buffer_lock.unlock()
@@ -3874,8 +4102,11 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
                             color = "orange"
                         else:
                             color = "red"
+                        saturation = (emg_saturation_copy[ch]
+                                      if ch < len(emg_saturation_copy) else None)
                         ax.set_ylabel(
-                            f"EMG-{ch + 1} (uV)\n{current_impedance:.2f} KOhm",
+                            _bio_side_text(f"EMG-{ch + 1} (uV)", emg_impedance_copy[ch],
+                                           saturation, state.impedance_enabled),
                             fontsize=8, color=color, rotation=0,
                             va='center', ha='left', labelpad=10
                         )
@@ -4004,6 +4235,10 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
     def _on_live_transfer_state(self, sensor: SensorProfile, is_transferring: bool):
         self._restart_lsl(sensor.BLEDevice.Address,
                           f"live_transfer_{'ON' if is_transferring else 'OFF'}")
+        self._ui(self._update_button_states)
+
+    def _on_auto_reconnecting_state_change(self, sensor: SensorProfile, is_auto_reconnecting: bool):
+        self._ui(self._update_button_states)
 
     def _on_auto_reconnect(self, sensor: SensorProfile, restore: bool, answer):
         if not self._auto_recovery_allowed(sensor):
@@ -4056,6 +4291,9 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         if not (self._lsl_running and self._auto_reconnect_enabled):
             self._remove_lsl_worker(addr)
         state = self.device_states.pop(addr, None)
+        self._data_switching_addrs.discard(addr)
+        self._disconnecting_addrs.discard(addr)
+        self._initing_addrs.discard(addr)
         self._update_device_item_text(addr, connected=False)
         if self.current_sensor is not None and self.current_sensor.BLEDevice.Address == addr:
             self.current_sensor = None

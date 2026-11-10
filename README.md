@@ -798,6 +798,10 @@ sensor.log("User toggled filter 50Hz", "I")
 
 ## Changelog
 
+### 1.4.4
+
+- Synchronized both PyQt GUI examples: connection and streaming controls now reflect device state, automatic reconnection can be monitored or cancelled, scan status and errors are visible, and saturation is shown alongside impedance.
+
 ### 1.4.3
 
 - Impedance stream metadata and timestamps now use 1 Hz for both live data and replay, independent of the EXG sample rate.
