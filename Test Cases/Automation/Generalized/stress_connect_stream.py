@@ -349,8 +349,8 @@ def main():
             fail_detail = detail
             break
 
-        # 每轮之间短暂休息
-        time.sleep(2)
+        # 断开 → 重连 之间等待：拉长间隔，避免设备高频重连后进入「在广播但不再接受连接」的卡死态
+        time.sleep(15)
 
     elapsed = time.time() - start_time
 

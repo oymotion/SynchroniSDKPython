@@ -15,7 +15,7 @@
 
 判定：
   - 合法值（1/MAX-1/MAX）：不抛异常即通过（返回 True/False 记录，False 可能是蓝牙未开启所致）
-  - 非法值（0/-1/MAX+1）：被拒绝（返回 False 或抛异常）即通过；返回 True 判 FAIL
+  - 非法值（0/-1/MAX+1）：SDK 1.4.4 起抛 ValueError（_validate_scan_period 显式校验），被拒绝即通过；返回 True 判 FAIL
   - 任一边界值导致子进程崩溃（returncode != 0）判 FAIL
 """
 

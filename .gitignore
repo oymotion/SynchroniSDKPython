@@ -16,3 +16,10 @@ examples/build/
 examples/dist/
 examples/*.spec
 examples/__pycache__/*.pyc
+
+# 运行产物目录（采样率测量结果 / e2e 日志）
+/Test Cases/Automation/Generalized/Sample Rate Result/
+/Test Cases/Automation/Generalized/e2e_logs/
+/Test Cases/Automation/Cerelax Pro/Sample Rate Result/
+/Test Cases/Automation/Cerelax Pro/SanityLogs/
+/Test Cases/Automation/Cerelax Pro/e2e_logs/

@@ -13,7 +13,7 @@
   2) 检查 SensorController.isEnable == True
   3) startScan -> 断言返回 True
   4) 断言 isScanning == True
-  5) stopScan -> 断言 isScanning == False
+  5) stopScan -> 断言返回 True 且 isScanning == False
   6) scan -> 断言发现目标设备
   7) requireSensor + connect -> 断言连接成功且到 Ready
 """
@@ -73,17 +73,20 @@ def main():
     record(results, "startScan 后 SensorController.isScanning==True", is_scanning is True,
            "SensorController.isScanning == True", f"SensorController.isScanning == {is_scanning}")
 
-    # stopScan（异常应计为 FAIL，而非仅警告）
+    # stopScan（返回 True；异常应计为 FAIL，而非仅警告）
     stop_raised = False
     stop_err = None
+    stop_ret = None
     try:
-        ctrl.stopScan()
+        stop_ret = ctrl.stopScan()
     except Exception as e:
         stop_raised = True
         stop_err = f"{type(e).__name__}: {e}"
         print(f"[检查] SensorController.stopScan 抛异常 {stop_err}", flush=True)
     record(results, "SensorController.stopScan 不抛异常", not stop_raised,
            "SensorController.stopScan 不抛异常", f"抛异常 {stop_err}" if stop_raised else "无异常")
+    record(results, "SensorController.stopScan 返回 True", stop_ret is True,
+           "SensorController.stopScan 返回 True", f"stopScan() 返回 {stop_ret!r}")
 
     # 检查3：stopScan 后 isScanning == False
     time.sleep(1)
