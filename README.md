@@ -798,6 +798,10 @@ sensor.log("User toggled filter 50Hz", "I")
 
 ## Changelog
 
+### 1.4.6
+
+- Updated the Python demo applications, including GUI connection and automatic-reconnect behavior, parameter controls, offline bin parsing, and quieter default dongle tracing.
+
 ### 1.4.4
 
 - Synchronized both PyQt GUI examples: connection and streaming controls now reflect device state, automatic reconnection can be monitored or cancelled, scan status and errors are visible, and saturation is shown alongside impedance.

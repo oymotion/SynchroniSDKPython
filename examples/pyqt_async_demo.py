@@ -55,7 +55,7 @@ PACKAGE_COUNT              = 32
 POWER_REFRESH_PERIOD_IN_MS = 60000
 PLOT_UPDATE_INTERVAL       = 50
 FFT_UPDATE_INTERVAL        = 0.5
-DEMO_VERSION               = "0.1.49"
+DEMO_VERSION               = "0.1.50"
 BUFFER_SECONDS             = 5
 BIO_BUFFER_SECONDS         = 1
 POWER_STABLE_BAND          = 4
@@ -1481,7 +1481,7 @@ class IMUQuaternionEMGEEGDemo(QtWidgets.QWidget):
         self._data_debug_log_checkbox.stateChanged.connect(self._on_data_debug_log_toggled)
         debug_log_layout.addWidget(self._data_debug_log_checkbox)
         self._dongle_debug_checkbox = QtWidgets.QCheckBox("Enable debug dongle")
-        self._dongle_debug_checkbox.setChecked(True)
+        self._dongle_debug_checkbox.setChecked(False)
         self._dongle_debug_checkbox.stateChanged.connect(self._on_dongle_debug_toggled)
         debug_log_layout.addWidget(self._dongle_debug_checkbox)
         self._translate_imu_checkbox = QtWidgets.QCheckBox("Translate IMU (split ACC/GYRO/EULER/QUAT)")
